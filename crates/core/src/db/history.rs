@@ -65,6 +65,46 @@ impl<'a> HistoryRepository<'a> {
         Ok(entries)
     }
 
+    pub fn by_email(&self, email_id: &str) -> Result<Vec<HistoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, email_id, email_from, email_subject, rule_id, rule_name, action, status,
+                    llm_model, llm_response, error, duration_ms, created_at
+             FROM history
+             WHERE email_id = ?1
+             ORDER BY created_at DESC",
+        )?;
+
+        let entries = stmt
+            .query_map(params![email_id], |row| {
+                Ok(HistoryEntry {
+                    id: row.get(0)?,
+                    email_id: row.get(1)?,
+                    email_from: row.get(2)?,
+                    email_subject: row.get(3)?,
+                    rule_id: row.get(4)?,
+                    rule_name: row.get(5)?,
+                    action: row.get(6)?,
+                    status: row.get(7)?,
+                    llm_model: row.get(8)?,
+                    llm_response: row.get(9)?,
+                    error: row.get(10)?,
+                    duration_ms: row.get(11)?,
+                    created_at: row.get(12)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(entries)
+    }
+
+    pub fn latest_created_at(&self) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT created_at FROM history ORDER BY created_at DESC LIMIT 1")?;
+        let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.next().transpose()
+    }
+
     pub fn search(&self, query: &str) -> Result<Vec<HistoryEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT h.id, h.email_id, h.email_from, h.email_subject, h.rule_id, h.rule_name,

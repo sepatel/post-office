@@ -16,7 +16,7 @@ pub struct GmailAuth {
     pub(crate) access_token: String,
     pub(crate) refresh_token: String,
     pub(crate) client_id: String,
-    pub(crate) client_secret: String,
+    pub(crate) client_secret: Option<String>,
     pub(crate) expires_at: std::time::Instant,
 }
 
@@ -25,7 +25,7 @@ impl GmailAuth {
         access_token: String,
         refresh_token: String,
         client_id: String,
-        client_secret: String,
+        client_secret: Option<String>,
         expires_in: u32,
     ) -> Self {
         Self {
@@ -43,14 +43,18 @@ impl GmailAuth {
     }
 
     pub async fn refresh(&mut self, http: &reqwest::Client) -> Result<(), GmailError> {
+        let mut form = vec![
+            ("client_id", self.client_id.as_str()),
+            ("refresh_token", self.refresh_token.as_str()),
+            ("grant_type", "refresh_token"),
+        ];
+        if let Some(secret) = self.client_secret.as_deref() {
+            form.push(("client_secret", secret));
+        }
+
         let token: TokenResponse = http
             .post("https://oauth2.googleapis.com/token")
-            .form(&[
-                ("client_id", self.client_id.as_str()),
-                ("client_secret", self.client_secret.as_str()),
-                ("refresh_token", self.refresh_token.as_str()),
-                ("grant_type", "refresh_token"),
-            ])
+            .form(&form)
             .send()
             .await?
             .json()
@@ -63,21 +67,16 @@ impl GmailAuth {
         Ok(())
     }
 
-    pub fn store(account: &str) -> Result<(), GmailError> {
-        let _entry = Entry::new(SERVICE_NAME, account)?;
-        // Actual storage handled by caller with tokens
-        Ok(())
-    }
-
-    pub fn load(account: &str) -> Option<Self> {
+    pub fn load(account: &str, client_id: &str, client_secret: Option<&str>) -> Option<Self> {
         let tokens = load_tokens(account).ok()??;
-        let client_id = std::env::var("GOOGLE_CLIENT_ID").ok()?;
-        let client_secret = std::env::var("GOOGLE_CLIENT_SECRET").ok()?;
+        if client_id.is_empty() {
+            return None;
+        }
         Some(Self::new(
             tokens.access,
             tokens.refresh,
-            client_id,
-            client_secret,
+            client_id.to_string(),
+            client_secret.map(|s| s.to_string()),
             3600,
         ))
     }

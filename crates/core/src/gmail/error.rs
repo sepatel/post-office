@@ -16,4 +16,7 @@ pub enum GmailError {
 
     #[error("token refresh failed")]
     TokenRefresh,
+
+    #[error("{0}")]
+    Auth(String),
 }

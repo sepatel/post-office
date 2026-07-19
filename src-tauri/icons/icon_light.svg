@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <!-- Envelope body -->
+  <rect x="24" y="64" width="208" height="140" rx="12" fill="white" opacity="0.9" stroke="white" stroke-width="4"/>
+  <!-- Envelope flap (V shape) -->
+  <path d="M24 76 L128 148 L232 76" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Stamp background -->
+  <rect x="176" y="72" width="48" height="48" rx="2" fill="white" opacity="0.8" stroke="white" stroke-width="2"/>
+  <!-- Stamp perforated border (dots) -->
+  <circle cx="180" cy="76" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="186" cy="76" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="192" cy="76" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="198" cy="76" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="204" cy="76" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="210" cy="76" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="216" cy="76" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="220" cy="80" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="220" cy="86" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="220" cy="92" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="220" cy="98" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="220" cy="104" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="220" cy="110" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="220" cy="116" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="216" cy="120" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="210" cy="120" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="204" cy="120" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="198" cy="120" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="192" cy="120" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="186" cy="120" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="180" cy="120" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="176" cy="116" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="176" cy="110" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="176" cy="104" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="176" cy="98" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="176" cy="92" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="176" cy="86" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="176" cy="80" r="1.5" fill="white" opacity="0.6"/>
+  <!-- Stamp inner star/emblem -->
+  <path d="M200 84 L202 90 L208 90 L203 94 L205 100 L200 96 L195 100 L197 94 L192 90 L198 90 Z" fill="white" opacity="0.7"/>
+  <!-- Postal cancellation lines -->
+  <line x1="160" y1="88" x2="232" y2="88" stroke="white" stroke-width="1.5" opacity="0.4"/>
+  <line x1="160" y1="96" x2="232" y2="96" stroke="white" stroke-width="1.5" opacity="0.4"/>
+  <line x1="160" y1="104" x2="232" y2="104" stroke="white" stroke-width="1.5" opacity="0.4"/>
+</svg>

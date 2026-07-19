@@ -1,8 +1,10 @@
 use post_office_core::config::AppConfig;
-use post_office_core::gmail::{GmailAuth, GmailClient};
+use post_office_core::gmail::GmailClient;
 use post_office_core::processing::{run_processing_loop, ProcessingState};
 use std::sync::Arc;
 use tauri::Manager;
+use tauri::tray::TrayIcon;
+use tauri::Emitter;
 use tokio::sync::Mutex;
 
 mod commands;
@@ -12,6 +14,7 @@ pub struct AppState {
     pub db: post_office_core::db::Database,
     pub processing_state: Arc<Mutex<ProcessingState>>,
     pub config: Arc<Mutex<AppConfig>>,
+    pub tray: Arc<std::sync::Mutex<Option<TrayIcon>>>,
 }
 
 fn main() {
@@ -39,6 +42,7 @@ fn main() {
                 db,
                 processing_state: processing_state.clone(),
                 config: config_arc.clone(),
+                tray: Arc::new(std::sync::Mutex::new(None)),
             };
 
             app.manage(app_state);
@@ -54,31 +58,33 @@ fn main() {
             let state_clone = state_handle.processing_state.clone();
             let config_clone = state_handle.config.clone();
             let config_clone2 = config.clone();
+            let app_handle = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
-                if let Some(ref account) = config_clone2.gmail_account {
-                    match GmailAuth::load(account) {
-                        Some(auth) => {
-                            let gmail = GmailClient::new(auth);
-                            run_processing_loop(
-                                db_clone,
-                                state_clone,
-                                gmail,
-                                llm,
-                                config_clone,
-                            )
-                            .await;
-                        }
-                        None => {
-                            tracing::warn!("No Gmail auth found for account: {}", account);
-                        }
+                match crate::commands::load_gmail_auth(&app_handle, &config_clone2) {
+                    Ok(auth) => {
+                        let gmail = GmailClient::new(auth);
+                        let emit_handle = app_handle.clone();
+                        run_processing_loop(
+                            db_clone,
+                            state_clone,
+                            gmail,
+                            llm,
+                            config_clone,
+                            move |progress| {
+                                let _ = emit_handle.emit("cycle-progress", &progress);
+                            },
+                        )
+                        .await;
                     }
-                } else {
-                    tracing::warn!("No Gmail account configured");
+                    Err(e) => {
+                        tracing::warn!("Gmail processing loop not started: {}", e);
+                    }
                 }
             });
 
-            tray::setup_tray(app)?;
+            let tray = tray::setup_tray(app, &config.tray_theme)?;
+            app.state::<AppState>().tray.lock().unwrap().replace(tray);
             let window = app.get_webview_window("main").unwrap();
             window.show()?;
 
@@ -91,14 +97,27 @@ fn main() {
             commands::rules_create,
             commands::rules_update,
             commands::rules_delete,
+            commands::rule_chat_history,
+            commands::rule_chat_send,
+            commands::rule_apply_proposal,
+            commands::gmail_recent_messages,
+            commands::rules_test,
+            commands::rules_apply,
+            commands::bulk_evaluate,
             commands::history_list,
             commands::history_search,
             commands::processing_status,
             commands::processing_pause,
             commands::processing_resume,
+            commands::processing_backfill,
             commands::gmail_authenticate,
             commands::gmail_get_profile,
             commands::gmail_list_labels,
+            commands::gmail_connection_status,
+            commands::history_by_email,
+            commands::tray_refresh,
+            commands::llm_test,
+            commands::llm_list_models,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

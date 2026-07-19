@@ -19,6 +19,7 @@ pub async fn execute_action(
         ParsedAction::MarkRead => (vec![], vec!["UNREAD".into()]),
         ParsedAction::MarkUnread => (vec!["UNREAD".into()], vec![]),
         ParsedAction::Star => (vec!["STARRED".into()], vec![]),
+        ParsedAction::Apply => (vec![], vec![]),
     };
 
     if add.is_empty() && remove.is_empty() {

@@ -9,6 +9,9 @@ pub enum LlmError {
 
     #[error("No response from LLM")]
     NoResponse,
+
+    #[error("Failed to parse LLM JSON response: {0}")]
+    ParseError(String),
 }
 
 pub struct ProcessRequest {

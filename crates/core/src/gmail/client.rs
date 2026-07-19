@@ -26,6 +26,22 @@ impl GmailClient {
         path: &str,
         body: Option<&(impl serde::Serialize + Send)>,
     ) -> Result<T, GmailError> {
+        let response = self.send(method, path, body).await?;
+
+        // Some Gmail mutations (e.g. modify/batchModify) can reply with no body.
+        // Treat an empty body as `null` so callers that don't need the payload
+        // (typed as `()` / `Option` / `Value`) still decode cleanly.
+        let text = response.text().await.unwrap_or_default();
+        let text = if text.trim().is_empty() { "null" } else { text.as_str() };
+        serde_json::from_str::<T>(text).map_err(GmailError::from)
+    }
+
+    async fn send(
+        &mut self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&(impl serde::Serialize + Send)>,
+    ) -> Result<reqwest::Response, GmailError> {
         if self.auth.is_expired() {
             self.auth.refresh(&self.http).await?;
         }
@@ -48,7 +64,7 @@ impl GmailClient {
             if let Some(body) = body {
                 retry_req = retry_req.json(body);
             }
-            return retry_req.send().await?.json().await.map_err(GmailError::from);
+            return retry_req.send().await.map_err(GmailError::from);
         }
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -60,7 +76,7 @@ impl GmailClient {
                 .unwrap_or(60);
 
             tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
-            return Box::pin(self.request(method, path, body)).await;
+            return Box::pin(self.send(method, path, body)).await;
         }
 
         let status = response.status();
@@ -72,7 +88,7 @@ impl GmailClient {
             });
         }
 
-        response.json().await.map_err(GmailError::from)
+        Ok(response)
     }
 
     pub async fn list_messages(
@@ -80,16 +96,12 @@ impl GmailClient {
         query: &str,
         max_results: u32,
     ) -> Result<Vec<MessageRef>, GmailError> {
-        let request_body = ListMessagesRequest {
-            q: query,
-            max_results,
-        };
+        let qs = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("q", query)
+            .finish();
+        let path = format!("/messages?maxResults={max_results}&{qs}");
         let response: ListMessagesResponse = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/messages?maxResults={max_results}"),
-                Some(&request_body),
-            )
+            .request(reqwest::Method::GET, &path, None::<&()>)
             .await?;
 
         Ok(response.messages.unwrap_or_default())
@@ -109,17 +121,20 @@ impl GmailClient {
         id: &str,
         add_label_ids: &[&str],
         remove_label_ids: &[&str],
-    ) -> Result<Message, GmailError> {
+    ) -> Result<(), GmailError> {
         let request_body = ModifyLabelsRequest {
             add_label_ids,
             remove_label_ids,
         };
-        self.request(
+        // Decode modify responses as JSON values; Gmail returns a Message object,
+        // so deserializing into `()` fails.
+        self.request::<serde_json::Value>(
             reqwest::Method::POST,
             &format!("/messages/{id}/modify"),
             Some(&request_body),
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     pub async fn batch_modify(
@@ -134,7 +149,7 @@ impl GmailClient {
                 add_label_ids,
                 remove_label_ids,
             };
-            self.request::<()>(
+            self.request::<serde_json::Value>(
                 reqwest::Method::POST,
                 "/messages/batchModify",
                 Some(&request_body),

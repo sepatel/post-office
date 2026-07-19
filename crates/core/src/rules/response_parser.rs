@@ -1,5 +1,23 @@
 use std::str::FromStr;
 
+use super::models::Action;
+
+/// Structured rule actions are authored as `Action` but executed as `ParsedAction`;
+/// the conversion lets the engine run either path through the same executor.
+impl From<&Action> for ParsedAction {
+    fn from(action: &Action) -> Self {
+        match action {
+            Action::Label { value } => ParsedAction::Label(value.clone()),
+            Action::Archive => ParsedAction::Archive,
+            Action::Trash => ParsedAction::Trash,
+            Action::Spam => ParsedAction::Spam,
+            Action::MarkRead => ParsedAction::MarkRead,
+            Action::MarkUnread => ParsedAction::MarkUnread,
+            Action::Star => ParsedAction::Star,
+        }
+    }
+}
+
 pub fn parse_llm_response(response: &str) -> Option<ParsedAction> {
     let first_line = response
         .trim()
@@ -10,6 +28,22 @@ pub fn parse_llm_response(response: &str) -> Option<ParsedAction> {
     ParsedAction::from_str(first_line).ok()
 }
 
+/// Extracts the brief explanation (line 2+) the model appends after the
+/// decision token. Empty when the model returned only the token.
+pub fn extract_reasoning(response: &str) -> String {
+    let lines: Vec<&str> = response
+        .trim()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    match lines.split_first() {
+        Some((_, rest)) if !rest.is_empty() => rest.join(" "),
+        _ => String::new(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedAction {
     Archive,
@@ -18,6 +52,7 @@ pub enum ParsedAction {
     MarkRead,
     MarkUnread,
     Star,
+    Apply,
     Label(String),
 }
 
@@ -44,6 +79,9 @@ impl FromStr for ParsedAction {
         }
         if s.eq_ignore_ascii_case("STAR") {
             return Ok(ParsedAction::Star);
+        }
+        if s.eq_ignore_ascii_case("APPLY") {
+            return Ok(ParsedAction::Apply);
         }
         if s.eq_ignore_ascii_case("SKIP") {
             return Err(ParseError::Skip);

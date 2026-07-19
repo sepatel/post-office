@@ -58,20 +58,20 @@ export default function History() {
           onChange={(e) => setSearchQuery(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && handleSearch()}
           placeholder="Search emails..."
-          className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm"
+          className="flex-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-3 py-2 text-sm"
         />
         <button
           onClick={handleSearch}
-          className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-sm"
+          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition-colors"
         >
           Search
         </button>
       </div>
 
-      <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-gray-700 text-left text-gray-400">
+            <tr className="border-b border-gray-200 dark:border-gray-700 text-left text-gray-500 dark:text-gray-400">
               <th className="px-4 py-2">From</th>
               <th className="px-4 py-2">Subject</th>
               <th className="px-4 py-2">Rule</th>
@@ -83,7 +83,7 @@ export default function History() {
           <tbody>
             {entries.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-8 text-center text-gray-500">
+                <td colSpan={6} className="px-4 py-8 text-center text-gray-400 dark:text-gray-500">
                   No history yet
                 </td>
               </tr>
@@ -91,7 +91,7 @@ export default function History() {
             {entries.map((entry) => (
               <tr
                 key={entry.id}
-                className="border-b border-gray-700/50 hover:bg-gray-700/30"
+                className="border-b border-gray-200 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors"
               >
                 <td className="px-4 py-2 max-w-[200px] truncate">
                   {entry.email_from || "-"}
@@ -105,16 +105,16 @@ export default function History() {
                   <span
                     className={
                       entry.status === "success"
-                        ? "text-green-400"
+                        ? "text-green-600 dark:text-green-400"
                         : entry.status === "error"
-                          ? "text-red-400"
-                          : "text-yellow-400"
+                          ? "text-red-600 dark:text-red-400"
+                          : "text-yellow-600 dark:text-yellow-400"
                     }
                   >
                     {entry.status}
                   </span>
                 </td>
-                <td className="px-4 py-2 text-gray-500">
+                <td className="px-4 py-2 text-gray-400 dark:text-gray-500">
                   {new Date(entry.created_at).toLocaleString()}
                 </td>
               </tr>
@@ -127,15 +127,15 @@ export default function History() {
         <button
           onClick={() => setPage(Math.max(0, page - 1))}
           disabled={page === 0}
-          className="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm disabled:opacity-50"
+          className="bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 px-3 py-1 rounded text-sm disabled:opacity-50 transition-colors"
         >
           Previous
         </button>
-        <span className="text-sm text-gray-400">Page {page + 1}</span>
+        <span className="text-sm text-gray-500 dark:text-gray-400">Page {page + 1}</span>
         <button
           onClick={() => setPage(page + 1)}
           disabled={entries.length < perPage}
-          className="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm disabled:opacity-50"
+          className="bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 px-3 py-1 rounded text-sm disabled:opacity-50 transition-colors"
         >
           Next
         </button>

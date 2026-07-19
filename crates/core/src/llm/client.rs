@@ -78,4 +78,76 @@ impl LlmClient {
             duration_ms,
         })
     }
+
+    /// Lists model ids from the OpenAI-compatible `/models` endpoint. Lets the
+    /// settings UI offer a dropdown of valid models instead of free-typing the
+    /// id (and guessing wrong like a bad base URL).
+    pub async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let resp = self.client.models().list().await?;
+        Ok(resp.data.into_iter().map(|m| m.id).collect())
+    }
+
+    /// Reachability/validity check: sends a tiny completion and returns the
+    /// model the endpoint actually served (which can differ from the requested
+    /// id when the server aliases it). Surfaces endpoint/auth/model problems
+    /// early instead of failing silently during a rule test or apply.
+    pub async fn test_connection(&self) -> Result<ProcessResponse, LlmError> {
+        self.process(ProcessRequest {
+            system_prompt: Some("Reply with the single word OK.".into()),
+            user_prompt: "Test.".into(),
+            model: None,
+            temperature: Some(0.0),
+            max_tokens: Some(5),
+        })
+        .await
+    }
+
+    /// Chat that expects a JSON object back. Used by the rule-tuning chat, where
+    /// the model returns a structured proposal. Strips optional markdown code
+    /// fences before parsing, since local models don't always honor
+    /// `response_format`.
+    pub async fn chat_json(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<serde_json::Value, LlmError> {
+        let model = self.default_model.clone();
+        let messages = vec![
+            json!({ "role": "system", "content": system_prompt }),
+            json!({ "role": "user", "content": user_prompt }),
+        ];
+
+        let response: Value = self
+            .client
+            .chat()
+            .create_byot(json!({
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3f32,
+            }))
+            .await?;
+
+        let content = response["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+
+        let content = strip_code_fence(content);
+        serde_json::from_str(&content).map_err(|e| LlmError::ParseError(e.to_string()))
+    }
+}
+
+fn strip_code_fence(content: &str) -> String {
+    let trimmed = content.trim();
+    if let Some(open) = trimmed.find("```") {
+        // Skip the opening fence and its language tag (e.g. "json\n").
+        let after_open = &trimmed[open + 3..];
+        let after_lang = match after_open.find('\n') {
+            Some(nl) => &after_open[nl + 1..],
+            None => after_open,
+        };
+        if let Some(end) = after_lang.find("```") {
+            return after_lang[..end].trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }

@@ -1,63 +1,145 @@
 use crate::db::rules::RuleRepository;
 use crate::gmail::models::Message;
-use crate::llm::LlmClient;
+use crate::llm::{LlmClient, ProcessRequest};
+use crate::rules::prompts::RULE_SYSTEM_PROMPT;
 use super::matcher;
 use super::models::Rule;
-use super::response_parser::{parse_llm_response, ParsedAction};
+use super::response_parser::{extract_reasoning, parse_llm_response, ParsedAction};
 
 pub struct RuleEngine<'a> {
     rule_repo: &'a RuleRepository<'a>,
-    llm: &'a LlmClient,
 }
 
 impl<'a> RuleEngine<'a> {
-    pub fn new(rule_repo: &'a RuleRepository<'a>, llm: &'a LlmClient) -> Self {
-        Self { rule_repo, llm }
+    pub fn new(rule_repo: &'a RuleRepository<'a>) -> Self {
+        Self { rule_repo }
     }
 
-    pub async fn process_email(
+    /// Sync: load enabled rules and return the highest-priority one whose
+    /// conditions all match (None if nothing matches).
+    pub fn find_matching_rule(
         &self,
         email: &Message,
         current_labels: &[String],
-    ) -> Result<ProcessingResult, RuleError> {
-        let rules = self.rule_repo.get_enabled_rules()?;
+    ) -> Option<Rule> {
+        let rules = self.rule_repo.get_enabled_rules().ok()?;
+        rules
+            .into_iter()
+            .filter(|r| {
+                r.conditions
+                    .iter()
+                    .all(|c| matcher::evaluate(c, email, current_labels))
+            })
+            .min_by_key(|r| r.priority)
+    }
+}
 
-        let matching_rule = rules
-            .iter()
-            .filter(|r| r.conditions.iter().all(|c| matcher::evaluate(c, email, current_labels)))
-            .min_by_key(|r| r.priority);
+/// Resolve a single rule against an email without persisting anything.
+/// Returns `None` when the rule's conditions don't match; otherwise the
+/// actions that *would* be taken (structured actions, or the LLM's verdict)
+/// plus the raw LLM reply (empty for the structured-action path).
+///
+/// Takes `&LlmClient` directly so callers don't need a `RuleRepository` — this
+/// is what lets the test/apply commands run without blocking the async runtime.
+pub async fn resolve_rule(
+    llm: &LlmClient,
+    rule: &Rule,
+    email: &Message,
+    memories: &[String],
+) -> Result<Option<Resolved>, RuleError> {
+    let matched = rule
+        .conditions
+        .iter()
+        .all(|c| matcher::evaluate(c, email, &email.label_ids));
 
-        match matching_rule {
-            Some(rule) => {
-                let result = self.execute_rule(rule, email).await?;
-                Ok(ProcessingResult::RuleMatched {
-                    rule_id: rule.id,
-                    rule_name: rule.name.clone(),
-                    action: result.action_taken,
-                    llm_response: result.llm_response,
-                    duration_ms: result.duration_ms,
-                })
-            }
-            None => Ok(ProcessingResult::NoMatch),
+    if !matched {
+        return Ok(None);
+    }
+
+    let result = execute_rule(llm, rule, email, memories).await?;
+    Ok(Some(result))
+}
+
+/// Dry-run variant of `resolve_rule` that produces a frontend-friendly result.
+pub async fn test_rule(
+    llm: &LlmClient,
+    rule: &Rule,
+    email: &Message,
+    memories: &[String],
+) -> Result<TestResult, RuleError> {
+    match resolve_rule(llm, rule, email, memories).await? {
+        None => Ok(TestResult {
+            matched: false,
+            actions: vec![],
+            llm_response: String::new(),
+            reasoning: String::new(),
+        }),
+        Some(resolved) => Ok(TestResult {
+            matched: true,
+            actions: resolved.actions.iter().map(display_action).collect(),
+            llm_response: resolved.llm_response,
+            reasoning: resolved.reasoning,
+        }),
+    }
+}
+
+async fn execute_rule(
+    llm: &LlmClient,
+    rule: &Rule,
+    email: &Message,
+    memories: &[String],
+) -> Result<Resolved, RuleError> {
+    // No prompt: structured actions (if any) run deterministically; otherwise
+    // nothing happens. The LLM is only consulted when a rule has a prompt.
+    if rule.prompt.trim().is_empty() {
+        if rule.actions.is_empty() {
+            return Ok(Resolved {
+                actions: vec![],
+                llm_response: String::new(),
+                reasoning: String::new(),
+            });
         }
+        let actions: Vec<ParsedAction> = rule.actions.iter().map(ParsedAction::from).collect();
+        return Ok(Resolved {
+            actions,
+            llm_response: String::new(),
+            reasoning: String::new(),
+        });
     }
 
-    async fn execute_rule(&self, rule: &Rule, email: &Message) -> Result<ExecutionResult, RuleError> {
-        let user_prompt = build_user_prompt(&rule.prompt, email);
+    // Prompt present: the LLM decides APPLY/SKIP (and may name a label). The
+    // prompt is a fuzzy gate; structured actions, when present, are the
+    // deterministic outcome of a non-SKIP verdict.
+    let user_prompt = build_user_prompt(&rule.prompt, email, memories);
 
-        let llm_response = self
-            .llm
-            .process(crate::llm::ProcessRequest::new(user_prompt))
-            .await?;
-
-        let parsed_action = parse_llm_response(&llm_response.content);
-
-        Ok(ExecutionResult {
-            action_taken: parsed_action,
-            llm_response: llm_response.content,
-            duration_ms: llm_response.duration_ms,
+    let llm_response = llm
+        .process(ProcessRequest {
+            system_prompt: Some(RULE_SYSTEM_PROMPT.to_string()),
+            user_prompt,
+            model: None,
+            temperature: None,
+            max_tokens: None,
         })
-    }
+        .await?;
+
+    let parsed = parse_llm_response(&llm_response.content);
+
+    let actions = match parsed {
+        None => vec![],
+        Some(action) => {
+            if !rule.actions.is_empty() {
+                rule.actions.iter().map(ParsedAction::from).collect()
+            } else {
+                vec![action]
+            }
+        }
+    };
+
+    Ok(Resolved {
+        actions,
+        llm_response: llm_response.content.clone(),
+        reasoning: extract_reasoning(&llm_response.content),
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,24 +151,78 @@ pub enum RuleError {
     Llm(#[from] crate::llm::LlmError),
 }
 
-pub enum ProcessingResult {
-    RuleMatched {
-        rule_id: i64,
-        rule_name: String,
-        action: Option<ParsedAction>,
-        llm_response: String,
-        duration_ms: u64,
-    },
-    NoMatch,
+/// Outcome of resolving a rule against one email (used by test/apply paths).
+pub struct Resolved {
+    pub actions: Vec<ParsedAction>,
+    pub llm_response: String,
+    pub reasoning: String,
 }
 
-struct ExecutionResult {
-    action_taken: Option<ParsedAction>,
-    llm_response: String,
-    duration_ms: u64,
+/// Frontend-friendly result of a dry-run test against a single email.
+#[derive(Debug, serde::Serialize)]
+pub struct TestResult {
+    pub matched: bool,
+    pub actions: Vec<ActionDisplay>,
+    pub llm_response: String,
+    pub reasoning: String,
 }
 
-fn build_user_prompt(rule_prompt: &str, email: &Message) -> String {
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActionDisplay {
+    pub kind: String,
+    pub detail: Option<String>,
+    pub display: String,
+}
+
+pub fn display_action(action: &ParsedAction) -> ActionDisplay {
+    match action {
+        ParsedAction::Label(name) => ActionDisplay {
+            kind: "label".into(),
+            detail: Some(name.clone()),
+            display: format!("Add label \"{}\"", name),
+        },
+        ParsedAction::Archive => ActionDisplay {
+            kind: "archive".into(),
+            detail: None,
+            display: "Archive".into(),
+        },
+        ParsedAction::Trash => ActionDisplay {
+            kind: "trash".into(),
+            detail: None,
+            display: "Move to Trash".into(),
+        },
+        ParsedAction::Spam => ActionDisplay {
+            kind: "spam".into(),
+            detail: None,
+            display: "Mark as Spam".into(),
+        },
+        ParsedAction::MarkRead => ActionDisplay {
+            kind: "mark_read".into(),
+            detail: None,
+            display: "Mark as read".into(),
+        },
+        ParsedAction::MarkUnread => ActionDisplay {
+            kind: "mark_unread".into(),
+            detail: None,
+            display: "Mark as unread".into(),
+        },
+        ParsedAction::Star => ActionDisplay {
+            kind: "star".into(),
+            detail: None,
+            display: "Star".into(),
+        },
+        ParsedAction::Apply => ActionDisplay {
+            kind: "apply".into(),
+            detail: None,
+            display: "Apply rule actions".into(),
+        },
+    }
+}
+
+/// Headers and plain-text body of an email, used both by the single-email prompt
+/// and by the batch evaluator. Kept as a shared primitive so the two paths can't
+/// drift in how an email is rendered to the model.
+pub(crate) fn email_parts(email: &Message) -> (String, String) {
     let headers = email
         .payload
         .as_ref()
@@ -101,13 +237,28 @@ fn build_user_prompt(rule_prompt: &str, email: &Message) -> String {
 
     let body = extract_plain_text(email);
 
+    (headers, body)
+}
+
+fn build_user_prompt(rule_prompt: &str, email: &Message, memories: &[String]) -> String {
+    let (headers, body) = email_parts(email);
+
+    let memory_block = if memories.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n--- Learned Memory ---\n{}\n(These are exceptions and notes you must respect when deciding.)",
+            memories.join("\n")
+        )
+    };
+
     format!(
         "--- Email Headers ---\n\
          {headers}\n\n\
          --- Email Body ---\n\
          {body}\n\n\
          --- Rule Instruction ---\n\
-         {rule_prompt}"
+         {rule_prompt}{memory_block}"
     )
 }
 

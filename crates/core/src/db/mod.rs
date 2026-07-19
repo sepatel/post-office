@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 pub mod config;
 pub mod history;
+pub mod rule_chat;
+pub mod rule_memory;
 pub mod rules;
 
 pub struct Database {
@@ -41,7 +43,12 @@ impl Database {
 
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(include_str!("../../../../migrations/001_initial.sql"))
+        let migrations = format!(
+            "{}\n{}",
+            include_str!("../../../../migrations/001_initial.sql"),
+            include_str!("../../../../migrations/002_rule_memory_chat.sql"),
+        );
+        conn.execute_batch(&migrations)
     }
 
     pub fn with_rules<F, R>(&self, f: F) -> R
@@ -68,6 +75,24 @@ impl Database {
     {
         let conn = self.conn.lock().unwrap();
         let repo = config::ConfigRepository::new(&conn);
+        f(repo)
+    }
+
+    pub fn with_rule_memory<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(rule_memory::RuleMemoryRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        let repo = rule_memory::RuleMemoryRepository::new(&conn);
+        f(repo)
+    }
+
+    pub fn with_rule_chat<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(rule_chat::RuleChatRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        let repo = rule_chat::RuleChatRepository::new(&conn);
         f(repo)
     }
 }

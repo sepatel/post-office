@@ -43,7 +43,7 @@ export default function Rules() {
         <h2 className="text-2xl font-bold">Rules</h2>
         <button
           onClick={() => navigate("/rules/new")}
-          className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-sm font-medium"
+          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
         >
           New Rule
         </button>
@@ -51,43 +51,95 @@ export default function Rules() {
 
       <div className="space-y-3">
         {rules.length === 0 && (
-          <div className="text-gray-500 text-center py-8">No rules yet</div>
+          <div className="text-gray-400 dark:text-gray-500 text-center py-8">No rules yet</div>
         )}
         {rules.map((rule) => (
           <div
             key={rule.id}
-            className="bg-gray-800 rounded-lg p-4 border border-gray-700 flex justify-between items-center"
+            className="bg-white dark:bg-gray-800 rounded-lg p-4 border border-gray-200 dark:border-gray-700 flex justify-between items-center"
           >
             <div>
               <div className="flex items-center gap-2">
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    rule.enabled ? "bg-green-400" : "bg-gray-500"
+                    rule.enabled ? "bg-green-500" : "bg-gray-400"
                   }`}
                 />
                 <span className="font-medium">{rule.name}</span>
-                <span className="text-xs text-gray-500">
+                <span className="text-xs text-gray-400 dark:text-gray-500">
                   Priority: {rule.priority}
                 </span>
               </div>
               {rule.description && (
-                <div className="text-sm text-gray-400 mt-1">
+                <div className="text-sm text-gray-500 dark:text-gray-400 mt-1">
                   {rule.description}
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => navigate(`/rules/${rule.id}/chat`)}
+                aria-label="Chat with rule"
+                title="Chat to tune"
+                className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300 hover:text-purple-600 dark:hover:text-purple-400 transition-colors"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                </svg>
+              </button>
               <button
                 onClick={() => navigate(`/rules/${rule.id}/edit`)}
-                className="text-sm text-blue-400 hover:text-blue-300"
+                aria-label="Edit rule"
+                title="Edit"
+                className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
               >
-                Edit
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M12 20h9" />
+                  <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                </svg>
               </button>
               <button
                 onClick={() => handleDelete(rule.id)}
-                className="text-sm text-red-400 hover:text-red-300"
+                aria-label="Delete rule"
+                title="Delete"
+                className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300 hover:text-red-600 dark:hover:text-red-400 transition-colors"
               >
-                Delete
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M3 6h18" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  <line x1="10" y1="11" x2="10" y2="17" />
+                  <line x1="14" y1="11" x2="14" y2="17" />
+                </svg>
               </button>
             </div>
           </div>

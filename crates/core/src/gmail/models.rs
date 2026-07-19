@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageRef {
     pub id: String,
     pub thread_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: String,
     pub thread_id: String,
@@ -21,6 +23,7 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessagePayload {
     pub mime_type: String,
     #[serde(default)]
@@ -45,6 +48,7 @@ pub struct Body {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Label {
     pub id: String,
     pub name: String,
@@ -57,6 +61,7 @@ pub struct Label {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GmailProfile {
     pub email_address: String,
     pub messages_total: u64,
@@ -65,6 +70,7 @@ pub struct GmailProfile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ListMessagesResponse {
     #[serde(default)]
     pub messages: Option<Vec<MessageRef>>,
@@ -80,18 +86,14 @@ pub(crate) struct ListLabelsResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ListMessagesRequest<'a> {
-    pub q: &'a str,
-    pub max_results: u32,
-}
-
-#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ModifyLabelsRequest<'a> {
     pub add_label_ids: &'a [&'a str],
     pub remove_label_ids: &'a [&'a str],
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct BatchModifyRequest<'a> {
     pub ids: &'a [&'a str],
     pub add_label_ids: &'a [&'a str],
@@ -99,15 +101,28 @@ pub(crate) struct BatchModifyRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct CreateLabelRequest<'a> {
     pub name: &'a str,
     pub message_list_visibility: &'a str,
     pub label_list_visibility: &'a str,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailConnection {
+    pub connected: bool,
+    pub email: Option<String>,
+    pub messages_total: Option<u64>,
+    pub threads_total: Option<u64>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct TokenResponse {
     pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
     pub expires_in: u32,
     #[serde(default)]
     pub token_type: String,
