@@ -145,14 +145,13 @@ Supported operators:
 ```
 
 Supported action types:
-- `label` — Apply a Gmail label
+- `label` — Apply a Gmail label (created on demand if missing)
 - `archive` — Remove from INBOX
 - `trash` — Move to trash
 - `spam` — Mark as spam
 - `mark_read` — Remove UNREAD label
 - `mark_unread` — Add UNREAD label
 - `star` — Add STARRED label
-- `custom_label` — Create label if needed, then apply
 
 ### History Table
 

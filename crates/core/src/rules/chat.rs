@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::db::Database;
 use crate::db::rule_chat::ChatMessageRow;
 use crate::db::rules::UpdateRuleRequest;
+use crate::db::Database;
 use crate::llm::LlmClient;
 use crate::rules::models::{Action, Condition};
 use crate::rules::prompts::CHAT_SYSTEM_PROMPT;
@@ -98,8 +98,9 @@ pub async fn apply_proposal(
         Ok::<(), rusqlite::Error>(())
     })?;
 
-    let mutates_rule =
-        proposal.prompt.is_some() || !proposal.actions_add.is_empty() || !proposal.conditions_add.is_empty();
+    let mutates_rule = proposal.prompt.is_some()
+        || !proposal.actions_add.is_empty()
+        || !proposal.conditions_add.is_empty();
 
     if mutates_rule {
         let mut rule = db
@@ -182,12 +183,6 @@ fn build_chat_user_prompt(
          RECENT CHAT:\n{}\n\n\
          USER MESSAGE:\n{}\n\n\
          Respond with the JSON proposal described in your instructions.",
-        rule.name,
-        rule.prompt,
-        actions,
-        conditions,
-        memory_block,
-        history_block,
-        message,
+        rule.name, rule.prompt, actions, conditions, memory_block, history_block, message,
     )
 }

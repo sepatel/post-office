@@ -10,8 +10,8 @@ use crate::config::AppConfig;
 use crate::db::history::NewHistoryEntry;
 use crate::db::Database;
 use crate::gmail::models::Message;
-use crate::rules::matcher;
 use crate::rules::engine::{resolve_rule, Resolved};
+use crate::rules::matcher;
 
 const LAST_RUN_KEY: &str = "processing.last_run";
 
@@ -272,7 +272,12 @@ async fn run_pipeline(
         // Backfills pass a selected subset; live polling passes all enabled rules.
         let matched_rule: Option<Rule> = rules
             .iter()
-            .filter(|r| r.enabled && r.conditions.iter().all(|c| matcher::evaluate(c, &email, &labels)))
+            .filter(|r| {
+                r.enabled
+                    && r.conditions
+                        .iter()
+                        .all(|c| matcher::evaluate(c, &email, &labels))
+            })
             .min_by_key(|r| r.priority)
             .cloned();
 
@@ -360,11 +365,13 @@ async fn run_pipeline(
                         .map(|a| format!("{:?}", a))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let errors: Vec<String> = outcomes
-                        .iter()
-                        .filter_map(|(_, e)| e.clone())
-                        .collect();
-                    let status = if errors.is_empty() { "success" } else { "error" };
+                    let errors: Vec<String> =
+                        outcomes.iter().filter_map(|(_, e)| e.clone()).collect();
+                    let status = if errors.is_empty() {
+                        "success"
+                    } else {
+                        "error"
+                    };
 
                     insert_history_entry(
                         db,
@@ -423,19 +430,32 @@ pub async fn run_backfill(
     rule_ids: &[i64],
     on_progress: &impl Fn(OpProgress),
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let query = format!("{} after:{} before:{}", config.polling_query.trim(), after.timestamp(), before.timestamp());
+    let query = format!(
+        "{} after:{} before:{}",
+        config.polling_query.trim(),
+        after.timestamp(),
+        before.timestamp()
+    );
     let rules = db.with_rules(|repo| repo.get_by_ids(rule_ids))?;
-    run_pipeline(db, state, gmail, llm, config, &query, &rules, true, on_progress).await
+    run_pipeline(
+        db,
+        state,
+        gmail,
+        llm,
+        config,
+        &query,
+        &rules,
+        true,
+        on_progress,
+    )
+    .await
 }
 
 fn extract_header(email: &Message, name: &str) -> Option<String> {
-    email
-        .payload
-        .as_ref()
-        .and_then(|p| {
-            p.headers
-                .iter()
-                .find(|h| h.name == name)
-                .map(|h| h.value.clone())
-        })
+    email.payload.as_ref().and_then(|p| {
+        p.headers
+            .iter()
+            .find(|h| h.name == name)
+            .map(|h| h.value.clone())
+    })
 }

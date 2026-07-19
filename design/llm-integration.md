@@ -144,7 +144,7 @@ pub enum LlmError {
 How emails are formatted for the LLM:
 
 ```rust
-// crates/core/src/llm/prompts.rs
+// crates/core/src/rules/engine.rs (simplified)
 
 use crate::gmail::models::Message;
 
@@ -236,13 +236,13 @@ fn html_to_text(html: &str) -> String {
 
 ## Response Parsing
 
-The LLM is prompted to respond in a strict format. If the response doesn't match, the email is skipped.
+The classifier path enforces a strict token contract. The first non-empty token line drives actions; malformed or `SKIP` responses produce no action.
 
 ### Prompt Template
 
 The user prompt is constructed as:
 
-```
+```text
 --- Email Headers ---
 From: sender@example.com
 To: recipient@example.com
@@ -254,20 +254,12 @@ Hey, just wanted to check in about...
 --- Rule Instruction ---
 {user's rule prompt}
 
---- Response Format ---
-You MUST respond with EXACTLY ONE of these lines:
-- ARCHIVE
-- TRASH
-- SPAM
-- LABEL: <name>
-- MARK_READ
-- MARK_UNREAD
-- STAR
-- SKIP
-
-No other text. Just the action word.
-If you need a label, use: LABEL: <name>
+Respond with EXACTLY two lines:
+1) Token only: ARCHIVE, TRASH, SPAM, MARK_READ, MARK_UNREAD, STAR, APPLY, SKIP, or LABEL: <name>
+2) One-sentence imperative explanation
 ```
+
+Batch mode uses one line per email: `N: <TOKEN>`.
 
 ### Parser
 
@@ -298,6 +290,7 @@ pub enum ParsedAction {
     MarkRead,
     MarkUnread,
     Star,
+    Apply,
     Label(String),
 }
 
@@ -325,6 +318,9 @@ impl FromStr for ParsedAction {
         if s.eq_ignore_ascii_case("STAR") {
             return Ok(ParsedAction::Star);
         }
+        if s.eq_ignore_ascii_case("APPLY") {
+            return Ok(ParsedAction::Apply);
+        }
         if s.eq_ignore_ascii_case("SKIP") {
             return Err(ParseError::Skip);
         }
@@ -345,6 +341,28 @@ pub enum ParseError {
 
     #[error("LLM responded with SKIP")]
     Skip,
+}
+```
+
+### Hybrid Execution Contract
+
+When a rule has both a prompt and configured structured actions, token execution is hybrid:
+
+- `APPLY` => run configured `rule.actions`
+- `SKIP` or invalid token => no action
+- explicit token (`ARCHIVE`, `TRASH`, `SPAM`, `MARK_READ`, `MARK_UNREAD`, `STAR`, `LABEL: <name>`) => execute that token directly
+
+```rust
+// crates/core/src/rules/engine.rs
+pub(crate) fn resolve_effective_actions(
+    rule: &Rule,
+    parsed: Option<ParsedAction>,
+) -> Vec<ParsedAction> {
+    match parsed {
+        None => vec![],
+        Some(ParsedAction::Apply) => rule.actions.iter().map(ParsedAction::from).collect(),
+        Some(action) => vec![action],
+    }
 }
 ```
 

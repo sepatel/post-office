@@ -105,9 +105,6 @@ pub enum Action {
 
     #[serde(rename = "star")]
     Star,
-
-    #[serde(rename = "custom_label")]
-    CustomLabel { value: String },
 }
 ```
 
@@ -211,90 +208,26 @@ fn parse_email_date(email: &Message) -> Option<NaiveDate> {
 
 ## Rule Evaluation Flow
 
+Rules run in first-match-wins order (lowest `priority` value). For the matched
+rule, execution depends on whether a prompt exists:
+
+- No prompt: execute `rule.actions` directly (deterministic, no LLM call)
+- Prompt present: parse first token from LLM response and resolve hybridly:
+  - `APPLY` => execute `rule.actions`
+  - `SKIP` or invalid => no action
+  - explicit token (`ARCHIVE`, `TRASH`, `SPAM`, `MARK_READ`, `MARK_UNREAD`, `STAR`, `LABEL: <name>`) => execute token directly
+
 ```rust
-// crates/core/src/rules/engine.rs
-
-use crate::db::rules::RuleRepository;
-use crate::gmail::models::Message;
-use crate::llm::LlmClient;
-use super::matcher;
-use super::response_parser::{parse_llm_response, ParsedAction};
-
-pub struct RuleEngine<'a> {
-    rule_repo: &'a RuleRepository,
-    llm: &'a LlmClient,
-}
-
-impl<'a> RuleEngine<'a> {
-    pub fn new(rule_repo: &'a RuleRepository, llm: &'a LlmClient) -> Self {
-        Self { rule_repo, llm }
+// crates/core/src/rules/engine.rs (simplified)
+pub(crate) fn resolve_effective_actions(
+    rule: &Rule,
+    parsed: Option<ParsedAction>,
+) -> Vec<ParsedAction> {
+    match parsed {
+        None => vec![],
+        Some(ParsedAction::Apply) => rule.actions.iter().map(ParsedAction::from).collect(),
+        Some(action) => vec![action],
     }
-
-    pub async fn process_email(
-        &self,
-        email: &Message,
-        current_labels: &[String],
-    ) -> Result<ProcessingResult, RuleError> {
-        let rules = self.rule_repo.get_enabled_rules()?;
-
-        let matching_rule = rules
-            .iter()
-            .filter(|r| r.conditions.iter().all(|c| matcher::evaluate(c, email, current_labels)))
-            .min_by_key(|r| r.priority);
-
-        match matching_rule {
-            Some(rule) => {
-                let result = self.execute_rule(rule, email).await?;
-                Ok(ProcessingResult::RuleMatched {
-                    rule_id: rule.id,
-                    rule_name: rule.name.clone(),
-                    actions: result.actions_taken,
-                    llm_response: result.llm_response,
-                    duration_ms: result.duration_ms,
-                })
-            }
-            None => Ok(ProcessingResult::NoMatch),
-        }
-    }
-
-    async fn execute_rule(&self, rule: &Rule, email: &Message) -> Result<ExecutionResult, RuleError> {
-        let user_prompt = build_user_prompt(&rule.prompt, email);
-
-        let llm_response = self
-            .llm
-            .process(ProcessRequest::new(user_prompt))
-            .await?;
-
-        let parsed_action = parse_llm_response(&llm_response.content);
-        let (add_labels, remove_labels) = action_to_label_ops(&parsed_action);
-
-        Ok(ExecutionResult {
-            action_taken: parsed_action,
-            add_labels,
-            remove_labels,
-            llm_response: llm_response.content,
-            duration_ms: llm_response.duration_ms,
-        })
-    }
-}
-
-pub enum ProcessingResult {
-    RuleMatched {
-        rule_id: i64,
-        rule_name: String,
-        action: Option<ParsedAction>,
-        llm_response: String,
-        duration_ms: u64,
-    },
-    NoMatch,
-}
-
-struct ExecutionResult {
-    action_taken: Option<ParsedAction>,
-    add_labels: Vec<String>,
-    remove_labels: Vec<String>,
-    llm_response: String,
-    duration_ms: u64,
 }
 ```
 
@@ -304,16 +237,18 @@ struct ExecutionResult {
 // crates/core/src/rules/actions.rs
 
 use super::response_parser::ParsedAction;
+use crate::gmail::models::Label;
 use crate::gmail::GmailClient;
 
 pub async fn execute_action(
     gmail: &mut GmailClient,
     email_id: &str,
     action: &ParsedAction,
+    existing_labels: &[Label],
 ) -> Result<(), RuleError> {
     let (add, remove) = match action {
         ParsedAction::Label(name) => {
-            let label = get_or_create_label(gmail, name).await?;
+            let label = get_or_create_label(gmail, name, existing_labels).await?;
             (vec![label.id], vec![])
         }
         ParsedAction::Archive => (vec![], vec!["INBOX".into()]),
@@ -322,6 +257,7 @@ pub async fn execute_action(
         ParsedAction::MarkRead => (vec![], vec!["UNREAD".into()]),
         ParsedAction::MarkUnread => (vec!["UNREAD".into()], vec![]),
         ParsedAction::Star => (vec!["STARRED".into()], vec![]),
+        ParsedAction::Apply => (vec![], vec![]),
     };
 
     if add.is_empty() && remove.is_empty() {
@@ -338,14 +274,13 @@ pub async fn execute_action(
 async fn get_or_create_label(
     gmail: &mut GmailClient,
     name: &str,
+    existing_labels: &[Label],
 ) -> Result<crate::gmail::models::Label, RuleError> {
-    let labels = gmail.list_labels().await?;
-
-    if let Some(existing) = labels.iter().find(|l| l.name == name) {
+    if let Some(existing) = existing_labels.iter().find(|l| l.name == name) {
         return Ok(existing.clone());
     }
 
-    gmail.create_label(name, LabelVisibility::Show).await
+    gmail.create_label(name).await
 }
 ```
 
@@ -389,7 +324,7 @@ The Gmail query used to fetch emails is configurable. Stored in the config table
 | Specific label | `label:Newsletters is:unread` |
 | Exclude categories | `in:inbox -category:promotions -category:social is:unread` |
 
-The polling service fetches emails matching the query, then evaluates rules against each one. If a rule matches, the LLM processes it and actions are applied. If no rule matches, the email is skipped (not logged unless configured to do so).
+The polling service fetches emails matching the query, then evaluates rules against each one. If a rule matches and has no prompt, configured actions run directly. If it has a prompt, the LLM token is resolved with hybrid semantics (`APPLY` runs configured actions, explicit tokens override per email, `SKIP`/invalid does nothing). If no rule matches, the email is skipped.
 
 ## Example Rules
 
@@ -427,18 +362,12 @@ This week's top stories...
 This is a newsletter email.
 
 --- Response Format ---
-You MUST respond with EXACTLY ONE of these lines:
-- ARCHIVE
-- TRASH
-- SPAM
-- LABEL: <name>
-- MARK_READ
-- MARK_UNREAD
-- STAR
-- SKIP
+Respond with EXACTLY two lines:
+1) Action token: ARCHIVE, TRASH, SPAM, MARK_READ, MARK_UNREAD, STAR, APPLY, SKIP, or LABEL: <name>
+2) One-sentence imperative explanation
 ```
 
-Expected LLM response: `ARCHIVE`
+Expected LLM response token: `APPLY`
 
 ### Rule 2: Invoice Detection
 

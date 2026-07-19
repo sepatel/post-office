@@ -1,10 +1,10 @@
+use super::matcher;
+use super::models::Rule;
+use super::response_parser::{extract_reasoning, parse_llm_response, ParsedAction};
 use crate::db::rules::RuleRepository;
 use crate::gmail::models::Message;
 use crate::llm::{LlmClient, ProcessRequest};
 use crate::rules::prompts::RULE_SYSTEM_PROMPT;
-use super::matcher;
-use super::models::Rule;
-use super::response_parser::{extract_reasoning, parse_llm_response, ParsedAction};
 
 pub struct RuleEngine<'a> {
     rule_repo: &'a RuleRepository<'a>,
@@ -17,11 +17,7 @@ impl<'a> RuleEngine<'a> {
 
     /// Sync: load enabled rules and return the highest-priority one whose
     /// conditions all match (None if nothing matches).
-    pub fn find_matching_rule(
-        &self,
-        email: &Message,
-        current_labels: &[String],
-    ) -> Option<Rule> {
+    pub fn find_matching_rule(&self, email: &Message, current_labels: &[String]) -> Option<Rule> {
         let rules = self.rule_repo.get_enabled_rules().ok()?;
         rules
             .into_iter()
@@ -107,9 +103,9 @@ async fn execute_rule(
         });
     }
 
-    // Prompt present: the LLM decides APPLY/SKIP (and may name a label). The
-    // prompt is a fuzzy gate; structured actions, when present, are the
-    // deterministic outcome of a non-SKIP verdict.
+    // Prompt present: the LLM returns SKIP/APPLY/explicit action. APPLY runs
+    // configured structured actions; an explicit token acts as a per-email
+    // override.
     let user_prompt = build_user_prompt(&rule.prompt, email, memories);
 
     let llm_response = llm
@@ -124,16 +120,7 @@ async fn execute_rule(
 
     let parsed = parse_llm_response(&llm_response.content);
 
-    let actions = match parsed {
-        None => vec![],
-        Some(action) => {
-            if !rule.actions.is_empty() {
-                rule.actions.iter().map(ParsedAction::from).collect()
-            } else {
-                vec![action]
-            }
-        }
-    };
+    let actions = resolve_effective_actions(rule, parsed);
 
     Ok(Resolved {
         actions,
@@ -216,6 +203,21 @@ pub fn display_action(action: &ParsedAction) -> ActionDisplay {
             detail: None,
             display: "Apply rule actions".into(),
         },
+    }
+}
+
+/// Resolve the final action list from an LLM token under hybrid semantics:
+/// - SKIP/invalid (`None`) -> no action
+/// - APPLY -> rule's configured actions
+/// - Explicit action token -> execute that token directly
+pub(crate) fn resolve_effective_actions(
+    rule: &Rule,
+    parsed: Option<ParsedAction>,
+) -> Vec<ParsedAction> {
+    match parsed {
+        None => vec![],
+        Some(ParsedAction::Apply) => rule.actions.iter().map(ParsedAction::from).collect(),
+        Some(action) => vec![action],
     }
 }
 
@@ -319,4 +321,59 @@ fn strip_html(html: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::models::{Action, Rule};
+
+    fn rule_with_actions(actions: Vec<Action>) -> Rule {
+        Rule {
+            id: 1,
+            name: "r".into(),
+            description: None,
+            conditions: vec![],
+            prompt: "classify".into(),
+            actions,
+            priority: 0,
+            enabled: true,
+            parent_id: None,
+        }
+    }
+
+    #[test]
+    fn apply_runs_structured_actions() {
+        let rule = rule_with_actions(vec![
+            Action::Archive,
+            Action::Label {
+                value: "Invoices".into(),
+            },
+        ]);
+
+        let resolved = resolve_effective_actions(&rule, Some(ParsedAction::Apply));
+        assert_eq!(
+            resolved,
+            vec![
+                ParsedAction::Archive,
+                ParsedAction::Label("Invoices".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_token_overrides_structured_actions() {
+        let rule = rule_with_actions(vec![Action::Archive]);
+
+        let resolved = resolve_effective_actions(&rule, Some(ParsedAction::Trash));
+        assert_eq!(resolved, vec![ParsedAction::Trash]);
+    }
+
+    #[test]
+    fn skip_or_invalid_yields_no_actions() {
+        let rule = rule_with_actions(vec![Action::Archive]);
+
+        let resolved = resolve_effective_actions(&rule, None);
+        assert!(resolved.is_empty());
+    }
 }

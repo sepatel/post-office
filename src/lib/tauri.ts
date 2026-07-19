@@ -44,6 +44,20 @@ export async function rulesDelete(id: number) {
   return invoke("rules_delete", { id });
 }
 
+export interface RuleMetrics {
+  rule_id: number;
+  checked_24h: number;
+  succeeded_24h: number;
+  llm_calls_24h: number;
+  checked_7d: number;
+  succeeded_7d: number;
+  llm_calls_7d: number;
+}
+
+export async function ruleMetrics(): Promise<RuleMetrics[]> {
+  return invoke("rules_metrics");
+}
+
 export interface ChatMessage {
   id: number;
   rule_id: number;

@@ -14,7 +14,6 @@ import Layout from "./components/Layout";
 import Dashboard from "./pages/Dashboard";
 import Rules from "./pages/Rules";
 import RuleEditor from "./pages/RuleEditor";
-import RuleChat from "./pages/RuleChat";
 import History from "./pages/History";
 import Settings from "./pages/Settings";
 import { gmailConnectionStatus, type GmailConnection } from "./lib/tauri";
@@ -92,7 +91,7 @@ function App() {
               <Route path="rules" element={<Rules />} />
               <Route path="rules/new" element={<RuleEditor />} />
               <Route path="rules/:id/edit" element={<RuleEditor />} />
-              <Route path="rules/:id/chat" element={<RuleChat />} />
+              <Route path="rules/:id/chat" element={<RuleEditor />} />
               <Route path="history" element={<History />} />
               <Route path="settings" element={<Settings />} />
             </Route>

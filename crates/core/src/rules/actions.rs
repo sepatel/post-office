@@ -1,6 +1,6 @@
+use super::response_parser::ParsedAction;
 use crate::gmail::models::Label;
 use crate::gmail::GmailClient;
-use super::response_parser::ParsedAction;
 
 pub async fn execute_action(
     gmail: &mut GmailClient,
@@ -28,7 +28,9 @@ pub async fn execute_action(
 
     let add_refs: Vec<&str> = add.iter().map(String::as_str).collect();
     let remove_refs: Vec<&str> = remove.iter().map(String::as_str).collect();
-    gmail.modify_labels(email_id, &add_refs, &remove_refs).await?;
+    gmail
+        .modify_labels(email_id, &add_refs, &remove_refs)
+        .await?;
 
     Ok(())
 }

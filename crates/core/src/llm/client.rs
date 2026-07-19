@@ -1,7 +1,4 @@
-use async_openai::{
-    config::OpenAIConfig,
-    Client,
-};
+use async_openai::{config::OpenAIConfig, Client};
 use serde_json::{json, Value};
 
 use super::{LlmError, ProcessRequest, ProcessResponse};
@@ -24,9 +21,7 @@ impl LlmClient {
     }
 
     pub async fn process(&self, request: ProcessRequest) -> Result<ProcessResponse, LlmError> {
-        let model = request
-            .model
-            .unwrap_or_else(|| self.default_model.clone());
+        let model = request.model.unwrap_or_else(|| self.default_model.clone());
 
         let mut messages = Vec::new();
 
@@ -62,14 +57,9 @@ impl LlmClient {
             .unwrap_or_default()
             .to_string();
 
-        let tokens_used = response["usage"]["total_tokens"]
-            .as_u64()
-            .map(|t| t as u32);
+        let tokens_used = response["usage"]["total_tokens"].as_u64().map(|t| t as u32);
 
-        let model_used = response["model"]
-            .as_str()
-            .unwrap_or(&model)
-            .to_string();
+        let model_used = response["model"].as_str().unwrap_or(&model).to_string();
 
         Ok(ProcessResponse {
             content,

@@ -341,6 +341,10 @@ How Gmail actions map to API calls:
 | Apply label | `["Label_xxxxx"]` | — |
 | Remove label | — | `["Label_xxxxx"]` |
 
+`APPLY` is a rules-engine control token, not a Gmail action. The engine resolves
+`APPLY` to the rule's configured structured actions before calling
+`modify_labels`.
+
 ## Rate Limiting
 
 ### Quota Costs

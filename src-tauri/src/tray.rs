@@ -52,7 +52,10 @@ fn is_dark_theme() -> bool {
                     in_settings = l.eq_ignore_ascii_case("[Settings]");
                     continue;
                 }
-                if in_settings && l.to_lowercase().starts_with("gtk-application-prefer-dark-theme") {
+                if in_settings
+                    && l.to_lowercase()
+                        .starts_with("gtk-application-prefer-dark-theme")
+                {
                     if let Some(v) = l.split('=').nth(1) {
                         if v.trim() == "1" {
                             return true;

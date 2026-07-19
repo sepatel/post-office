@@ -17,3 +17,14 @@ body {
 [data-tauri-drag-region] {
   -webkit-app-region: drag;
 }
+
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]),
+a[href] {
+  cursor: pointer;
+}
+
+button:disabled,
+[role="button"][aria-disabled="true"] {
+  cursor: not-allowed;
+}

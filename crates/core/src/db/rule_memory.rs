@@ -51,8 +51,10 @@ impl<'a> RuleMemoryRepository<'a> {
     }
 
     pub fn delete_for_rule(&self, rule_id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM rule_memory WHERE rule_id = ?1", params![rule_id])?;
+        self.conn.execute(
+            "DELETE FROM rule_memory WHERE rule_id = ?1",
+            params![rule_id],
+        )?;
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
 use chrono::NaiveDate;
 
-use crate::gmail::models::{Message, MessagePayload};
 use super::models::{Condition, Operator};
+use crate::gmail::models::{Message, MessagePayload};
 
 pub fn evaluate(condition: &Condition, email: &Message, current_labels: &[String]) -> bool {
     match condition {
@@ -23,9 +23,9 @@ pub fn evaluate(condition: &Condition, email: &Message, current_labels: &[String
         }
         Condition::HasAttachment { value } => email_has_attachment(email) == *value,
         Condition::IsUnread { value } => current_labels.iter().any(|l| l == "UNREAD") == *value,
-        Condition::Label { operator, value } => {
-            current_labels.iter().any(|l| evaluate_string_op(l, operator, value))
-        }
+        Condition::Label { operator, value } => current_labels
+            .iter()
+            .any(|l| evaluate_string_op(l, operator, value)),
         Condition::DateAfter { value } => NaiveDate::parse_from_str(value, "%Y/%m/%d")
             .ok()
             .and_then(|date| parse_email_date(email).map(|d| d >= date))
@@ -34,12 +34,12 @@ pub fn evaluate(condition: &Condition, email: &Message, current_labels: &[String
             .ok()
             .and_then(|date| parse_email_date(email).map(|d| d <= date))
             .unwrap_or(false),
-        Condition::And { conditions } => {
-            conditions.iter().all(|c| evaluate(c, email, current_labels))
-        }
-        Condition::Or { conditions } => {
-            conditions.iter().any(|c| evaluate(c, email, current_labels))
-        }
+        Condition::And { conditions } => conditions
+            .iter()
+            .all(|c| evaluate(c, email, current_labels)),
+        Condition::Or { conditions } => conditions
+            .iter()
+            .any(|c| evaluate(c, email, current_labels)),
         Condition::Not { condition } => !evaluate(condition, email, current_labels),
     }
 }
@@ -69,17 +69,11 @@ fn extract_header(email: &Message, name: &str) -> String {
 }
 
 fn email_has_attachment(email: &Message) -> bool {
-    email
-        .payload
-        .as_ref()
-        .is_some_and(has_attachment_recursive)
+    email.payload.as_ref().is_some_and(has_attachment_recursive)
 }
 
 fn has_attachment_recursive(payload: &MessagePayload) -> bool {
-    payload
-        .filename
-        .as_ref()
-        .is_some_and(|f| !f.is_empty())
+    payload.filename.as_ref().is_some_and(|f| !f.is_empty())
         || payload
             .parts
             .as_ref()

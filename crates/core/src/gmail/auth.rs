@@ -33,7 +33,8 @@ impl GmailAuth {
             refresh_token,
             client_id,
             client_secret,
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(expires_in.into()),
+            expires_at: std::time::Instant::now()
+                + std::time::Duration::from_secs(expires_in.into()),
         }
     }
 

@@ -3,23 +3,31 @@ import { useNavigate, useParams } from "react-router-dom";
 import {
   rulesCreate,
   rulesUpdate,
+  rulesDelete,
   rulesList,
+  ruleApplyProposal,
+  ruleMetrics,
   gmailRecentMessages,
   rulesTest,
   rulesApply,
   bulkEvaluate,
-  RecentMessage,
-  TestResult,
-  ApplyResult,
-  BulkVerdict,
+  type ChatProposal,
+  type MemoryInput,
+  type RecentMessage,
+  type RuleMetrics,
+  type TestResult,
+  type ApplyResult,
+  type BulkVerdict,
 } from "../lib/tauri";
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
+import RuleChatPanel from "../components/RuleChatPanel";
 
 interface Condition {
   type: string;
-  operator: string;
-  value: string;
+  operator?: string;
+  value?: string;
+  [key: string]: unknown;
 }
 
 type ActionType =
@@ -66,6 +74,7 @@ function actionLabel(action: RuleAction): string {
 
 export default function RuleEditor() {
   const { id } = useParams();
+  const ruleId = Number(id ?? 0);
   const navigate = useNavigate();
   const isEdit = Boolean(id);
   const toast = useToast();
@@ -94,17 +103,31 @@ export default function RuleEditor() {
   const [bulkResults, setBulkResults] = useState<BulkVerdict[] | null>(null);
   const [bulkEvaluating, setBulkEvaluating] = useState(false);
   const [bulkApplyingId, setBulkApplyingId] = useState<string | null>(null);
+  const [pendingMemories, setPendingMemories] = useState<MemoryInput[]>([]);
+  const [metrics, setMetrics] = useState<RuleMetrics | null>(null);
 
   useEffect(() => {
     if (isEdit) {
       loadRule();
+      loadMetrics();
+    } else {
+      setMetrics(null);
     }
   }, [id]);
 
   async function loadRule() {
     try {
-      const rules = (await rulesList()) as { id: number; name: string; description: string | null; conditions: unknown[]; prompt: string; actions: unknown[]; priority: number; enabled: boolean }[];
-      const rule = rules.find((r) => r.id === Number(id));
+      const rules = (await rulesList()) as {
+        id: number;
+        name: string;
+        description: string | null;
+        conditions: unknown[];
+        prompt: string;
+        actions: unknown[];
+        priority: number;
+        enabled: boolean;
+      }[];
+      const rule = rules.find((r) => r.id === ruleId);
       if (rule) {
         setName(rule.name);
         setDescription(rule.description || "");
@@ -113,23 +136,36 @@ export default function RuleEditor() {
         setEnabled(rule.enabled);
         setConditions(rule.conditions as Condition[]);
         setActions(rule.actions as RuleAction[]);
+        setPendingMemories([]);
       }
     } catch (e) {
       console.error("Failed to load rule:", e);
     }
   }
 
+  async function loadMetrics() {
+    if (!isEdit) return;
+    try {
+      const all = await ruleMetrics();
+      setMetrics(all.find((m) => m.rule_id === ruleId) ?? null);
+    } catch (e) {
+      console.error("Failed to load rule metrics:", e);
+    }
+  }
+
   function addCondition() {
+    if (!conditionValue.trim()) return;
     const condition = {
       type: conditionType,
       operator: conditionOperator,
-      value: conditionValue,
+      value: conditionValue.trim(),
     };
     setConditions([...conditions, condition]);
     setConditionValue("");
   }
 
   function addAction() {
+    if (actionType === "label" && !actionValue.trim()) return;
     const action: RuleAction =
       actionType === "label"
         ? { type: "label", value: actionValue.trim() }
@@ -152,15 +188,62 @@ export default function RuleEditor() {
 
   async function handleSave() {
     try {
+      const payload = buildRulePayload();
       if (isEdit) {
-        await rulesUpdate(Number(id), buildRulePayload());
+        await rulesUpdate(ruleId, payload);
+        if (pendingMemories.length > 0) {
+          await ruleApplyProposal(ruleId, {
+            prompt: null,
+            actions_add: [],
+            conditions_add: [],
+            memories_add: pendingMemories,
+          });
+        }
       } else {
-        await rulesCreate(buildRulePayload());
+        await rulesCreate(payload);
       }
+      toast.success(isEdit ? "Rule updated" : "Rule created");
       navigate("/rules");
     } catch (e) {
+      toast.error(String(e));
       console.error("Failed to save rule:", e);
     }
+  }
+
+  async function handleDelete() {
+    if (!isEdit) return;
+    if (!confirm("Delete this rule? This cannot be undone.")) return;
+
+    try {
+      await rulesDelete(ruleId);
+      toast.success("Rule deleted");
+      navigate("/rules");
+    } catch (e) {
+      const msg = typeof e === "string" ? e : String(e);
+      toast.error(msg);
+      console.error("Failed to delete rule:", e);
+    }
+  }
+
+  async function applyChatProposalToDraft(proposal: ChatProposal) {
+    if (proposal.prompt !== null) {
+      setPrompt(proposal.prompt);
+    }
+    if (proposal.actions_add.length > 0) {
+      setActions((prev) => [...prev, ...(proposal.actions_add as RuleAction[])]);
+    }
+    if (proposal.conditions_add.length > 0) {
+      setConditions((prev) => [...prev, ...(proposal.conditions_add as Condition[])]);
+    }
+    if (proposal.memories_add.length > 0) {
+      setPendingMemories((prev) =>
+        dedupeMemories([...prev, ...proposal.memories_add]),
+      );
+    }
+    setTestResult(null);
+    setApplyResult(null);
+    setBulkResults(null);
+    toast.success("Proposal applied to draft. Save to persist.");
   }
 
   async function loadRecentMessages() {
@@ -244,12 +327,36 @@ export default function RuleEditor() {
   }
 
   return (
-    <div className="max-w-2xl">
-      <h2 className="text-2xl font-bold mb-6">
-        {isEdit ? "Edit Rule" : "New Rule"}
-      </h2>
+    <div className="h-full min-h-0 xl:grid xl:grid-cols-[minmax(0,2fr)_minmax(0,1.15fr)] gap-6">
+      <div className="min-w-0">
+        <h2 className="text-2xl font-bold mb-4">
+          {isEdit ? "Edit Rule" : "New Rule"}
+        </h2>
 
-      <div className="space-y-4">
+        {isEdit && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+            <MetricCard
+              label="Last 24h"
+              checked={metrics?.checked_24h ?? 0}
+              succeeded={metrics?.succeeded_24h ?? 0}
+              llmCalls={metrics?.llm_calls_24h ?? 0}
+            />
+            <MetricCard
+              label="Last 7d"
+              checked={metrics?.checked_7d ?? 0}
+              succeeded={metrics?.succeeded_7d ?? 0}
+              llmCalls={metrics?.llm_calls_7d ?? 0}
+            />
+          </div>
+        )}
+
+        {pendingMemories.length > 0 && (
+          <div className="mb-4 text-xs text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded px-3 py-2">
+            {pendingMemories.length} memory note{pendingMemories.length === 1 ? "" : "s"} pending save.
+          </div>
+        )}
+
+        <div className="space-y-4">
         <div>
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">Name</label>
           <input
@@ -332,8 +439,13 @@ export default function RuleEditor() {
                 className="flex items-center gap-2 text-sm bg-gray-100 dark:bg-gray-800/50 rounded px-2 py-1"
               >
                 <span className="text-gray-500 dark:text-gray-400">{c.type}</span>
-                <span>{c.operator}</span>
-                <span className="text-blue-600 dark:text-blue-300">{c.value}</span>
+                {typeof c.operator === "string" && <span>{c.operator}</span>}
+                {typeof c.value === "string" && (
+                  <span className="text-blue-600 dark:text-blue-300">{c.value}</span>
+                )}
+                {typeof c.operator !== "string" && typeof c.value !== "string" && (
+                  <span className="text-gray-400 dark:text-gray-500">complex</span>
+                )}
                 <button
                   onClick={() =>
                     setConditions(conditions.filter((_, idx) => idx !== i))
@@ -406,29 +518,19 @@ export default function RuleEditor() {
         </div>
 
         <div>
-          <div className="flex items-center justify-between mb-1">
-            <label className="block text-sm text-gray-500 dark:text-gray-400">
-              LLM Prompt (optional)
-            </label>
-            {isEdit && (
-              <button
-                onClick={() => navigate(`/rules/${id}/chat`)}
-                className="text-xs text-purple-600 dark:text-purple-300 hover:underline"
-              >
-                Chat to tune this rule →
-              </button>
-            )}
-          </div>
+          <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
+            LLM Prompt (optional)
+          </label>
           <textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             rows={6}
             className="w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-3 py-2 text-sm font-mono"
-            placeholder="The classifier prompt. Best authored by chatting with the rule (see 'Chat to tune'). When this rule has actions above, the prompt acts as a gate: reply APPLY to run them, SKIP to do nothing."
+            placeholder="The classifier prompt. Chat proposals on the right apply to this draft only until you save. With actions above: reply APPLY to run them, SKIP to do nothing, or return an explicit action (like TRASH or LABEL: Invoices) to override for that email."
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Tip: chat with the rule to write this prompt and teach it exceptions.
-            It proposes changes you approve.
+            Tip: use chat to propose edits, apply them to this draft, then test
+            before saving.
           </p>
         </div>
 
@@ -634,8 +736,85 @@ export default function RuleEditor() {
           >
             Cancel
           </button>
+          {isEdit && (
+            <button
+              onClick={handleDelete}
+              className="ml-auto bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
+            >
+              Delete rule
+            </button>
+          )}
         </div>
+      </div>
+      </div>
+
+      <div className="min-w-0 h-[32rem] xl:h-[calc(100vh-9rem)]">
+        {isEdit ? (
+          <RuleChatPanel
+            ruleId={ruleId}
+            ruleName={name || "Untitled rule"}
+            onApplyProposal={applyChatProposalToDraft}
+          />
+        ) : (
+          <div className="h-full flex items-center justify-center text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-6 text-center">
+            Save this rule first, then tune it with chat from the right panel.
+          </div>
+        )}
       </div>
     </div>
   );
+}
+
+function dedupeMemories(memories: MemoryInput[]): MemoryInput[] {
+  const seen = new Set<string>();
+  return memories.filter((m) => {
+    const key = `${m.kind}::${m.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function MetricCard({
+  label,
+  checked,
+  succeeded,
+  llmCalls,
+}: {
+  label: string;
+  checked: number;
+  succeeded: number;
+  llmCalls: number;
+}) {
+  const successRate = ratePercent(succeeded, checked);
+  const llmRate = ratePercent(llmCalls, checked);
+  const showLlmCalls = llmCalls > 0 && llmCalls !== checked;
+
+  return (
+    <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2">
+      <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">{label}</div>
+      <div className="text-sm text-gray-700 dark:text-gray-200">
+        {checked} checked • {succeeded} success
+      </div>
+      <div className={`text-xs mt-1 ${successRateTone(successRate)}`}>
+        {successRate}% success
+      </div>
+      {showLlmCalls && (
+        <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+          {llmCalls} LLM calls ({llmRate}%)
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ratePercent(part: number, whole: number): number {
+  if (whole === 0) return 0;
+  return Math.round((part / whole) * 100);
+}
+
+function successRateTone(rate: number): string {
+  if (rate >= 80) return "text-green-600 dark:text-green-400";
+  if (rate >= 50) return "text-yellow-600 dark:text-yellow-400";
+  return "text-red-600 dark:text-red-400";
 }

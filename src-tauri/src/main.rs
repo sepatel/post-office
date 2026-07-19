@@ -2,9 +2,9 @@ use post_office_core::config::AppConfig;
 use post_office_core::gmail::GmailClient;
 use post_office_core::processing::{run_processing_loop, ProcessingState};
 use std::sync::Arc;
-use tauri::Manager;
 use tauri::tray::TrayIcon;
 use tauri::Emitter;
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 mod commands;
@@ -105,6 +105,7 @@ fn main() {
             commands::rules_apply,
             commands::bulk_evaluate,
             commands::history_list,
+            commands::rules_metrics,
             commands::history_search,
             commands::processing_status,
             commands::processing_pause,

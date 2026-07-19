@@ -70,11 +70,7 @@ impl<'a> RuleRepository<'a> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT id, name, description, conditions, prompt, actions, priority, enabled, parent_id
              FROM rules

@@ -1,7 +1,7 @@
 pub mod actions;
 pub mod chat;
-pub mod evaluation;
 pub mod engine;
+pub mod evaluation;
 pub mod matcher;
 pub mod models;
 pub mod prompts;

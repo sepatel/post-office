@@ -35,6 +35,7 @@ A Rust desktop application for applying AI filters over Gmail emails. Runs local
 |----------|----------|
 | Email content for LLM | Plain text if available, full HTML as fallback |
 | Rule evaluation | First-match-wins (lowest priority number wins) |
+| Prompt + structured actions | Hybrid token resolution: APPLY runs configured actions; explicit tokens override per email |
 | Processing scope | Configurable per-instance (default: `is:unread`) |
 | Starter prompt templates | Not for MVP |
 | Malformed LLM responses | Strict prompt format, skip email if invalid (no retry) |

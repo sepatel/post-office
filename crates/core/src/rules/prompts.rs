@@ -15,6 +15,7 @@ Rules:
 - The first non-empty line must be the token alone; it is the only thing used to act.
 - The line 2 explanation must be brief, begin with a verb, and justify the decision.
 - Use APPLY to run the rule's configured actions.
+- If you choose ARCHIVE/TRASH/SPAM/MARK_READ/MARK_UNREAD/STAR/LABEL: <name>, that explicit action is applied directly.
 - Use SKIP when the rule does not apply (no change is made).
 - Use LABEL: <name> to apply a specific label named <name>.";
 
@@ -36,7 +37,9 @@ where N is the email's number (1-based) and <TOKEN> is exactly one of:
 Rules:
 - Output one `N: <TOKEN>` line for every email, in order (do not skip any).
 - The first token after `N:` must be the action alone; it is the only thing used.
-- Use APPLY to run the rule's configured actions. Use SKIP when the rule does not apply.
+- Use APPLY to run the rule's configured actions.
+- If you choose ARCHIVE/TRASH/SPAM/MARK_READ/MARK_UNREAD/STAR/LABEL: <name>, that explicit action is applied directly.
+- Use SKIP when the rule does not apply.
 - Use LABEL: <name> to apply a specific label named <name>.";
 
 /// System prompt for the *chat* path: the LLM converses with the user and

@@ -105,6 +105,39 @@ impl<'a> HistoryRepository<'a> {
         rows.next().transpose()
     }
 
+    pub fn rules_metrics(&self) -> Result<Vec<RuleMetrics>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                rule_id,
+                SUM(CASE WHEN created_at >= datetime('now', '-24 hours') THEN 1 ELSE 0 END) AS checked_24h,
+                SUM(CASE WHEN created_at >= datetime('now', '-24 hours') AND status = 'success' THEN 1 ELSE 0 END) AS succeeded_24h,
+                SUM(CASE WHEN created_at >= datetime('now', '-24 hours') AND (action = 'RESOLVE_RULE' OR COALESCE(TRIM(llm_response), '') <> '') THEN 1 ELSE 0 END) AS llm_calls_24h,
+                COUNT(*) AS checked_7d,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS succeeded_7d,
+                SUM(CASE WHEN action = 'RESOLVE_RULE' OR COALESCE(TRIM(llm_response), '') <> '' THEN 1 ELSE 0 END) AS llm_calls_7d
+             FROM history
+             WHERE rule_id IS NOT NULL
+               AND created_at >= datetime('now', '-7 days')
+             GROUP BY rule_id",
+        )?;
+
+        let entries = stmt
+            .query_map([], |row| {
+                Ok(RuleMetrics {
+                    rule_id: row.get(0)?,
+                    checked_24h: row.get(1)?,
+                    succeeded_24h: row.get(2)?,
+                    llm_calls_24h: row.get(3)?,
+                    checked_7d: row.get(4)?,
+                    succeeded_7d: row.get(5)?,
+                    llm_calls_7d: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(entries)
+    }
+
     pub fn search(&self, query: &str) -> Result<Vec<HistoryEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT h.id, h.email_id, h.email_from, h.email_subject, h.rule_id, h.rule_name,
@@ -169,4 +202,15 @@ pub struct HistoryEntry {
     pub error: Option<String>,
     pub duration_ms: Option<i64>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleMetrics {
+    pub rule_id: i64,
+    pub checked_24h: i64,
+    pub succeeded_24h: i64,
+    pub llm_calls_24h: i64,
+    pub checked_7d: i64,
+    pub succeeded_7d: i64,
+    pub llm_calls_7d: i64,
 }

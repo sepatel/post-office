@@ -47,16 +47,22 @@ Post Office is a single-user desktop application that polls Gmail for new emails
    │
    ├── 3b. RuleEngine::evaluate(email, rules)
    │       → Check conditions in priority order
-   │       → Return first matching rule (or all matches, configurable)
+   │       → Return first matching rule (lowest priority number)
    │
    ├── 3c. If rule matched:
    │       │
-   │       ├── LlmClient::process(rule.prompt + email_content)
-   │       │   → Send to local OpenAI-compatible endpoint
-   │       │   → Parse response for action instructions
+   │       ├── If rule.prompt is empty:
+   │       │     → Resolve configured structured actions locally (no LLM call)
+   │       │
+   │       ├── Else LlmClient::process(rule.prompt + email_content)
+   │       │   → Parse first non-empty token line (APPLY, SKIP, explicit action)
+   │       │   → Hybrid resolution:
+   │       │       APPLY => run configured structured actions
+   │       │       SKIP / invalid => no action
+   │       │       ARCHIVE/TRASH/SPAM/MARK_READ/MARK_UNREAD/STAR/LABEL:<name> => execute token directly
    │       │
    │       └── GmailClient::modify_labels(email_id, add, remove)
-   │           → Execute actions (label, archive, trash, spam)
+   │           → Execute resolved Gmail label mutations
    │
    ├── 3d. Log to history table
    │       (email_id, rule_id, action, status, llm_response, duration)
@@ -139,6 +145,6 @@ The `src-tauri` crate is thin: it wires Tauri IPC commands to core functions and
 | Gmail API auth (401) | Refresh token, retry once; if refresh fails, notify user |
 | Gmail API permanent (400, 404) | Log error, skip email, continue |
 | LLM endpoint unreachable | Log error, skip email, mark rule as failed |
-| LLM malformed response | Retry with stricter prompt, then skip |
+| LLM malformed response | Log response, skip email (no retry) |
 | SQLite write failure | Retry once; if persistent, notify user |
 | Config parse failure | Use defaults, log warning |

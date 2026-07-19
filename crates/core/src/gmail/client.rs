@@ -32,7 +32,11 @@ impl GmailClient {
         // Treat an empty body as `null` so callers that don't need the payload
         // (typed as `()` / `Option` / `Value`) still decode cleanly.
         let text = response.text().await.unwrap_or_default();
-        let text = if text.trim().is_empty() { "null" } else { text.as_str() };
+        let text = if text.trim().is_empty() {
+            "null"
+        } else {
+            text.as_str()
+        };
         serde_json::from_str::<T>(text).map_err(GmailError::from)
     }
 
@@ -47,7 +51,10 @@ impl GmailClient {
         }
 
         let url = format!("{BASE_URL}/users/me{path}");
-        let mut req = self.http.request(method.clone(), &url).bearer_auth(&self.auth.access_token);
+        let mut req = self
+            .http
+            .request(method.clone(), &url)
+            .bearer_auth(&self.auth.access_token);
 
         if let Some(body) = body {
             req = req.json(body);
@@ -173,12 +180,8 @@ impl GmailClient {
             message_list_visibility: "show",
             label_list_visibility: "labelShow",
         };
-        self.request(
-            reqwest::Method::POST,
-            "/labels",
-            Some(&request_body),
-        )
-        .await
+        self.request(reqwest::Method::POST, "/labels", Some(&request_body))
+            .await
     }
 
     pub async fn get_profile(&mut self) -> Result<GmailProfile, GmailError> {

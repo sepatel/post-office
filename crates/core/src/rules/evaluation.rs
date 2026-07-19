@@ -6,7 +6,9 @@ use regex::Regex;
 
 use crate::gmail::models::Message;
 use crate::llm::{LlmClient, ProcessRequest};
-use crate::rules::engine::{display_action, email_parts, ActionDisplay, RuleError};
+use crate::rules::engine::{
+    display_action, email_parts, resolve_effective_actions, ActionDisplay, RuleError,
+};
 use crate::rules::matcher;
 use crate::rules::models::Rule;
 use crate::rules::prompts::BATCH_SYSTEM_PROMPT;
@@ -97,7 +99,7 @@ pub async fn bulk_evaluate(
         let parsed = parse_batch(&response.content, chunk.len());
         for (offset, action_opt) in parsed.into_iter().enumerate() {
             let global_idx = matched[chunk_start + offset];
-            verdicts[global_idx].actions = resolve_actions(rule, action_opt)
+            verdicts[global_idx].actions = resolve_effective_actions(rule, action_opt)
                 .into_iter()
                 .map(|a| display_action(&a))
                 .collect();
@@ -107,21 +109,6 @@ pub async fn bulk_evaluate(
     }
 
     Ok(verdicts)
-}
-
-/// Mirror `engine::execute_rule`: a non-SKIP verdict with configured actions runs
-/// those structured actions; otherwise the single parsed action is the outcome.
-fn resolve_actions(rule: &Rule, parsed: Option<ParsedAction>) -> Vec<ParsedAction> {
-    match parsed {
-        None => vec![],
-        Some(action) => {
-            if !rule.actions.is_empty() {
-                rule.actions.iter().map(ParsedAction::from).collect()
-            } else {
-                vec![action]
-            }
-        }
-    }
 }
 
 fn build_batch_prompt(rule: &Rule, emails: &[&Message]) -> String {

@@ -52,22 +52,12 @@ impl AppConfig {
             llm_base_url: get("llm.base_url", &Self::default().llm_base_url),
             llm_api_key: get("llm.api_key", &Self::default().llm_api_key),
             llm_default_model: get("llm.default_model", &Self::default().llm_default_model),
-            llm_temperature: get("llm.temperature", "0.3")
-                .parse()
-                .unwrap_or(0.3),
-            llm_max_tokens: get("llm.max_tokens", "1024")
-                .parse()
-                .unwrap_or(1024),
+            llm_temperature: get("llm.temperature", "0.3").parse().unwrap_or(0.3),
+            llm_max_tokens: get("llm.max_tokens", "1024").parse().unwrap_or(1024),
             polling_query: get("polling.query", &Self::default().polling_query),
-            polling_interval_minutes: get("polling.interval_minutes", "5")
-                .parse()
-                .unwrap_or(5),
-            polling_max_per_cycle: get("polling.max_per_cycle", "100")
-                .parse()
-                .unwrap_or(100),
-            polling_enabled: get("polling.enabled", "true")
-                .parse()
-                .unwrap_or(true),
+            polling_interval_minutes: get("polling.interval_minutes", "5").parse().unwrap_or(5),
+            polling_max_per_cycle: get("polling.max_per_cycle", "100").parse().unwrap_or(100),
+            polling_enabled: get("polling.enabled", "true").parse().unwrap_or(true),
             tray_theme: get("ui.tray_theme", "auto"),
         }
     }

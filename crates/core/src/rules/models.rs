@@ -17,28 +17,16 @@ pub struct Rule {
 #[serde(tag = "type")]
 pub enum Condition {
     #[serde(rename = "from")]
-    From {
-        operator: Operator,
-        value: String,
-    },
+    From { operator: Operator, value: String },
 
     #[serde(rename = "to")]
-    To {
-        operator: Operator,
-        value: String,
-    },
+    To { operator: Operator, value: String },
 
     #[serde(rename = "subject")]
-    Subject {
-        operator: Operator,
-        value: String,
-    },
+    Subject { operator: Operator, value: String },
 
     #[serde(rename = "body")]
-    Body {
-        operator: Operator,
-        value: String,
-    },
+    Body { operator: Operator, value: String },
 
     #[serde(rename = "has_attachment")]
     HasAttachment { value: bool },
@@ -47,10 +35,7 @@ pub enum Condition {
     IsUnread { value: bool },
 
     #[serde(rename = "label")]
-    Label {
-        operator: Operator,
-        value: String,
-    },
+    Label { operator: Operator, value: String },
 
     #[serde(rename = "date_after")]
     DateAfter { value: String },
@@ -65,9 +50,7 @@ pub enum Condition {
     Or { conditions: Vec<Condition> },
 
     #[serde(rename = "not")]
-    Not {
-        condition: Box<Condition>,
-    },
+    Not { condition: Box<Condition> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

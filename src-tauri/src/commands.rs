@@ -1,11 +1,10 @@
 use post_office_core::config::AppConfig;
+use post_office_core::db::rule_chat::ChatMessageRow;
 use post_office_core::db::rules::{CreateRuleRequest, UpdateRuleRequest};
 use post_office_core::gmail::oauth::{auth_url, exchange_code, generate_pkce};
 use post_office_core::gmail::{store_tokens, GmailAuth, GmailClient};
 use post_office_core::llm::LlmClient;
 use post_office_core::processing::run_backfill;
-use std::sync::Arc;
-use post_office_core::db::rule_chat::ChatMessageRow;
 use post_office_core::rules::actions::execute_action;
 use post_office_core::rules::chat::{apply_proposal, chat_with_rule, ChatProposal, ChatTurn};
 use post_office_core::rules::engine::{display_action, ActionDisplay, TestResult};
@@ -13,16 +12,17 @@ use post_office_core::rules::evaluation::BulkVerdict;
 use post_office_core::rules::models::{Action, Condition, Rule};
 use post_office_core::rules::response_parser::ParsedAction;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
-use tauri::Emitter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::AppState;
 use crate::tray;
+use crate::AppState;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RuleCreateRequest {
@@ -76,14 +76,13 @@ fn build_rule_model(rule: &RuleCreateRequest) -> Rule {
     }
 }
 
-fn extract_header(
-    email: &post_office_core::gmail::models::Message,
-    name: &str,
-) -> Option<String> {
-    email
-        .payload
-        .as_ref()
-        .and_then(|p| p.headers.iter().find(|h| h.name == name).map(|h| h.value.clone()))
+fn extract_header(email: &post_office_core::gmail::models::Message, name: &str) -> Option<String> {
+    email.payload.as_ref().and_then(|p| {
+        p.headers
+            .iter()
+            .find(|h| h.name == name)
+            .map(|h| h.value.clone())
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -112,31 +111,39 @@ pub async fn config_set(
 ) -> Result<(), String> {
     let mut config = state.config.lock().await;
     match key.as_str() {
-        "gmail.account" => {
-            config.gmail_account = if value.is_empty() { None } else { Some(value) }
-        }
+        "gmail.account" => config.gmail_account = if value.is_empty() { None } else { Some(value) },
         "llm.base_url" => config.llm_base_url = value,
         "llm.api_key" => config.llm_api_key = value,
         "llm.default_model" => config.llm_default_model = value,
         "llm.temperature" => {
-            let val: f32 = value.parse().map_err(|e: std::num::ParseFloatError| e.to_string())?;
+            let val: f32 = value
+                .parse()
+                .map_err(|e: std::num::ParseFloatError| e.to_string())?;
             config.llm_temperature = val;
         }
         "llm.max_tokens" => {
-            let val: u32 = value.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let val: u32 = value
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
             config.llm_max_tokens = val;
         }
         "polling.query" => config.polling_query = value,
         "polling.interval_minutes" => {
-            let val: u32 = value.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let val: u32 = value
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
             config.polling_interval_minutes = val;
         }
         "polling.max_per_cycle" => {
-            let val: u32 = value.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let val: u32 = value
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
             config.polling_max_per_cycle = val;
         }
         "polling.enabled" => {
-            let val: bool = value.parse().map_err(|e: std::str::ParseBoolError| e.to_string())?;
+            let val: bool = value
+                .parse()
+                .map_err(|e: std::str::ParseBoolError| e.to_string())?;
             config.polling_enabled = val;
         }
         "google.client_id" => config.google_client_id = value,
@@ -387,9 +394,10 @@ pub async fn rules_apply(
             .unwrap_or_default()
     });
 
-    let resolved = post_office_core::rules::engine::resolve_rule(&llm, &rule_model, &email, &memories)
-        .await
-        .map_err(|e| e.to_string())?;
+    let resolved =
+        post_office_core::rules::engine::resolve_rule(&llm, &rule_model, &email, &memories)
+            .await
+            .map_err(|e| e.to_string())?;
 
     let resolved = match resolved {
         None => {
@@ -422,7 +430,11 @@ pub async fn rules_apply(
     Ok(ApplyResult {
         matched: true,
         applied,
-        error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        },
     })
 }
 
@@ -435,6 +447,16 @@ pub async fn history_list(
     state
         .db
         .with_history(|repo| repo.list(page, per_page))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rules_metrics(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::history::RuleMetrics>, String> {
+    state
+        .db
+        .with_history(|repo| repo.rules_metrics())
         .map_err(|e| e.to_string())
 }
 
@@ -468,16 +490,14 @@ pub async fn processing_status(state: State<'_, AppState>) -> Result<ProcessingS
 #[tauri::command]
 pub async fn processing_pause(state: State<'_, AppState>) -> Result<(), String> {
     let ps = state.processing_state.lock().await;
-    ps.paused
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    ps.paused.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn processing_resume(state: State<'_, AppState>) -> Result<(), String> {
     let ps = state.processing_state.lock().await;
-    ps.paused
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    ps.paused.store(false, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -549,9 +569,7 @@ fn parse_day_end(value: &str) -> Result<DateTime<Utc>, String> {
         return Ok(dt.with_timezone(&Utc));
     }
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map(|d| {
-            DateTime::from_naive_utc_and_offset(d.and_hms_opt(23, 59, 59).unwrap(), Utc)
-        })
+        .map(|d| DateTime::from_naive_utc_and_offset(d.and_hms_opt(23, 59, 59).unwrap(), Utc))
         .map_err(|e| e.to_string())
 }
 
@@ -615,10 +633,7 @@ fn json_field(json: &Option<serde_json::Value>, key: &str) -> Option<String> {
 /// 2. bundled google-oauth.json (resource dir)
 /// 3. google.client_id stored in app config (legacy override)
 /// 4. client_id baked into the binary at build time
-pub fn resolve_client_id(
-    app: &tauri::AppHandle,
-    config: &AppConfig,
-) -> Result<String, String> {
+pub fn resolve_client_id(app: &tauri::AppHandle, config: &AppConfig) -> Result<String, String> {
     if let Ok(v) = std::env::var("POST_OFFICE_GOOGLE_CLIENT_ID") {
         if !v.trim().is_empty() {
             return Ok(v.trim().to_string());
@@ -753,11 +768,7 @@ async fn listen_for_oauth_code() -> Result<String, String> {
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
         let request = String::from_utf8_lossy(&buf[..n]);
-        let first_line = request
-            .lines()
-            .next()
-            .ok_or("Empty request")?
-            .to_string();
+        let first_line = request.lines().next().ok_or("Empty request")?.to_string();
 
         let body = "<!doctype html><html><body style='font-family:sans-serif'><h2>Post Office</h2><p>Authentication complete. You can close this tab and return to the app.</p></body></html>";
         let response = format!(
@@ -771,10 +782,9 @@ async fn listen_for_oauth_code() -> Result<String, String> {
         Ok::<String, String>(first_line)
     };
 
-    let first_line =
-        tokio::time::timeout(std::time::Duration::from_secs(300), accept)
-            .await
-            .map_err(|_| "Timed out waiting for OAuth callback".to_string())??;
+    let first_line = tokio::time::timeout(std::time::Duration::from_secs(300), accept)
+        .await
+        .map_err(|_| "Timed out waiting for OAuth callback".to_string())??;
 
     let path = first_line
         .strip_prefix("GET ")
@@ -783,11 +793,10 @@ async fn listen_for_oauth_code() -> Result<String, String> {
     let path = path.split_whitespace().next().ok_or("Unexpected request")?;
 
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-    let params: std::collections::HashMap<String, String> = url::form_urlencoded::parse(
-        query.as_bytes(),
-    )
-    .into_owned()
-    .collect();
+    let params: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
 
     if let Some(err) = params.get("error") {
         let desc = params
