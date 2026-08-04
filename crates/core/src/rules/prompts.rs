@@ -15,7 +15,8 @@ Rules:
 - The first non-empty line must be the token alone; it is the only thing used to act.
 - The line 2 explanation must be brief, begin with a verb, and justify the decision.
 - Use APPLY to run the rule's configured actions.
-- If you choose ARCHIVE/TRASH/SPAM/MARK_READ/MARK_UNREAD/STAR/LABEL: <name>, that explicit action is applied directly.
+- TRASH and SPAM run directly and do NOT run configured actions.
+- ARCHIVE, MARK_READ, MARK_UNREAD, STAR, or LABEL: <name> run that explicit action AND then run configured actions.
 - Use SKIP when the rule does not apply (no change is made).
 - Use LABEL: <name> to apply a specific label named <name>.";
 
@@ -28,17 +29,19 @@ You will be given several emails and ONE rule instruction that applies to all of
 For each email, decide the single action to take.
 
 Respond with exactly one line per email, in numeric order:
-  N: <TOKEN>
+  N: <TOKEN> | <brief explanation>
 
 where N is the email's number (1-based) and <TOKEN> is exactly one of:
   ARCHIVE, TRASH, SPAM, MARK_READ, MARK_UNREAD, STAR, APPLY, SKIP
   or  LABEL: <name>
 
 Rules:
-- Output one `N: <TOKEN>` line for every email, in order (do not skip any).
+- Output one `N: <TOKEN> | <brief explanation>` line for every email, in order (do not skip any).
 - The first token after `N:` must be the action alone; it is the only thing used.
+- The explanation must briefly justify the decision using details from that email.
 - Use APPLY to run the rule's configured actions.
-- If you choose ARCHIVE/TRASH/SPAM/MARK_READ/MARK_UNREAD/STAR/LABEL: <name>, that explicit action is applied directly.
+- TRASH and SPAM run directly and do NOT run configured actions.
+- ARCHIVE, MARK_READ, MARK_UNREAD, STAR, or LABEL: <name> run that explicit action AND then run configured actions.
 - Use SKIP when the rule does not apply.
 - Use LABEL: <name> to apply a specific label named <name>.";
 

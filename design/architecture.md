@@ -2,7 +2,12 @@
 
 ## System Overview
 
-Post Office is a single-user desktop application that polls Gmail for new emails, applies user-defined rules with AI-powered classification via a local LLM, and executes actions (label, archive, trash, mark spam).
+Post Office is a single-user desktop application that applies user-defined
+rules to Gmail with AI-powered classification via a local LLM and executes
+actions (label, archive, trash, mark spam).
+
+Current ingestion is interval polling. Target ingestion is Gmail push
+notifications (`users.watch`) plus durable cursor replay (`users.history.list`).
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -33,23 +38,46 @@ Post Office is a single-user desktop application that polls Gmail for new emails
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Push Target State
+
+```
+┌───────────────────────────── Google Cloud ─────────────────────────────┐
+│ Gmail -> Pub/Sub topic -> Push subscription -> Relay webhook/API/WS    │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │ outbound WS
+┌───────────────────────────────────▼─────────────────────────────────────┐
+│                      Desktop App (Tauri + Core)                        │
+│                                                                         │
+│  Sync Agent -> users.history.list replay -> Rule Engine -> Gmail ops   │
+│        |                                                                │
+│        v                                                                │
+│    sqlite cursor state (`last_history_id`) + processing history         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+See `design/gmail-push-sync.md` for protocol and rollout details.
+
 ## Data Flow
 
 ```
-1. Poller wakes up (every N minutes, configurable)
+1. Sync trigger fires (push notification, startup replay, or safety sweep)
    │
-2. GmailClient::list_messages("is:unread", max=100)
+2. Sync agent reads persisted `last_history_id`
    │
-3. For each email:
+3. GmailClient::history_list(startHistoryId=...)
    │
-   ├── 3a. GmailClient::get_message(id, Format::Full)
+4. Collect changed message IDs (deduped)
+   │
+5. For each email:
+   │
+   ├── 5a. GmailClient::get_message(id, Format::Full)
    │       → Extract subject, sender, body (plain text), labels, date
    │
-   ├── 3b. RuleEngine::evaluate(email, rules)
+   ├── 5b. RuleEngine::evaluate(email, rules)
    │       → Check conditions in priority order
    │       → Return first matching rule (lowest priority number)
    │
-   ├── 3c. If rule matched:
+   ├── 5c. If rule matched:
    │       │
    │       ├── If rule.prompt is empty:
    │       │     → Resolve configured structured actions locally (no LLM call)
@@ -64,10 +92,12 @@ Post Office is a single-user desktop application that polls Gmail for new emails
    │       └── GmailClient::modify_labels(email_id, add, remove)
    │           → Execute resolved Gmail label mutations
    │
-   ├── 3d. Log to history table
+   ├── 5d. Log to history table
    │       (email_id, rule_id, action, status, llm_response, duration)
    │
-   └── 3e. Emit Tauri event to update GUI
+   ├── 5e. Persist highest replayed history id
+   │
+   └── 5f. Emit Tauri event to update GUI
 ```
 
 ## Workspace Structure
@@ -119,7 +149,7 @@ The `src-tauri` crate is thin: it wires Tauri IPC commands to core functions and
 │                 Tokio Runtime                    │
 │                                                  │
 │  ┌──────────────┐  ┌──────────────────────────┐ │
-│  │ Polling Task │  │ GUI Event Loop (Tauri)   │ │
+│  │ Sync Task    │  │ GUI Event Loop (Tauri)   │ │
 │  │ (spawn)      │  │                          │ │
 │  └──────┬───────┘  └────────────┬─────────────┘ │
 │         │                       │                │
@@ -132,7 +162,7 @@ The `src-tauri` crate is thin: it wires Tauri IPC commands to core functions and
 └─────────────────────────────────────────────────┘
 ```
 
-- **Polling task**: Runs in background tokio task, wakes on interval
+- **Sync task**: Runs in background tokio task, reacts to push + replay timers
 - **GUI**: Tauri's event loop, communicates via IPC commands
 - **Shared state**: Processing status, current email count, error state
 - **SQLite**: Single connection with WAL mode (concurrent reads, serialized writes)

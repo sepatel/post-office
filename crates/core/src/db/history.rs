@@ -29,16 +29,39 @@ impl<'a> HistoryRepository<'a> {
             ],
         )?;
 
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        if entry.llm_provider.is_some() || entry.policy_id.is_some() {
+            self.conn.execute(
+                "INSERT INTO history_inference_meta (history_id, provider_id, policy_id)
+                 VALUES (?1, ?2, ?3)",
+                params![id, entry.llm_provider, entry.policy_id],
+            )?;
+        }
+        Ok(id)
+    }
+
+    pub fn upsert_email_sent_at(&self, email_id: &str, email_sent_at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO history_email_meta (email_id, email_sent_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(email_id) DO UPDATE SET
+                email_sent_at = COALESCE(excluded.email_sent_at, history_email_meta.email_sent_at),
+                updated_at = datetime('now')",
+            params![email_id, email_sent_at],
+        )?;
+        Ok(())
     }
 
     pub fn list(&self, page: u32, per_page: u32) -> Result<Vec<HistoryEntry>> {
         let offset = page * per_page;
         let mut stmt = self.conn.prepare(
-            "SELECT id, email_id, email_from, email_subject, rule_id, rule_name, action, status,
-                    llm_model, llm_response, error, duration_ms, created_at
-             FROM history
-             ORDER BY created_at DESC
+            "SELECT h.id, h.email_id, h.email_from, h.email_subject, h.rule_id, h.rule_name, h.action, h.status,
+                    h.llm_model, h.llm_response, h.error, h.duration_ms, h.created_at,
+                    m.email_sent_at, im.provider_id, im.policy_id
+             FROM history h
+             LEFT JOIN history_email_meta m ON m.email_id = h.email_id
+             LEFT JOIN history_inference_meta im ON im.history_id = h.id
+             ORDER BY h.created_at DESC
              LIMIT ?1 OFFSET ?2",
         )?;
 
@@ -58,6 +81,9 @@ impl<'a> HistoryRepository<'a> {
                     error: row.get(10)?,
                     duration_ms: row.get(11)?,
                     created_at: row.get(12)?,
+                    email_sent_at: row.get(13)?,
+                    llm_provider: row.get(14)?,
+                    policy_id: row.get(15)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -67,11 +93,14 @@ impl<'a> HistoryRepository<'a> {
 
     pub fn by_email(&self, email_id: &str) -> Result<Vec<HistoryEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, email_id, email_from, email_subject, rule_id, rule_name, action, status,
-                    llm_model, llm_response, error, duration_ms, created_at
-             FROM history
-             WHERE email_id = ?1
-             ORDER BY created_at DESC",
+            "SELECT h.id, h.email_id, h.email_from, h.email_subject, h.rule_id, h.rule_name, h.action, h.status,
+                    h.llm_model, h.llm_response, h.error, h.duration_ms, h.created_at,
+                    m.email_sent_at, im.provider_id, im.policy_id
+             FROM history h
+             LEFT JOIN history_email_meta m ON m.email_id = h.email_id
+             LEFT JOIN history_inference_meta im ON im.history_id = h.id
+             WHERE h.email_id = ?1
+             ORDER BY h.created_at DESC",
         )?;
 
         let entries = stmt
@@ -90,6 +119,9 @@ impl<'a> HistoryRepository<'a> {
                     error: row.get(10)?,
                     duration_ms: row.get(11)?,
                     created_at: row.get(12)?,
+                    email_sent_at: row.get(13)?,
+                    llm_provider: row.get(14)?,
+                    policy_id: row.get(15)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -141,9 +173,12 @@ impl<'a> HistoryRepository<'a> {
     pub fn search(&self, query: &str) -> Result<Vec<HistoryEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT h.id, h.email_id, h.email_from, h.email_subject, h.rule_id, h.rule_name,
-                    h.action, h.status, h.llm_model, h.llm_response, h.error, h.duration_ms, h.created_at
+                    h.action, h.status, h.llm_model, h.llm_response, h.error, h.duration_ms, h.created_at,
+                     m.email_sent_at, im.provider_id, im.policy_id
              FROM history h
              JOIN history_fts f ON h.id = f.rowid
+             LEFT JOIN history_email_meta m ON m.email_id = h.email_id
+             LEFT JOIN history_inference_meta im ON im.history_id = h.id
              WHERE history_fts MATCH ?1
              ORDER BY rank",
         )?;
@@ -164,6 +199,9 @@ impl<'a> HistoryRepository<'a> {
                     error: row.get(10)?,
                     duration_ms: row.get(11)?,
                     created_at: row.get(12)?,
+                    email_sent_at: row.get(13)?,
+                    llm_provider: row.get(14)?,
+                    policy_id: row.get(15)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -185,6 +223,8 @@ pub struct NewHistoryEntry {
     pub llm_response: Option<String>,
     pub error: Option<String>,
     pub duration_ms: Option<i64>,
+    pub llm_provider: Option<String>,
+    pub policy_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +242,9 @@ pub struct HistoryEntry {
     pub error: Option<String>,
     pub duration_ms: Option<i64>,
     pub created_at: String,
+    pub email_sent_at: Option<String>,
+    pub llm_provider: Option<String>,
+    pub policy_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

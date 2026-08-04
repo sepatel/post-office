@@ -11,6 +11,12 @@ pub struct Rule {
     pub priority: i32,
     pub enabled: bool,
     pub parent_id: Option<i64>,
+    #[serde(default = "default_inference_policy")]
+    pub inference_policy: String,
+}
+
+fn default_inference_policy() -> String {
+    "default".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

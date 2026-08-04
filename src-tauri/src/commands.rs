@@ -1,17 +1,23 @@
 use post_office_core::config::AppConfig;
 use post_office_core::db::rule_chat::ChatMessageRow;
 use post_office_core::db::rules::{CreateRuleRequest, UpdateRuleRequest};
+use post_office_core::gmail::models::Label;
 use post_office_core::gmail::oauth::{auth_url, exchange_code, generate_pkce};
 use post_office_core::gmail::{store_tokens, GmailAuth, GmailClient};
-use post_office_core::llm::LlmClient;
-use post_office_core::processing::run_backfill;
+use post_office_core::llm::{InferenceRouter, LlmClient};
+use post_office_core::llm::{LlmProviderProfile, LlmRoutingPolicy};
+use post_office_core::processing::{
+    mark_last_successful, run_backfill, run_processing_loop, OpProgress,
+};
 use post_office_core::rules::actions::execute_action;
 use post_office_core::rules::chat::{apply_proposal, chat_with_rule, ChatProposal, ChatTurn};
 use post_office_core::rules::engine::{display_action, ActionDisplay, TestResult};
 use post_office_core::rules::evaluation::BulkVerdict;
 use post_office_core::rules::models::{Action, Condition, Rule};
 use post_office_core::rules::response_parser::ParsedAction;
+use post_office_core::sync::{replay_history, start_watch, stop_watch, ReplayResult};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
@@ -21,8 +27,43 @@ use tokio::net::TcpListener;
 
 use chrono::{DateTime, NaiveDate, Utc};
 
+use crate::sync_runtime::SyncTrigger;
 use crate::tray;
 use crate::AppState;
+
+pub fn ensure_polling_started(app: tauri::AppHandle, state: &AppState, config: &AppConfig) {
+    if state.poller_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let db_clone = Arc::new(state.db.clone());
+    let state_clone = state.processing_state.clone();
+    let config_clone = state.config.clone();
+    let config_for_auth = config.clone();
+    let poller_flag = state.poller_started.clone();
+    tauri::async_runtime::spawn(async move {
+        match load_gmail_auth(&app, &config_for_auth) {
+            Ok(auth) => {
+                let gmail = GmailClient::new(auth);
+                let emit_handle = app.clone();
+                run_processing_loop(
+                    db_clone,
+                    state_clone,
+                    gmail,
+                    config_clone,
+                    move |progress| {
+                        let _ = emit_handle.emit("cycle-progress", &progress);
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!("Gmail processing loop not started: {}", e);
+            }
+        }
+        poller_flag.store(false, Ordering::SeqCst);
+    });
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RuleCreateRequest {
@@ -33,6 +74,8 @@ pub struct RuleCreateRequest {
     pub actions: Vec<Action>,
     pub priority: i32,
     pub enabled: bool,
+    #[serde(default = "default_policy")]
+    pub inference_policy: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +87,12 @@ pub struct RuleUpdateRequest {
     pub actions: Vec<Action>,
     pub priority: i32,
     pub enabled: bool,
+    #[serde(default = "default_policy")]
+    pub inference_policy: String,
+}
+
+fn default_policy() -> String {
+    "default".into()
 }
 
 #[derive(Debug, Serialize)]
@@ -73,7 +122,78 @@ fn build_rule_model(rule: &RuleCreateRequest) -> Rule {
         priority: rule.priority,
         enabled: rule.enabled,
         parent_id: None,
+        inference_policy: if rule.inference_policy.trim().is_empty() {
+            default_policy()
+        } else {
+            rule.inference_policy.clone()
+        },
     }
+}
+
+fn normalize_label_ref(value: &str, labels: &[Label]) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    labels
+        .iter()
+        .find(|l| l.id == trimmed)
+        .or_else(|| labels.iter().find(|l| l.name.eq_ignore_ascii_case(trimmed)))
+        .map(|l| l.id.clone())
+}
+
+fn normalize_label_ref_or_error(
+    value: &str,
+    labels: &[Label],
+    context: &str,
+) -> Result<String, String> {
+    normalize_label_ref(value, labels)
+        .ok_or_else(|| format!("Unknown label in {context}: {}", value.trim()))
+}
+
+fn normalize_rule_label_fields(
+    conditions: &mut [Condition],
+    actions: &mut [Action],
+    labels: &[Label],
+) -> Result<(), String> {
+    for condition in conditions.iter_mut() {
+        if let Condition::Label { value, .. } = condition {
+            *value = normalize_label_ref_or_error(value, labels, "condition")?;
+        }
+    }
+
+    for action in actions.iter_mut() {
+        if let Action::Label { value } = action {
+            *value = normalize_label_ref_or_error(value, labels, "action")?;
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_proposal_label_actions(
+    proposal: &mut ChatProposal,
+    labels: &[Label],
+) -> Result<(), String> {
+    for action in proposal.actions_add.iter_mut() {
+        if let Action::Label { value } = action {
+            *value = normalize_label_ref_or_error(value, labels, "proposal action")?;
+        }
+    }
+    Ok(())
+}
+
+fn conditions_need_label_resolution(conditions: &[Condition]) -> bool {
+    conditions
+        .iter()
+        .any(|condition| matches!(condition, Condition::Label { .. }))
+}
+
+fn actions_need_label_resolution(actions: &[Action]) -> bool {
+    actions
+        .iter()
+        .any(|action| matches!(action, Action::Label { .. }))
 }
 
 fn extract_header(email: &post_office_core::gmail::models::Message, name: &str) -> Option<String> {
@@ -95,6 +215,9 @@ pub struct ProcessingStatus {
     pub last_cycle_count: usize,
     pub last_cycle_error: Option<String>,
     pub active_phase: String,
+    pub current_progress: Option<OpProgress>,
+    pub backfill_running: bool,
+    pub backfill_cancel_requested: bool,
 }
 
 #[tauri::command]
@@ -105,11 +228,14 @@ pub async fn config_get(state: State<'_, AppState>) -> Result<AppConfig, String>
 
 #[tauri::command]
 pub async fn config_set(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     key: String,
     value: String,
 ) -> Result<(), String> {
+    let sync_related = key.starts_with("sync.");
     let mut config = state.config.lock().await;
+    let mut start_poller = false;
     match key.as_str() {
         "gmail.account" => config.gmail_account = if value.is_empty() { None } else { Some(value) },
         "llm.base_url" => config.llm_base_url = value,
@@ -127,6 +253,32 @@ pub async fn config_set(
                 .map_err(|e: std::num::ParseIntError| e.to_string())?;
             config.llm_max_tokens = val;
         }
+        "llm.timeout_secs" => {
+            let val: u64 = value
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
+            config.llm_timeout_secs = val;
+        }
+        "llm.input_cost_per_million_usd" => {
+            let val: f64 = value
+                .parse()
+                .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+            config.llm_input_cost_per_million_usd = val;
+        }
+        "llm.output_cost_per_million_usd" => {
+            let val: f64 = value
+                .parse()
+                .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+            config.llm_output_cost_per_million_usd = val;
+        }
+        "llm.providers" => {
+            config.llm_providers = serde_json::from_str(&value).map_err(|e| e.to_string())?;
+        }
+        "llm.routing_policies" => {
+            config.llm_routing_policies =
+                serde_json::from_str(&value).map_err(|e| e.to_string())?;
+        }
+        "llm.default_policy" => config.llm_default_policy = value,
         "polling.query" => config.polling_query = value,
         "polling.interval_minutes" => {
             let val: u32 = value
@@ -146,6 +298,29 @@ pub async fn config_set(
                 .map_err(|e: std::str::ParseBoolError| e.to_string())?;
             config.polling_enabled = val;
         }
+        "sync.enabled" => {
+            let val: bool = value
+                .parse()
+                .map_err(|e: std::str::ParseBoolError| e.to_string())?;
+            config.sync_enabled = val;
+            start_poller = !val;
+        }
+        "sync.reconcile_interval_minutes" => {
+            let val: u32 = value
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
+            config.sync_reconcile_interval_minutes = val;
+        }
+        "sync.watch.topic" => config.sync_watch_topic = value,
+        "sync.watch.label_ids" => config.sync_watch_label_ids = value,
+        "sync.relay.enabled" => {
+            let val: bool = value
+                .parse()
+                .map_err(|e: std::str::ParseBoolError| e.to_string())?;
+            config.relay_enabled = val;
+        }
+        "sync.relay.ws_url" => config.relay_ws_url = value,
+        "sync.relay.auth_token" => config.relay_auth_token = value,
         "google.client_id" => config.google_client_id = value,
         "ui.tray_theme" => config.tray_theme = value,
         _ => return Err(format!("Unknown config key: {}", key)),
@@ -154,7 +329,49 @@ pub async fn config_set(
         .db
         .with_config(|repo| config.save(&repo))
         .map_err(|e| e.to_string())?;
+    let config_snapshot = config.clone();
+    drop(config);
+    if sync_related {
+        let _ = state.sync_trigger.send(SyncTrigger::Startup);
+    }
+    if start_poller {
+        ensure_polling_started(app, &state, &config_snapshot);
+    }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LlmConfigUpdate {
+    pub base_url: String,
+    pub api_key: String,
+    pub default_model: String,
+    pub input_cost_per_million_usd: f64,
+    pub output_cost_per_million_usd: f64,
+    pub timeout_secs: u64,
+    pub providers: Vec<LlmProviderProfile>,
+    pub routing_policies: Vec<LlmRoutingPolicy>,
+    pub default_policy: String,
+}
+
+#[tauri::command]
+pub async fn llm_config_set(
+    state: State<'_, AppState>,
+    update: LlmConfigUpdate,
+) -> Result<(), String> {
+    let mut config = state.config.lock().await;
+    config.llm_base_url = update.base_url;
+    config.llm_api_key = update.api_key;
+    config.llm_default_model = update.default_model;
+    config.llm_input_cost_per_million_usd = update.input_cost_per_million_usd;
+    config.llm_output_cost_per_million_usd = update.output_cost_per_million_usd;
+    config.llm_timeout_secs = update.timeout_secs;
+    config.llm_providers = update.providers;
+    config.llm_routing_policies = update.routing_policies;
+    config.llm_default_policy = update.default_policy;
+    state
+        .db
+        .with_config(|repo| config.save(&repo))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -169,9 +386,22 @@ pub async fn rules_list(
 
 #[tauri::command]
 pub async fn rules_create(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
-    rule: RuleCreateRequest,
+    mut rule: RuleCreateRequest,
 ) -> Result<post_office_core::rules::models::Rule, String> {
+    if conditions_need_label_resolution(&rule.conditions)
+        || actions_need_label_resolution(&rule.actions)
+    {
+        let config = state.config.lock().await;
+        let auth = load_gmail_auth(&app, &config)?;
+        drop(config);
+
+        let mut gmail = GmailClient::new(auth);
+        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+        normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
+    }
+
     let create = CreateRuleRequest {
         name: rule.name,
         description: rule.description,
@@ -180,6 +410,11 @@ pub async fn rules_create(
         actions: rule.actions,
         priority: rule.priority,
         enabled: rule.enabled,
+        inference_policy: if rule.inference_policy.trim().is_empty() {
+            default_policy()
+        } else {
+            rule.inference_policy
+        },
     };
     state
         .db
@@ -189,10 +424,23 @@ pub async fn rules_create(
 
 #[tauri::command]
 pub async fn rules_update(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: i64,
-    rule: RuleUpdateRequest,
+    mut rule: RuleUpdateRequest,
 ) -> Result<post_office_core::rules::models::Rule, String> {
+    if conditions_need_label_resolution(&rule.conditions)
+        || actions_need_label_resolution(&rule.actions)
+    {
+        let config = state.config.lock().await;
+        let auth = load_gmail_auth(&app, &config)?;
+        drop(config);
+
+        let mut gmail = GmailClient::new(auth);
+        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+        normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
+    }
+
     let update = UpdateRuleRequest {
         name: rule.name,
         description: rule.description,
@@ -201,6 +449,11 @@ pub async fn rules_update(
         actions: rule.actions,
         priority: rule.priority,
         enabled: rule.enabled,
+        inference_policy: if rule.inference_policy.trim().is_empty() {
+            default_policy()
+        } else {
+            rule.inference_policy
+        },
     };
     state
         .db
@@ -235,11 +488,7 @@ pub async fn rule_chat_send(
 ) -> Result<ChatTurn, String> {
     let llm = {
         let config = state.config.lock().await;
-        LlmClient::new(
-            &config.llm_base_url,
-            &config.llm_api_key,
-            &config.llm_default_model,
-        )
+        InferenceRouter::from_config(&config).with_database(state.db.clone())
     };
 
     chat_with_rule(&state.db, &llm, rule_id, &message)
@@ -249,10 +498,21 @@ pub async fn rule_chat_send(
 
 #[tauri::command]
 pub async fn rule_apply_proposal(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     rule_id: i64,
-    proposal: ChatProposal,
+    mut proposal: ChatProposal,
 ) -> Result<(), String> {
+    if actions_need_label_resolution(&proposal.actions_add) {
+        let config = state.config.lock().await;
+        let auth = load_gmail_auth(&app, &config)?;
+        drop(config);
+
+        let mut gmail = GmailClient::new(auth);
+        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+        normalize_proposal_label_actions(&mut proposal, &labels)?;
+    }
+
     apply_proposal(&state.db, rule_id, &proposal)
         .await
         .map_err(|e| e.to_string())
@@ -293,21 +553,24 @@ pub async fn gmail_recent_messages(
 pub async fn rules_test(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    rule: RuleCreateRequest,
+    mut rule: RuleCreateRequest,
     message_id: String,
 ) -> Result<TestResult, String> {
     let (auth, llm) = {
         let config = state.config.lock().await;
         let auth = load_gmail_auth(&app, &config)?;
-        let llm = LlmClient::new(
-            &config.llm_base_url,
-            &config.llm_api_key,
-            &config.llm_default_model,
-        );
+        let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
         (auth, llm)
     };
 
     let mut gmail = GmailClient::new(auth);
+    if conditions_need_label_resolution(&rule.conditions)
+        || actions_need_label_resolution(&rule.actions)
+    {
+        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+        normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
+    }
+
     let email = gmail
         .get_message(&message_id)
         .await
@@ -333,21 +596,24 @@ pub async fn rules_test(
 pub async fn bulk_evaluate(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    rule: RuleCreateRequest,
+    mut rule: RuleCreateRequest,
     message_ids: Vec<String>,
 ) -> Result<Vec<BulkVerdict>, String> {
     let (auth, llm) = {
         let config = state.config.lock().await;
         let auth = load_gmail_auth(&app, &config)?;
-        let llm = LlmClient::new(
-            &config.llm_base_url,
-            &config.llm_api_key,
-            &config.llm_default_model,
-        );
+        let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
         (auth, llm)
     };
 
     let mut gmail = GmailClient::new(auth);
+    if conditions_need_label_resolution(&rule.conditions)
+        || actions_need_label_resolution(&rule.actions)
+    {
+        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+        normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
+    }
+
     let mut emails = Vec::new();
     for id in &message_ids {
         if let Ok(msg) = gmail.get_message(id).await {
@@ -366,21 +632,24 @@ pub async fn bulk_evaluate(
 pub async fn rules_apply(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    rule: RuleCreateRequest,
+    mut rule: RuleCreateRequest,
     message_id: String,
 ) -> Result<ApplyResult, String> {
     let (auth, llm) = {
         let config = state.config.lock().await;
         let auth = load_gmail_auth(&app, &config)?;
-        let llm = LlmClient::new(
-            &config.llm_base_url,
-            &config.llm_api_key,
-            &config.llm_default_model,
-        );
+        let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
         (auth, llm)
     };
 
     let mut gmail = GmailClient::new(auth);
+    let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+    if conditions_need_label_resolution(&rule.conditions)
+        || actions_need_label_resolution(&rule.actions)
+    {
+        normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
+    }
+
     let email = gmail
         .get_message(&message_id)
         .await
@@ -410,7 +679,6 @@ pub async fn rules_apply(
         Some(r) => r,
     };
 
-    let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
     let mut outcomes: Vec<(&ParsedAction, Option<String>)> = Vec::new();
     for action in &resolved.actions {
         let error = execute_action(&mut gmail, &message_id, action, &labels)
@@ -461,6 +729,16 @@ pub async fn rules_metrics(
 }
 
 #[tauri::command]
+pub async fn rule_roi_metrics(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::llm_usage::RuleRoiMetrics>, String> {
+    state
+        .db
+        .with_llm_usage(|repo| repo.rule_roi_metrics())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn history_search(
     state: State<'_, AppState>,
     query: String,
@@ -469,6 +747,41 @@ pub async fn history_search(
         .db
         .with_history(|repo| repo.search(&query))
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn inference_jobs_list(
+    state: State<'_, AppState>,
+    page: u32,
+    per_page: u32,
+) -> Result<Vec<post_office_core::db::inference::InferenceJob>, String> {
+    state
+        .db
+        .with_inference(|repo| repo.list(page, per_page))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn inference_job_retry(state: State<'_, AppState>, job_id: i64) -> Result<bool, String> {
+    state
+        .db
+        .with_inference(|repo| repo.retry(job_id))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn llm_provider_set_api_key(provider_id: String, api_key: String) -> Result<(), String> {
+    post_office_core::llm::credentials::store_provider_api_key(&provider_id, &api_key)
+}
+
+#[tauri::command]
+pub async fn llm_provider_status_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::llm_provider_status::LlmProviderStatus>, String> {
+    state
+        .db
+        .with_llm_provider_status(|repo| repo.list())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -484,6 +797,13 @@ pub async fn processing_status(state: State<'_, AppState>) -> Result<ProcessingS
         last_cycle_count: ps.last_cycle_count,
         last_cycle_error: ps.last_cycle_error.clone(),
         active_phase: ps.active_phase.clone(),
+        current_progress: ps.current_progress.clone(),
+        backfill_running: ps
+            .backfill_running
+            .load(std::sync::atomic::Ordering::Relaxed),
+        backfill_cancel_requested: ps
+            .backfill_cancel_requested
+            .load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -501,6 +821,196 @@ pub async fn processing_resume(state: State<'_, AppState>) -> Result<(), String>
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+pub struct SyncStatus {
+    pub enabled: bool,
+    pub relay_enabled: bool,
+    pub account_email: Option<String>,
+    pub state: Option<post_office_core::db::sync_state::GmailSyncState>,
+    pub pending_events: usize,
+}
+
+#[tauri::command]
+pub async fn sync_status(state: State<'_, AppState>) -> Result<SyncStatus, String> {
+    let cfg = state.config.lock().await.clone();
+    let account = cfg.gmail_account.clone();
+    let sync_state = if let Some(account_email) = account.as_deref() {
+        state
+            .db
+            .with_sync_state(|repo| repo.get(account_email))
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let pending = if let Some(account_email) = account.as_deref() {
+        state
+            .db
+            .with_sync_state(|repo| repo.list_pending_events(account_email, 1000))
+            .map(|rows| rows.len())
+            .map_err(|e| e.to_string())?
+    } else {
+        0
+    };
+
+    Ok(SyncStatus {
+        enabled: cfg.sync_enabled,
+        relay_enabled: cfg.relay_enabled,
+        account_email: account,
+        state: sync_state,
+        pending_events: pending,
+    })
+}
+
+#[tauri::command]
+pub async fn sync_replay_now(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ReplayResult, String> {
+    let cfg = state.config.lock().await.clone();
+    let account_email = cfg
+        .gmail_account
+        .clone()
+        .ok_or_else(|| "No Gmail account configured".to_string())?;
+    let auth = load_gmail_auth(&app, &cfg)?;
+    let llm = InferenceRouter::from_config(&cfg).with_database(state.db.clone());
+    let mut gmail = GmailClient::new(auth);
+
+    let db = Arc::new(state.db.clone());
+    let processing_state = state.processing_state.clone();
+
+    {
+        let mut s = processing_state.lock().await;
+        s.active_phase = "sync-fetching".into();
+        s.current_progress = Some(OpProgress {
+            source: "sync".into(),
+            phase: "sync-fetching".into(),
+            processed: 0,
+            total: None,
+            detail: Some("Checking Gmail history".into()),
+            current_email_id: None,
+            current_email_from: None,
+            current_email_subject: None,
+            current_email_sent_at: None,
+        });
+    }
+
+    match replay_history(
+        &db,
+        &processing_state,
+        &mut gmail,
+        &llm,
+        &cfg,
+        &account_email,
+        "manual",
+        &|progress| {
+            let _ = app.emit("sync-progress", &progress);
+        },
+    )
+    .await
+    {
+        Ok(result) => {
+            mark_last_successful(&db, &processing_state, Utc::now()).await;
+            {
+                let mut s = processing_state.lock().await;
+                s.current_progress = None;
+                s.active_phase = "idle".into();
+            }
+            let _ = app.emit(
+                "sync-progress",
+                OpProgress {
+                    source: "sync".into(),
+                    phase: "idle".into(),
+                    processed: 0,
+                    total: None,
+                    detail: None,
+                    current_email_id: None,
+                    current_email_from: None,
+                    current_email_subject: None,
+                    current_email_sent_at: None,
+                },
+            );
+            Ok(result)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            {
+                let mut s = processing_state.lock().await;
+                s.current_progress = None;
+                s.active_phase = "error".into();
+            }
+            let _ = app.emit(
+                "sync-progress",
+                OpProgress {
+                    source: "sync".into(),
+                    phase: "error".into(),
+                    processed: 0,
+                    total: None,
+                    detail: Some(msg.clone()),
+                    current_email_id: None,
+                    current_email_from: None,
+                    current_email_subject: None,
+                    current_email_sent_at: None,
+                },
+            );
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn sync_watch_start(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<post_office_core::gmail::models::WatchResponse, String> {
+    let cfg = state.config.lock().await.clone();
+    let account_email = cfg
+        .gmail_account
+        .clone()
+        .ok_or_else(|| "No Gmail account configured".to_string())?;
+    let topic = cfg.sync_watch_topic.trim();
+    if topic.is_empty() {
+        return Err("sync.watch.topic is empty".into());
+    }
+
+    let auth = load_gmail_auth(&app, &cfg)?;
+    let mut gmail = GmailClient::new(auth);
+    let labels = parse_watch_labels(&cfg.sync_watch_label_ids);
+    start_watch(
+        &Arc::new(state.db.clone()),
+        &mut gmail,
+        &account_email,
+        topic,
+        &labels,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sync_watch_stop(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cfg = state.config.lock().await.clone();
+    let account_email = cfg
+        .gmail_account
+        .clone()
+        .ok_or_else(|| "No Gmail account configured".to_string())?;
+    let auth = load_gmail_auth(&app, &cfg)?;
+    let mut gmail = GmailClient::new(auth);
+    stop_watch(&Arc::new(state.db.clone()), &mut gmail, &account_email)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn parse_watch_labels(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// One-off backfill: process mail in `[after, before]` (inclusive day bounds)
 /// applying only the rules whose ids are in `rule_ids`. Emits `backfill-progress`
 /// events so the UI can show a live status bar. Returns the number processed.
@@ -512,18 +1022,14 @@ pub async fn processing_backfill(
     after: String,
     before: String,
     rule_ids: Vec<i64>,
-) -> Result<usize, String> {
+) -> Result<BackfillResult, String> {
     let after_dt = parse_day(&after).map_err(|e| format!("Invalid 'after' date: {}", e))?;
     let before_dt = parse_day_end(&before).map_err(|e| format!("Invalid 'before' date: {}", e))?;
 
     let (auth, llm) = {
         let config = state.config.lock().await;
         let auth = load_gmail_auth(&app, &config)?;
-        let llm = LlmClient::new(
-            &config.llm_base_url,
-            &config.llm_api_key,
-            &config.llm_default_model,
-        );
+        let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
         (auth, llm)
     };
 
@@ -531,9 +1037,18 @@ pub async fn processing_backfill(
     let db = Arc::new(state.db.clone());
     let state_clone = state.processing_state.clone();
     let config = state.config.lock().await.clone();
-    drop(state);
 
-    run_backfill(
+    let cancel_flag = {
+        let ps = state_clone.lock().await;
+        if ps.backfill_running.swap(true, Ordering::SeqCst) {
+            return Err("A backfill is already running".to_string());
+        }
+        ps.backfill_cancel_requested
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        ps.backfill_cancel_requested.clone()
+    };
+
+    let run_result = run_backfill(
         &db,
         &state_clone,
         &mut gmail,
@@ -542,12 +1057,91 @@ pub async fn processing_backfill(
         after_dt,
         before_dt,
         &rule_ids,
+        cancel_flag.as_ref(),
         &|progress| {
             let _ = app.emit("backfill-progress", &progress);
         },
     )
-    .await
-    .map_err(|e| e.to_string())
+    .await;
+
+    {
+        let mut ps = state_clone.lock().await;
+        ps.backfill_running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        ps.backfill_cancel_requested
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        ps.active_phase = if run_result.is_ok() {
+            "idle".into()
+        } else {
+            "error".into()
+        };
+        ps.current_progress = None;
+    }
+
+    match run_result {
+        Ok(result) => {
+            if !result.stopped {
+                let _ = app.emit(
+                    "backfill-progress",
+                    OpProgress {
+                        source: "backfill".into(),
+                        phase: "idle".into(),
+                        processed: result.processed,
+                        total: Some(result.discovered),
+                        detail: None,
+                        current_email_id: None,
+                        current_email_from: None,
+                        current_email_subject: None,
+                        current_email_sent_at: None,
+                    },
+                );
+            }
+            Ok(BackfillResult {
+                processed: result.processed,
+                discovered: result.discovered,
+                stopped: result.stopped,
+            })
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = app.emit(
+                "backfill-progress",
+                OpProgress {
+                    source: "backfill".into(),
+                    phase: "error".into(),
+                    processed: 0,
+                    total: None,
+                    detail: Some(msg.clone()),
+                    current_email_id: None,
+                    current_email_from: None,
+                    current_email_subject: None,
+                    current_email_sent_at: None,
+                },
+            );
+            Err(msg)
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackfillResult {
+    pub processed: usize,
+    pub discovered: usize,
+    pub stopped: bool,
+}
+
+#[tauri::command]
+pub async fn processing_backfill_stop(state: State<'_, AppState>) -> Result<bool, String> {
+    let ps = state.processing_state.lock().await;
+    let running = ps
+        .backfill_running
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if running {
+        ps.backfill_cancel_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(running)
 }
 
 /// Parse `YYYY-MM-DD` as start-of-day UTC.
@@ -593,6 +1187,56 @@ pub async fn llm_test(
             ok: false,
             model: String::new(),
             error: Some(e.to_string()),
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn llm_provider_test(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<LlmTestResult, String> {
+    let config = state.config.lock().await.clone();
+    let (base_url, api_key, model, timeout_secs) = if provider_id == "legacy" {
+        (
+            config.llm_base_url,
+            config.llm_api_key,
+            config.llm_default_model,
+            config.llm_timeout_secs,
+        )
+    } else {
+        let provider = config
+            .llm_providers
+            .iter()
+            .find(|profile| profile.id == provider_id)
+            .ok_or_else(|| format!("Provider not found: {provider_id}"))?;
+        let key_ref = if provider.api_key_ref.trim().is_empty() {
+            &provider.id
+        } else {
+            &provider.api_key_ref
+        };
+        let api_key =
+            post_office_core::llm::credentials::load_provider_api_key(key_ref)?.unwrap_or_default();
+        (
+            provider.base_url.clone(),
+            api_key,
+            provider.model.clone(),
+            provider.timeout_secs,
+        )
+    };
+
+    let client =
+        LlmClient::with_options(&base_url, &api_key, &model, timeout_secs, Some(provider_id));
+    match client.test_connection().await {
+        Ok(response) => Ok(LlmTestResult {
+            ok: true,
+            model: response.model,
+            error: None,
+        }),
+        Err(error) => Ok(LlmTestResult {
+            ok: false,
+            model: String::new(),
+            error: Some(error.to_string()),
         }),
     }
 }
@@ -746,14 +1390,22 @@ pub async fn gmail_authenticate(
     store_tokens(&profile.email_address, &access_token, &refresh_token)
         .map_err(|e| format!("Failed to store tokens: {}", e))?;
 
-    {
+    let sync_enabled = {
         let mut config = state.config.lock().await;
         config.gmail_account = Some(profile.email_address.clone());
         state
             .db
             .with_config(|repo| config.save(&repo))
             .map_err(|e| e.to_string())?;
+        config.sync_enabled
+    };
+
+    if !sync_enabled {
+        let cfg = state.config.lock().await.clone();
+        ensure_polling_started(app.clone(), &state, &cfg);
     }
+
+    let _ = state.sync_trigger.send(SyncTrigger::Startup);
 
     Ok(profile.email_address)
 }

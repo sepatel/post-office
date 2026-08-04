@@ -71,7 +71,7 @@ pub struct GmailProfile {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ListMessagesResponse {
+pub struct ListMessagesResponse {
     #[serde(default)]
     pub messages: Option<Vec<MessageRef>>,
     #[serde(default)]
@@ -124,6 +124,60 @@ pub(crate) struct TokenResponse {
     #[serde(default)]
     pub refresh_token: Option<String>,
     pub expires_in: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WatchRequest<'a> {
+    pub topic_name: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub label_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_filter_behavior: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchResponse {
+    pub history_id: String,
+    pub expiration: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListHistoryResponse {
     #[serde(default)]
-    pub token_type: String,
+    pub history: Option<Vec<HistoryRecord>>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub history_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRecord {
+    pub id: String,
+    #[serde(default)]
+    pub messages: Option<Vec<MessageRef>>,
+    #[serde(default)]
+    pub messages_added: Option<Vec<HistoryMessageEnvelope>>,
+    #[serde(default)]
+    pub messages_deleted: Option<Vec<HistoryMessageEnvelope>>,
+    #[serde(default)]
+    pub labels_added: Option<Vec<HistoryLabelEnvelope>>,
+    #[serde(default)]
+    pub labels_removed: Option<Vec<HistoryLabelEnvelope>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMessageEnvelope {
+    pub message: MessageRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryLabelEnvelope {
+    pub message: MessageRef,
 }

@@ -103,15 +103,49 @@ impl GmailClient {
         query: &str,
         max_results: u32,
     ) -> Result<Vec<MessageRef>, GmailError> {
-        let qs = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("q", query)
-            .finish();
-        let path = format!("/messages?maxResults={max_results}&{qs}");
-        let response: ListMessagesResponse = self
-            .request(reqwest::Method::GET, &path, None::<&()>)
-            .await?;
+        if max_results == 0 {
+            return Ok(Vec::new());
+        }
 
-        Ok(response.messages.unwrap_or_default())
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        while out.len() < max_results as usize {
+            let remaining = (max_results as usize).saturating_sub(out.len()) as u32;
+            let page = self
+                .list_messages_page(query, remaining.min(500), page_token.as_deref())
+                .await?;
+            out.extend(page.messages.unwrap_or_default());
+
+            if out.len() >= max_results as usize {
+                break;
+            }
+
+            page_token = page.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(out)
+    }
+
+    pub async fn list_messages_page(
+        &mut self,
+        query: &str,
+        max_results: u32,
+        page_token: Option<&str>,
+    ) -> Result<ListMessagesResponse, GmailError> {
+        let qs = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer.append_pair("q", query);
+            if let Some(token) = page_token {
+                serializer.append_pair("pageToken", token);
+            }
+            serializer.finish()
+        };
+        let path = format!("/messages?maxResults={max_results}&{qs}");
+        self.request(reqwest::Method::GET, &path, None::<&()>).await
     }
 
     pub async fn get_message(&mut self, id: &str) -> Result<Message, GmailError> {
@@ -187,5 +221,52 @@ impl GmailClient {
     pub async fn get_profile(&mut self) -> Result<GmailProfile, GmailError> {
         self.request(reqwest::Method::GET, "/profile", None::<&()>)
             .await
+    }
+
+    pub async fn watch(
+        &mut self,
+        topic_name: &str,
+        label_ids: &[String],
+    ) -> Result<WatchResponse, GmailError> {
+        let request_body = WatchRequest {
+            topic_name,
+            label_ids: label_ids.to_vec(),
+            label_filter_behavior: if label_ids.is_empty() {
+                None
+            } else {
+                Some("include")
+            },
+        };
+
+        self.request(reqwest::Method::POST, "/watch", Some(&request_body))
+            .await
+    }
+
+    pub async fn stop_watch(&mut self) -> Result<(), GmailError> {
+        self.request::<serde_json::Value>(
+            reqwest::Method::POST,
+            "/stop",
+            Some(&serde_json::json!({})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_history_page(
+        &mut self,
+        start_history_id: &str,
+        page_token: Option<&str>,
+    ) -> Result<ListHistoryResponse, GmailError> {
+        let qs = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer.append_pair("startHistoryId", start_history_id);
+            serializer.append_pair("maxResults", "500");
+            if let Some(token) = page_token {
+                serializer.append_pair("pageToken", token);
+            }
+            serializer.finish()
+        };
+        let path = format!("/history?{qs}");
+        self.request(reqwest::Method::GET, &path, None::<&()>).await
     }
 }

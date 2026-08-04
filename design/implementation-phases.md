@@ -167,3 +167,40 @@ These are NOT in scope for initial release but inform architecture decisions:
 | System-wide hotkeys | Can add `tauri-plugin-global-shortcut` |
 | CLI mode | Core crate has no GUI deps (reusable) |
 | Server mode | Core crate could be used in a web server |
+
+---
+
+## Phase 5: Push Sync (Post-v0.1.0)
+
+**Goal:** Move from interval polling to push-triggered sync with Gmail cursor
+replay for near-real-time, loss-resistant ingestion.
+
+### Tasks
+
+- [ ] Build cursor replay in core:
+  - [ ] Persist `last_history_id` per account
+  - [ ] Implement Gmail `users.history.list` pagination
+  - [ ] Replay changed message IDs through existing rule pipeline
+  - [ ] Commit cursor only after successful local write
+- [ ] Implement Gmail watch lifecycle:
+  - [ ] `users.watch` registration
+  - [ ] Renewal before expiration
+  - [ ] `users.stop` on disconnect/re-auth
+- [ ] Build relay service:
+  - [ ] Public Pub/Sub push webhook
+  - [ ] Pub/Sub JWT verification
+  - [ ] WebSocket session manager for desktops
+  - [ ] Notification buffering for short offline windows
+- [ ] Desktop realtime channel:
+  - [ ] Outbound authenticated WebSocket client
+  - [ ] Push-triggered immediate replay
+  - [ ] Startup reconciliation sweep
+- [ ] Reliability and fallback:
+  - [ ] Handle stale cursor (`history.list` 404) with bounded resync
+  - [ ] Keep polling behind emergency feature flag
+  - [ ] Add sync diagnostics and latency metrics
+
+### Deliverable
+
+The app processes inbox changes in near real time via push notifications while
+preserving correctness through `historyId` replay and durable local cursors.

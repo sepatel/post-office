@@ -4,9 +4,13 @@ use std::sync::{Arc, Mutex};
 
 pub mod config;
 pub mod history;
+pub mod inference;
+pub mod llm_provider_status;
+pub mod llm_usage;
 pub mod rule_chat;
 pub mod rule_memory;
 pub mod rules;
+pub mod sync_state;
 
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -44,9 +48,15 @@ impl Database {
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let migrations = format!(
-            "{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("../../../../migrations/001_initial.sql"),
             include_str!("../../../../migrations/002_rule_memory_chat.sql"),
+            include_str!("../../../../migrations/003_llm_usage.sql"),
+            include_str!("../../../../migrations/004_gmail_sync.sql"),
+            include_str!("../../../../migrations/005_history_email_meta.sql"),
+            include_str!("../../../../migrations/006_inference_jobs.sql"),
+            include_str!("../../../../migrations/007_history_inference_meta.sql"),
+            include_str!("../../../../migrations/008_llm_provider_status.sql"),
         );
         conn.execute_batch(&migrations)
     }
@@ -93,6 +103,42 @@ impl Database {
     {
         let conn = self.conn.lock().unwrap();
         let repo = rule_chat::RuleChatRepository::new(&conn);
+        f(repo)
+    }
+
+    pub fn with_llm_usage<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(llm_usage::LlmUsageRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        let repo = llm_usage::LlmUsageRepository::new(&conn);
+        f(repo)
+    }
+
+    pub fn with_inference<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(inference::InferenceRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        let repo = inference::InferenceRepository::new(&conn);
+        f(repo)
+    }
+
+    pub fn with_llm_provider_status<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(llm_provider_status::LlmProviderStatusRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        let repo = llm_provider_status::LlmProviderStatusRepository::new(&conn);
+        f(repo)
+    }
+
+    pub fn with_sync_state<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(sync_state::SyncStateRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        let repo = sync_state::SyncStateRepository::new(&conn);
         f(repo)
     }
 }

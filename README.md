@@ -77,6 +77,32 @@ First launch shows an onboarding screen. Connect Gmail, configure your LLM
 endpoint (e.g. a local Ollama instance at `http://localhost:11434/v1`), then
 create a rule.
 
+### Multiple inference providers
+
+Settings supports multiple OpenAI-compatible endpoint/model profiles, including
+LiteLLM and OpenRouter. Provider profiles and routing policies are stored as
+JSON so the same endpoint can expose separate cheap and strong model entries:
+
+```json
+[
+  {
+    "id": "travel-cheap",
+    "name": "OpenRouter cheap",
+    "base_url": "https://openrouter.ai/api/v1",
+    "model": "provider/model-id",
+    "api_key_ref": "openrouter",
+    "quality_tier": "cheap",
+    "privacy_status": "unknown",
+    "timeout_secs": 30,
+    "enabled": true
+  }
+]
+```
+
+Routing policies try candidate profiles in order. A production job remains in
+the local inference queue when no eligible candidate is available. Additional
+provider keys are stored in the OS keyring through Settings.
+
 ## License
 
 MIT

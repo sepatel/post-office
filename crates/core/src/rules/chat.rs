@@ -1,9 +1,10 @@
+use serde::de::{DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
 
 use crate::db::rule_chat::ChatMessageRow;
 use crate::db::rules::UpdateRuleRequest;
 use crate::db::Database;
-use crate::llm::LlmClient;
+use crate::llm::InferenceRouter;
 use crate::rules::models::{Action, Condition};
 use crate::rules::prompts::CHAT_SYSTEM_PROMPT;
 
@@ -19,11 +20,11 @@ pub struct MemoryInput {
 pub struct ChatProposal {
     #[serde(default)]
     pub prompt: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_actions")]
     pub actions_add: Vec<Action>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_conditions")]
     pub conditions_add: Vec<Condition>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_memories")]
     pub memories_add: Vec<MemoryInput>,
 }
 
@@ -56,7 +57,7 @@ pub enum ChatError {
 /// assistant message for later review/apply). No rule state is mutated here.
 pub async fn chat_with_rule(
     db: &Database,
-    llm: &LlmClient,
+    llm: &InferenceRouter,
     rule_id: i64,
     message: &str,
 ) -> Result<ChatTurn, ChatError> {
@@ -69,7 +70,9 @@ pub async fn chat_with_rule(
 
     let user_content = build_chat_user_prompt(&rule, &memories, &history, message);
 
-    let response: serde_json::Value = llm.chat_json(CHAT_SYSTEM_PROMPT, &user_content).await?;
+    let response: serde_json::Value = llm
+        .chat_json(&rule.inference_policy, CHAT_SYSTEM_PROMPT, &user_content)
+        .await?;
 
     let turn: ChatTurn =
         serde_json::from_value(response).map_err(|e| ChatError::Parse(e.to_string()))?;
@@ -121,6 +124,7 @@ pub async fn apply_proposal(
             actions: rule.actions,
             priority: rule.priority,
             enabled: rule.enabled,
+            inference_policy: rule.inference_policy,
         };
         db.with_rules(|repo| repo.update(rule.id, &update))?;
     }
@@ -185,4 +189,81 @@ fn build_chat_user_prompt(
          Respond with the JSON proposal described in your instructions.",
         rule.name, rule.prompt, actions, conditions, memory_block, history_block, message,
     )
+}
+
+fn deserialize_lossy_actions<'de, D>(deserializer: D) -> Result<Vec<Action>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_lossy_vec(deserializer)
+}
+
+fn deserialize_lossy_conditions<'de, D>(deserializer: D) -> Result<Vec<Condition>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_lossy_vec(deserializer)
+}
+
+fn deserialize_lossy_memories<'de, D>(deserializer: D) -> Result<Vec<MemoryInput>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_lossy_vec(deserializer)
+}
+
+fn deserialize_lossy_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let raw = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(raw
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<T>(item).ok())
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_turn_skips_malformed_action_entries() {
+        let raw = serde_json::json!({
+            "reply": "Updated.",
+            "proposal": {
+                "prompt": null,
+                "actions_add": [
+                    { "type": "archive" },
+                    { "value": "MissingType" }
+                ],
+                "conditions_add": [],
+                "memories_add": []
+            }
+        });
+
+        let turn: ChatTurn = serde_json::from_value(raw).unwrap();
+        assert_eq!(turn.reply, "Updated.");
+        assert_eq!(turn.proposal.actions_add.len(), 1);
+    }
+
+    #[test]
+    fn chat_turn_skips_malformed_condition_entries() {
+        let raw = serde_json::json!({
+            "reply": "Noted.",
+            "proposal": {
+                "prompt": null,
+                "actions_add": [],
+                "conditions_add": [
+                    { "type": "from", "operator": "contains", "value": "boss" },
+                    { "operator": "contains", "value": "missing type" }
+                ],
+                "memories_add": []
+            }
+        });
+
+        let turn: ChatTurn = serde_json::from_value(raw).unwrap();
+        assert_eq!(turn.proposal.conditions_add.len(), 1);
+    }
 }

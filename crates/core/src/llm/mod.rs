@@ -1,6 +1,9 @@
 pub mod client;
+pub mod credentials;
+pub mod router;
 
 pub use client::LlmClient;
+pub use router::{InferenceRouter, LlmProviderProfile, LlmRoutingPolicy, PrivacyRequirement};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -12,8 +15,12 @@ pub enum LlmError {
 
     #[error("Failed to parse LLM JSON response: {0}")]
     ParseError(String),
+
+    #[error("No eligible LLM provider was available: {0}")]
+    Routing(String),
 }
 
+#[derive(Clone, Default)]
 pub struct ProcessRequest {
     pub system_prompt: Option<String>,
     pub user_prompt: String,
@@ -34,21 +41,12 @@ impl ProcessRequest {
     }
 }
 
-impl Default for ProcessRequest {
-    fn default() -> Self {
-        Self {
-            system_prompt: None,
-            user_prompt: String::new(),
-            model: None,
-            temperature: None,
-            max_tokens: None,
-        }
-    }
-}
-
 pub struct ProcessResponse {
     pub content: String,
     pub model: String,
+    pub provider_id: Option<String>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
     pub tokens_used: Option<u32>,
     pub duration_ms: u64,
 }

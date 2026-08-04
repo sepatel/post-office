@@ -1,24 +1,21 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import {
   configGet,
   configSet,
   gmailAuthenticate,
   gmailConnectionStatus,
-  llmTest,
-  llmListModels,
-  trayRefresh,
   type GmailConnection,
 } from "../lib/tauri";
 import { useGate } from "../lib/gate";
-import Dropdown from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import ConnectionStatus from "../components/ConnectionStatus";
+import InferenceStudio, {
+  type InferenceConfig,
+} from "../components/InferenceStudio";
 
-interface Config {
+interface Config extends InferenceConfig {
   gmail_account: string | null;
-  llm_base_url: string;
-  llm_api_key: string;
-  llm_default_model: string;
   polling_query: string;
   polling_interval_minutes: number;
   polling_max_per_cycle: number;
@@ -26,66 +23,47 @@ interface Config {
   tray_theme: string;
 }
 
+type SettingsTab = "inference" | "mailbox";
+
 export default function Settings() {
   const { connection, setConnection } = useGate();
   const toast = useToast();
   const [config, setConfig] = useState<Config | null>(null);
-  const [saved, setSaved] = useState(false);
+  const [tab, setTab] = useState<SettingsTab>("inference");
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
-  const [llmStatus, setLlmStatus] = useState<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [llmStatusError, setLlmStatusError] = useState<string | null>(null);
-  const [models, setModels] = useState<string[]>([]);
-  const [loadingModels, setLoadingModels] = useState(false);
-  const [modelsError, setModelsError] = useState<string | null>(null);
 
   useEffect(() => {
-    loadConfig();
+    void loadConfig();
   }, []);
-
-  async function reloadConnection() {
-    try {
-      const c = (await gmailConnectionStatus()) as GmailConnection;
-      setConnection(c);
-    } catch {
-      /* leave as-is */
-    }
-  }
 
   async function loadConfig() {
     try {
-      const c = (await configGet()) as Config;
-      setConfig(c);
+      const next = (await configGet()) as Config;
+      setConfig(next);
       await reloadConnection();
-    } catch (e) {
-      console.error("Failed to load config:", e);
+    } catch (error) {
+      console.error("Failed to load config:", error);
     }
   }
 
-  async function handleSave() {
+  async function reloadConnection() {
+    try {
+      setConnection((await gmailConnectionStatus()) as GmailConnection);
+    } catch {
+      // Keep the last known connection state visible.
+    }
+  }
+
+  async function saveGeneralSettings() {
     if (!config) return;
     try {
-      await configSet("llm.base_url", config.llm_base_url);
-      await configSet("llm.api_key", config.llm_api_key);
-      await configSet("llm.default_model", config.llm_default_model);
       await configSet("polling.query", config.polling_query);
-      await configSet(
-        "polling.interval_minutes",
-        config.polling_interval_minutes.toString()
-      );
-      await configSet(
-        "polling.max_per_cycle",
-        config.polling_max_per_cycle.toString()
-      );
+      await configSet("polling.interval_minutes", config.polling_interval_minutes.toString());
+      await configSet("polling.max_per_cycle", config.polling_max_per_cycle.toString());
       await configSet("polling.enabled", config.polling_enabled.toString());
-      await configSet("ui.tray_theme", config.tray_theme);
-      await trayRefresh();
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch (e) {
-      console.error("Failed to save config:", e);
+    } catch (error) {
+      toast.error(`Could not save settings: ${String(error)}`);
     }
   }
 
@@ -94,14 +72,13 @@ export default function Settings() {
     setConnectError(null);
     try {
       const email = (await gmailAuthenticate()) as string;
-      const c = (await gmailConnectionStatus()) as GmailConnection;
-      setConnection(c);
+      await reloadConnection();
       toast.success(`Connected to ${email}`);
       await loadConfig();
-    } catch (e) {
-      const msg = typeof e === "string" ? e : String(e);
-      setConnectError(msg);
-      toast.error(msg);
+    } catch (error) {
+      const message = typeof error === "string" ? error : String(error);
+      setConnectError(message);
+      toast.error(message);
     } finally {
       setConnecting(false);
     }
@@ -118,301 +95,182 @@ export default function Settings() {
         error: null,
       });
       await loadConfig();
-    } catch (e) {
-      console.error("Failed to disconnect:", e);
+    } catch (error) {
+      toast.error(`Could not disconnect Gmail: ${String(error)}`);
     }
   }
-
-  async function runLlmCheck() {
-    if (!config) return;
-    if (!config.llm_base_url || !config.llm_api_key || !config.llm_default_model) {
-      setLlmStatus("idle");
-      setLlmStatusError(null);
-      return;
-    }
-    setLlmStatus("checking");
-    setLlmStatusError(null);
-    try {
-      const result = await llmTest(
-        config.llm_base_url,
-        config.llm_api_key,
-        config.llm_default_model
-      );
-      if (result.ok) {
-        setLlmStatus("ok");
-      } else {
-        setLlmStatus("error");
-        setLlmStatusError(result.error ?? "LLM connection failed");
-      }
-    } catch (e) {
-      const msg = typeof e === "string" ? e : String(e);
-      setLlmStatus("error");
-      setLlmStatusError(msg);
-    }
-  }
-
-  async function loadModels() {
-    if (!config) return;
-    if (!config.llm_base_url || !config.llm_api_key) return;
-    setLoadingModels(true);
-    setModelsError(null);
-    try {
-      const ids = await llmListModels(config.llm_base_url, config.llm_api_key);
-      setModels(ids);
-    } catch (e) {
-      const msg = typeof e === "string" ? e : String(e);
-      setModelsError(msg);
-    } finally {
-      setLoadingModels(false);
-    }
-  }
-
-  useEffect(() => {
-    if (config?.llm_base_url && config?.llm_api_key && config?.llm_default_model) {
-      loadModels();
-      runLlmCheck();
-    }
-  }, [config?.llm_base_url, config?.llm_api_key, config?.llm_default_model]);
 
   if (!config) {
-    return <div className="text-gray-400 dark:text-gray-500">Loading...</div>;
+    return <div className="text-gray-400 dark:text-gray-500">Loading settings…</div>;
   }
 
+  const needsReconnect = Boolean(connection?.connected && connection?.error);
+  const showConnectButton = !connection?.connected || needsReconnect;
+
   return (
-    <div className="max-w-2xl">
-      <h2 className="text-2xl font-bold mb-6">Settings</h2>
-
-      <div className="space-y-6">
-        <section>
-          <h3 className="text-lg font-semibold mb-3 text-gray-700 dark:text-gray-300">
-            Gmail Connection
-          </h3>
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-4 border border-gray-200 dark:border-gray-700 space-y-3">
-            <ConnectionStatus connection={connection} checking={connecting} />
-            {!connection?.connected && (
-              <button
-                onClick={connectGmail}
-                disabled={connecting}
-                className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50"
-              >
-                {connecting ? "Waiting for browser..." : "Connect Gmail"}
-              </button>
-            )}
-            {connectError && (
-              <div className="text-sm text-red-600 dark:text-red-400">
-                {connectError}
-              </div>
-            )}
-          </div>
-        </section>
-
-        <section>
-          <h3 className="flex items-center gap-2 text-lg font-semibold mb-3 text-gray-700 dark:text-gray-300">
-            LLM Configuration
-            {llmStatus === "checking" && (
-              <span className="text-gray-400 dark:text-gray-500 text-sm">…</span>
-            )}
-            {llmStatus === "ok" && (
-              <span
-                className="text-green-600 dark:text-green-400"
-                title="LLM connection is working"
-              >
-                ✓
-              </span>
-            )}
-            {llmStatus === "error" && (
-              <span
-                className="text-red-600 dark:text-red-400"
-                title={llmStatusError ?? "LLM connection failed"}
-              >
-                ✕
-              </span>
-            )}
-          </h3>
-          <div className="space-y-3">
-            <div>
-              <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
-                Base URL
-              </label>
-              <input
-                type="text"
-                value={config.llm_base_url}
-                onChange={(e) =>
-                  setConfig({ ...config, llm_base_url: e.target.value })
-                }
-                className="w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-3 py-2 text-sm"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
-                API Key
-              </label>
-              <input
-                type="password"
-                value={config.llm_api_key}
-                onChange={(e) =>
-                  setConfig({ ...config, llm_api_key: e.target.value })
-                }
-                className="w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-3 py-2 text-sm"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
-                Default Model
-              </label>
-              <Dropdown
-                className="w-full"
-                value={config.llm_default_model}
-                options={[
-                  ...(models.includes(config.llm_default_model) ||
-                  !config.llm_default_model
-                    ? []
-                    : [
-                        {
-                          value: config.llm_default_model,
-                          label: `${config.llm_default_model} (current)`,
-                        },
-                      ]),
-                  ...(models.length > 0
-                    ? models.map((m) => ({ value: m, label: m }))
-                    : []),
-                ]}
-                onChange={(v) => setConfig({ ...config, llm_default_model: v })}
-              />
-              {loadingModels && (
-                <div className="text-xs text-gray-400 dark:text-gray-500 mt-2">
-                  Loading models…
-                </div>
-              )}
-              {modelsError && (
-                <div className="text-sm text-red-600 dark:text-red-400 mt-2">
-                  Could not list models: {modelsError}
-                </div>
-              )}
-            </div>
-          </div>
-        </section>
-
-        <section>
-          <h3 className="text-lg font-semibold mb-3 text-gray-700 dark:text-gray-300">
-            Polling
-          </h3>
-          <div className="space-y-3">
-            <div>
-              <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
-                Gmail Query
-              </label>
-              <input
-                type="text"
-                value={config.polling_query}
-                onChange={(e) =>
-                  setConfig({ ...config, polling_query: e.target.value })
-                }
-                className="w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-3 py-2 text-sm"
-              />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
-                  Interval (minutes)
-                </label>
-                <input
-                  type="number"
-                  min="1"
-                  value={config.polling_interval_minutes}
-                  onChange={(e) =>
-                    setConfig({
-                      ...config,
-                      polling_interval_minutes: Number(e.target.value),
-                    })
-                  }
-                  className="w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
-                  Max per Cycle
-                </label>
-                <input
-                  type="number"
-                  min="1"
-                  value={config.polling_max_per_cycle}
-                  onChange={(e) =>
-                    setConfig({
-                      ...config,
-                      polling_max_per_cycle: Number(e.target.value),
-                    })
-                  }
-                  className="w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-3 py-2 text-sm"
-                />
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={config.polling_enabled}
-                onChange={(e) =>
-                  setConfig({ ...config, polling_enabled: e.target.checked })
-                }
-                className="rounded"
-              />
-              <label className="text-sm text-gray-500 dark:text-gray-400">Enabled</label>
-            </div>
-          </div>
-        </section>
-
-        <section>
-          <h3 className="text-lg font-semibold mb-3 text-gray-700 dark:text-gray-300">
-            Appearance
-          </h3>
-          <div className="flex items-center gap-3">
-            <label className="text-sm text-gray-500 dark:text-gray-400">
-              Tray icon
-            </label>
-            <div className="flex rounded-md overflow-hidden border border-gray-300 dark:border-gray-700">
-              {(["auto", "light", "dark"] as const).map((opt) => {
-                const active = config.tray_theme === opt;
-                const label =
-                  opt === "auto" ? "Auto" : opt === "light" ? "Light" : "Dark";
-                return (
-                  <button
-                    key={opt}
-                    type="button"
-                    onClick={() => setConfig({ ...config, tray_theme: opt })}
-                    className={`px-3 py-1 text-sm transition-colors ${
-                      active
-                        ? "bg-blue-600 text-white"
-                        : "bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </section>
-
-        <div className="flex items-center gap-3 pt-4">
-          <button
-            onClick={handleSave}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
-          >
-            Save
-          </button>
-          {connection?.connected && (
-            <button
-              onClick={disconnectGmail}
-              className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
-            >
-              Disconnect
-            </button>
-          )}
-          {saved && (
-            <span className="text-sm text-green-600 dark:text-green-400">Saved successfully</span>
-          )}
+    <div className="max-w-6xl">
+      <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-blue-600 dark:text-blue-300">
+            Control room
+          </p>
+          <h1 className="mt-1 text-3xl font-semibold tracking-tight">Settings</h1>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+            Shape how Post Office connects, decides, and recovers.
+          </p>
         </div>
+        {tab !== "inference" && (
+          <button
+            type="button"
+            onClick={() => void saveGeneralSettings()}
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-blue-700"
+          >
+            Save settings
+          </button>
+        )}
       </div>
+
+      <div className="mb-7 flex max-w-xl gap-1 rounded-xl border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
+        <TabButton active={tab === "inference"} onClick={() => setTab("inference")}>
+          Inference
+        </TabButton>
+        <TabButton active={tab === "mailbox"} onClick={() => setTab("mailbox")}>
+          Mailbox
+        </TabButton>
+      </div>
+
+      {tab === "inference" && (
+        <InferenceStudio
+          config={config}
+          onConfigChange={(next) => setConfig({ ...config, ...next })}
+        />
+      )}
+
+      {tab === "mailbox" && (
+        <div className="max-w-3xl space-y-6">
+          <section>
+            <SectionHeading eyebrow="Account" title="Gmail connection" />
+            <div className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-700 dark:bg-gray-800">
+              <ConnectionStatus
+                connection={connection}
+                checking={connecting}
+                onReconnect={connectGmail}
+              />
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                {showConnectButton && (
+                  <button
+                    type="button"
+                    onClick={connectGmail}
+                    disabled={connecting}
+                    className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    {connecting
+                      ? "Waiting for browser…"
+                      : needsReconnect
+                        ? "Reconnect Gmail"
+                        : "Connect Gmail"}
+                  </button>
+                )}
+                {connection?.connected && (
+                  <button
+                    type="button"
+                    onClick={disconnectGmail}
+                    className="rounded-lg px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-950/30"
+                  >
+                    Disconnect
+                  </button>
+                )}
+              </div>
+              {connectError && (
+                <p className="mt-3 text-sm text-red-600 dark:text-red-400">{connectError}</p>
+              )}
+            </div>
+          </section>
+
+          <section>
+            <SectionHeading eyebrow="Processing" title="Polling behavior" />
+            <div className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-700 dark:bg-gray-800">
+              <div className="space-y-4">
+                <Field label="Gmail query">
+                  <input
+                    value={config.polling_query}
+                    onChange={(event) => setConfig({ ...config, polling_query: event.target.value })}
+                    className={inputClass}
+                  />
+                </Field>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <Field label="Interval in minutes">
+                    <input
+                      type="number"
+                      min="1"
+                      value={config.polling_interval_minutes}
+                      onChange={(event) => setConfig({ ...config, polling_interval_minutes: Number(event.target.value) })}
+                      className={inputClass}
+                    />
+                  </Field>
+                  <Field label="Maximum per cycle">
+                    <input
+                      type="number"
+                      min="1"
+                      value={config.polling_max_per_cycle}
+                      onChange={(event) => setConfig({ ...config, polling_max_per_cycle: Number(event.target.value) })}
+                      className={inputClass}
+                    />
+                  </Field>
+                </div>
+                <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={config.polling_enabled}
+                    onChange={(event) => setConfig({ ...config, polling_enabled: event.target.checked })}
+                    className="rounded"
+                  />
+                  Keep polling enabled
+                </label>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
+
     </div>
   );
 }
+
+function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex-1 rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
+        active
+          ? "bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-white"
+          : "text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function SectionHeading({ eyebrow, title }: { eyebrow: string; title: string }) {
+  return (
+    <div className="mb-3">
+      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-400 dark:text-gray-500">
+        {eyebrow}
+      </p>
+      <h2 className="mt-1 text-lg font-semibold text-gray-800 dark:text-gray-100">{title}</h2>
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-gray-500 dark:text-gray-400">{label}</label>
+      {children}
+    </div>
+  );
+}
+
+const inputClass = "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100";

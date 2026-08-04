@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::db::config::ConfigRepository;
+use crate::llm::{LlmProviderProfile, LlmRoutingPolicy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -11,10 +12,23 @@ pub struct AppConfig {
     pub llm_default_model: String,
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
+    pub llm_timeout_secs: u64,
+    pub llm_input_cost_per_million_usd: f64,
+    pub llm_output_cost_per_million_usd: f64,
+    pub llm_providers: Vec<LlmProviderProfile>,
+    pub llm_routing_policies: Vec<LlmRoutingPolicy>,
+    pub llm_default_policy: String,
     pub polling_query: String,
     pub polling_interval_minutes: u32,
     pub polling_max_per_cycle: u32,
     pub polling_enabled: bool,
+    pub sync_enabled: bool,
+    pub sync_reconcile_interval_minutes: u32,
+    pub sync_watch_topic: String,
+    pub sync_watch_label_ids: String,
+    pub relay_enabled: bool,
+    pub relay_ws_url: String,
+    pub relay_auth_token: String,
     pub tray_theme: String,
 }
 
@@ -28,10 +42,23 @@ impl Default for AppConfig {
             llm_default_model: "llama3".into(),
             llm_temperature: 0.3,
             llm_max_tokens: 1024,
+            llm_timeout_secs: 30,
+            llm_input_cost_per_million_usd: 0.0,
+            llm_output_cost_per_million_usd: 0.0,
+            llm_providers: vec![],
+            llm_routing_policies: vec![],
+            llm_default_policy: "default".into(),
             polling_query: "is:unread".into(),
             polling_interval_minutes: 5,
             polling_max_per_cycle: 100,
             polling_enabled: true,
+            sync_enabled: false,
+            sync_reconcile_interval_minutes: 5,
+            sync_watch_topic: String::new(),
+            sync_watch_label_ids: String::new(),
+            relay_enabled: false,
+            relay_ws_url: String::new(),
+            relay_auth_token: String::new(),
             tray_theme: "auto".into(),
         }
     }
@@ -54,10 +81,29 @@ impl AppConfig {
             llm_default_model: get("llm.default_model", &Self::default().llm_default_model),
             llm_temperature: get("llm.temperature", "0.3").parse().unwrap_or(0.3),
             llm_max_tokens: get("llm.max_tokens", "1024").parse().unwrap_or(1024),
+            llm_timeout_secs: get("llm.timeout_secs", "30").parse().unwrap_or(30),
+            llm_input_cost_per_million_usd: get("llm.input_cost_per_million_usd", "0")
+                .parse()
+                .unwrap_or(0.0),
+            llm_output_cost_per_million_usd: get("llm.output_cost_per_million_usd", "0")
+                .parse()
+                .unwrap_or(0.0),
+            llm_providers: parse_json(&get("llm.providers", "[]")),
+            llm_routing_policies: parse_json(&get("llm.routing_policies", "[]")),
+            llm_default_policy: get("llm.default_policy", "default"),
             polling_query: get("polling.query", &Self::default().polling_query),
             polling_interval_minutes: get("polling.interval_minutes", "5").parse().unwrap_or(5),
             polling_max_per_cycle: get("polling.max_per_cycle", "100").parse().unwrap_or(100),
             polling_enabled: get("polling.enabled", "true").parse().unwrap_or(true),
+            sync_enabled: get("sync.enabled", "false").parse().unwrap_or(false),
+            sync_reconcile_interval_minutes: get("sync.reconcile_interval_minutes", "5")
+                .parse()
+                .unwrap_or(5),
+            sync_watch_topic: get("sync.watch.topic", ""),
+            sync_watch_label_ids: get("sync.watch.label_ids", ""),
+            relay_enabled: get("sync.relay.enabled", "false").parse().unwrap_or(false),
+            relay_ws_url: get("sync.relay.ws_url", ""),
+            relay_auth_token: get("sync.relay.auth_token", ""),
             tray_theme: get("ui.tray_theme", "auto"),
         }
     }
@@ -74,6 +120,24 @@ impl AppConfig {
         set("llm.default_model", &self.llm_default_model)?;
         set("llm.temperature", &self.llm_temperature.to_string())?;
         set("llm.max_tokens", &self.llm_max_tokens.to_string())?;
+        set("llm.timeout_secs", &self.llm_timeout_secs.to_string())?;
+        set(
+            "llm.input_cost_per_million_usd",
+            &self.llm_input_cost_per_million_usd.to_string(),
+        )?;
+        set(
+            "llm.output_cost_per_million_usd",
+            &self.llm_output_cost_per_million_usd.to_string(),
+        )?;
+        set(
+            "llm.providers",
+            &serde_json::to_string(&self.llm_providers).unwrap_or_else(|_| "[]".into()),
+        )?;
+        set(
+            "llm.routing_policies",
+            &serde_json::to_string(&self.llm_routing_policies).unwrap_or_else(|_| "[]".into()),
+        )?;
+        set("llm.default_policy", &self.llm_default_policy)?;
         set("polling.query", &self.polling_query)?;
         set(
             "polling.interval_minutes",
@@ -84,7 +148,76 @@ impl AppConfig {
             &self.polling_max_per_cycle.to_string(),
         )?;
         set("polling.enabled", &self.polling_enabled.to_string())?;
+        set("sync.enabled", &self.sync_enabled.to_string())?;
+        set(
+            "sync.reconcile_interval_minutes",
+            &self.sync_reconcile_interval_minutes.to_string(),
+        )?;
+        set("sync.watch.topic", &self.sync_watch_topic)?;
+        set("sync.watch.label_ids", &self.sync_watch_label_ids)?;
+        set("sync.relay.enabled", &self.relay_enabled.to_string())?;
+        set("sync.relay.ws_url", &self.relay_ws_url)?;
+        set("sync.relay.auth_token", &self.relay_auth_token)?;
         set("ui.tray_theme", &self.tray_theme)?;
         Ok(())
+    }
+}
+
+fn parse_json<T>(value: &str) -> Vec<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_str(value).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::db::Database;
+    use crate::llm::PrivacyRequirement;
+
+    #[test]
+    fn saves_and_loads_inference_configuration_together() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        let config = AppConfig {
+            llm_providers: vec![LlmProviderProfile {
+                id: "travel".into(),
+                name: "Travel fallback".into(),
+                base_url: "https://example.test/v1".into(),
+                model: "example/cheap".into(),
+                api_key_ref: "travel".into(),
+                quality_tier: "cheap".into(),
+                privacy_status: "unknown".into(),
+                input_cost_per_million_usd: 1.0,
+                output_cost_per_million_usd: 2.0,
+                timeout_secs: 45,
+                enabled: true,
+            }],
+            llm_routing_policies: vec![LlmRoutingPolicy {
+                id: "travel".into(),
+                name: "Travel".into(),
+                candidate_provider_ids: vec!["travel".into()],
+                minimum_quality: "cheap".into(),
+                privacy_requirement: PrivacyRequirement::Any,
+                allow_fallback: true,
+            }],
+            llm_default_policy: "travel".into(),
+            llm_timeout_secs: 45,
+            ..AppConfig::default()
+        };
+
+        db.with_config(|repo| config.save(&repo)).unwrap();
+        let loaded = db.with_config(|repo| AppConfig::load(&repo));
+
+        assert_eq!(loaded.llm_default_policy, "travel");
+        assert_eq!(loaded.llm_timeout_secs, 45);
+        assert_eq!(loaded.llm_providers[0].model, "example/cheap");
+        assert_eq!(
+            loaded.llm_routing_policies[0].candidate_provider_ids,
+            ["travel"]
+        );
     }
 }

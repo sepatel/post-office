@@ -430,6 +430,26 @@ smaller:1M
 
 Queries can be combined with spaces (AND) and `-` (NOT).
 
+## Push + Cursor Sync Endpoints
+
+Target-state ingestion uses Gmail push notifications plus cursor replay:
+
+- `POST /users/me/watch`
+- `POST /users/me/stop`
+- `GET /users/me/history?startHistoryId=...`
+
+Design constraints:
+
+- Notifications only carry `emailAddress` + `historyId`; they are a trigger, not
+  complete mailbox state.
+- `history.list` is the source of truth and must be paged until caught up.
+- Watches expire and must be renewed (Gmail max is 7 days).
+- Desktop apps cannot expose public webhooks directly, so Pub/Sub push requires
+  a cloud relay.
+
+See `design/gmail-push-sync.md` for full protocol, relay architecture, and
+failure-recovery behavior.
+
 ## Models
 
 ```rust

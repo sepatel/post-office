@@ -9,9 +9,9 @@ pub async fn execute_action(
     existing_labels: &[Label],
 ) -> Result<(), crate::gmail::GmailError> {
     let (add, remove) = match action {
-        ParsedAction::Label(name) => {
-            let label = get_or_create_label(gmail, name, existing_labels).await?;
-            (vec![label.id], vec![])
+        ParsedAction::Label(value) => {
+            let label_id = resolve_existing_label_id(value, existing_labels)?;
+            (vec![label_id], vec![])
         }
         ParsedAction::Archive => (vec![], vec!["INBOX".into()]),
         ParsedAction::Trash => (vec!["TRASH".into()], vec!["INBOX".into()]),
@@ -35,14 +35,61 @@ pub async fn execute_action(
     Ok(())
 }
 
-async fn get_or_create_label(
-    gmail: &mut GmailClient,
-    name: &str,
+fn resolve_existing_label_id(
+    value: &str,
     existing_labels: &[Label],
-) -> Result<Label, crate::gmail::GmailError> {
-    if let Some(existing) = existing_labels.iter().find(|l| l.name == name) {
-        return Ok(existing.clone());
+) -> Result<String, crate::gmail::GmailError> {
+    let trimmed = value.trim();
+
+    if let Some(existing) = existing_labels.iter().find(|l| l.id == trimmed) {
+        return Ok(existing.id.clone());
     }
 
-    gmail.create_label(name).await
+    if let Some(existing) = existing_labels
+        .iter()
+        .find(|l| l.name.eq_ignore_ascii_case(trimmed))
+    {
+        return Ok(existing.id.clone());
+    }
+
+    Err(crate::gmail::GmailError::Auth(format!(
+        "Unknown label: {}",
+        value
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label(id: &str, name: &str) -> Label {
+        Label {
+            id: id.into(),
+            name: name.into(),
+            label_type: "user".into(),
+            message_list_visibility: None,
+            label_list_visibility: None,
+        }
+    }
+
+    #[test]
+    fn resolves_by_id() {
+        let labels = vec![label("Label_1", "Invoices")];
+        let resolved = resolve_existing_label_id("Label_1", &labels).unwrap();
+        assert_eq!(resolved, "Label_1");
+    }
+
+    #[test]
+    fn resolves_by_name() {
+        let labels = vec![label("Label_1", "Invoices")];
+        let resolved = resolve_existing_label_id("invoices", &labels).unwrap();
+        assert_eq!(resolved, "Label_1");
+    }
+
+    #[test]
+    fn unknown_label_is_error() {
+        let labels = vec![label("Label_1", "Invoices")];
+        let err = resolve_existing_label_id("Receipts", &labels).unwrap_err();
+        assert!(err.to_string().contains("Unknown label"));
+    }
 }

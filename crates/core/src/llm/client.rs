@@ -1,22 +1,40 @@
 use async_openai::{config::OpenAIConfig, Client};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use super::{LlmError, ProcessRequest, ProcessResponse};
 
+#[derive(Clone)]
 pub struct LlmClient {
     client: Client<OpenAIConfig>,
     default_model: String,
+    provider_id: Option<String>,
 }
 
 impl LlmClient {
     pub fn new(base_url: &str, api_key: &str, default_model: &str) -> Self {
+        Self::with_options(base_url, api_key, default_model, 30, None)
+    }
+
+    pub fn with_options(
+        base_url: &str,
+        api_key: &str,
+        default_model: &str,
+        timeout_secs: u64,
+        provider_id: Option<String>,
+    ) -> Self {
         let config = OpenAIConfig::new()
             .with_api_base(base_url)
             .with_api_key(api_key);
+        let http = reqwest13::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs.max(1)))
+            .build()
+            .unwrap_or_else(|_| reqwest13::Client::new());
 
         Self {
-            client: Client::with_config(config),
+            client: Client::with_config(config).with_http_client(http),
             default_model: default_model.to_string(),
+            provider_id,
         }
     }
 
@@ -39,16 +57,18 @@ impl LlmClient {
 
         let start = std::time::Instant::now();
 
-        let response: Value = self
-            .client
-            .chat()
-            .create_byot(json!({
-                "model": model,
-                "messages": messages,
-                "temperature": request.temperature,
-                "max_tokens": request.max_tokens,
-            }))
-            .await?;
+        let mut body = json!({
+            "model": model,
+            "messages": messages,
+        });
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
+
+        let response: Value = self.client.chat().create_byot(body).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -57,6 +77,12 @@ impl LlmClient {
             .unwrap_or_default()
             .to_string();
 
+        let prompt_tokens = response["usage"]["prompt_tokens"]
+            .as_u64()
+            .map(|t| t as u32);
+        let completion_tokens = response["usage"]["completion_tokens"]
+            .as_u64()
+            .map(|t| t as u32);
         let tokens_used = response["usage"]["total_tokens"].as_u64().map(|t| t as u32);
 
         let model_used = response["model"].as_str().unwrap_or(&model).to_string();
@@ -64,6 +90,9 @@ impl LlmClient {
         Ok(ProcessResponse {
             content,
             model: model_used,
+            provider_id: self.provider_id.clone(),
+            prompt_tokens,
+            completion_tokens,
             tokens_used,
             duration_ms,
         })

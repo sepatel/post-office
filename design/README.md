@@ -13,6 +13,7 @@ A Rust desktop application for applying AI filters over Gmail emails. Runs local
 | [Rules Engine](rules-engine.md) | Condition matching, action execution |
 | [Desktop GUI](desktop-gui.md) | Tauri v2, system tray, window management |
 | [Dependencies](dependencies.md) | Crate choices and rationale |
+| [Gmail Push Sync](gmail-push-sync.md) | Push architecture (`watch` + `history.list`) and relay design |
 | [Implementation Phases](implementation-phases.md) | Development roadmap |
 
 ## Project Decisions
@@ -37,6 +38,7 @@ A Rust desktop application for applying AI filters over Gmail emails. Runs local
 | Rule evaluation | First-match-wins (lowest priority number wins) |
 | Prompt + structured actions | Hybrid token resolution: APPLY runs configured actions; explicit tokens override per email |
 | Processing scope | Configurable per-instance (default: `is:unread`) |
+| Inbox sync model | Target state is Gmail push notifications + `historyId` replay |
 | Starter prompt templates | Not for MVP |
 | Malformed LLM responses | Strict prompt format, skip email if invalid (no retry) |
 | Frontend framework | React (largest ecosystem, Tauri first-class support, least maintenance) |

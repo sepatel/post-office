@@ -3,9 +3,11 @@ import { Outlet, NavLink, useNavigate } from "react-router-dom";
 import ThemeToggle from "./ThemeToggle";
 import ConnectionStatus from "./ConnectionStatus";
 import { useGate } from "../lib/gate";
+import { formatLocalDateTime } from "../lib/datetime";
 import {
   onBackfillProgress,
   onCycleProgress,
+  onSyncProgress,
   processingPause,
   processingResume,
   processingStatus,
@@ -25,6 +27,17 @@ interface ProcessingStatus {
   last_successful: string | null;
   last_cycle_count: number;
   last_cycle_error: string | null;
+  current_progress: OpProgress | null;
+  backfill_running: boolean;
+  backfill_cancel_requested: boolean;
+}
+
+function isTerminalPhase(phase: string): boolean {
+  return phase === "idle" || phase === "error" || phase === "stopped";
+}
+
+function isActiveProgress(progress: OpProgress | null | undefined): progress is OpProgress {
+  return Boolean(progress && !isTerminalPhase(progress.phase));
 }
 
 export default function Layout() {
@@ -33,11 +46,33 @@ export default function Layout() {
   const [status, setStatus] = useState<ProcessingStatus | null>(null);
   const [cycle, setCycle] = useState<OpProgress | null>(null);
   const [backfill, setBackfill] = useState<OpProgress | null>(null);
+  const [sync, setSync] = useState<OpProgress | null>(null);
   const [togglingPause, setTogglingPause] = useState(false);
 
   async function loadStatus() {
     try {
-      setStatus((await processingStatus()) as ProcessingStatus);
+      const next = (await processingStatus()) as ProcessingStatus;
+      setStatus(next);
+
+      if (isActiveProgress(next.current_progress)) {
+        if (next.current_progress.source === "backfill") {
+          setBackfill(next.current_progress);
+          setSync(null);
+          setCycle(null);
+        } else if (next.current_progress.source === "sync") {
+          setSync(next.current_progress);
+          setBackfill(null);
+          setCycle(null);
+        } else {
+          setCycle(next.current_progress);
+          setBackfill(null);
+          setSync(null);
+        }
+      } else {
+        setCycle(null);
+        setBackfill(null);
+        setSync(null);
+      }
     } catch {
       /* keep previous value */
     }
@@ -49,20 +84,40 @@ export default function Layout() {
 
     const unlisteners = Promise.all([
       onCycleProgress((p) => {
-        setCycle(p);
-        if (p.phase === "idle" || p.phase === "error") loadStatus();
+        setCycle(isTerminalPhase(p.phase) ? null : p);
+        if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
+          window.setTimeout(() => {
+            void loadStatus();
+          }, 750);
+        }
+        if (isTerminalPhase(p.phase)) loadStatus();
       }),
       onBackfillProgress((p) => {
-        setBackfill(p);
-        if (p.phase === "idle" || p.phase === "error") loadStatus();
+        setBackfill(isTerminalPhase(p.phase) ? null : p);
+        if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
+          window.setTimeout(() => {
+            void loadStatus();
+          }, 750);
+        }
+        if (isTerminalPhase(p.phase)) loadStatus();
+      }),
+      onSyncProgress((p) => {
+        setSync(isTerminalPhase(p.phase) ? null : p);
+        if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
+          window.setTimeout(() => {
+            void loadStatus();
+          }, 750);
+        }
+        if (isTerminalPhase(p.phase)) loadStatus();
       }),
     ]);
 
     return () => {
       clearInterval(interval);
-      unlisteners.then(([a, b]) => {
+      unlisteners.then(([a, b, c]) => {
         a();
         b();
+        c();
       });
     };
   }, []);
@@ -119,6 +174,7 @@ export default function Layout() {
             <NavProcessingStatus
               cycle={cycle}
               backfill={backfill}
+              sync={sync}
               status={status}
             />
             <button
@@ -160,14 +216,25 @@ export default function Layout() {
 function NavProcessingStatus({
   cycle,
   backfill,
+  sync,
   status,
 }: {
   cycle: OpProgress | null;
   backfill: OpProgress | null;
+  sync: OpProgress | null;
   status: ProcessingStatus | null;
 }) {
-  const op = backfill ?? cycle;
-  const active = op != null && op.phase !== "idle";
+  const fallback = isActiveProgress(status?.current_progress)
+    ? status.current_progress
+    : null;
+  const op = isActiveProgress(backfill)
+    ? backfill
+    : isActiveProgress(sync)
+      ? sync
+      : isActiveProgress(cycle)
+        ? cycle
+        : fallback;
+  const active = isActiveProgress(op);
   const paused = status?.paused ?? false;
   const pollingEnabled = status?.polling_enabled ?? true;
 
@@ -177,20 +244,22 @@ function NavProcessingStatus({
       : paused
         ? "Paused"
         : "Running"
-    : backfill != null
+    : op.source === "backfill"
       ? "Backfilling"
-      : op.phase === "fetching"
+      : op.source === "sync"
+        ? "Syncing"
+        : op.phase === "fetching"
         ? "Fetching"
         : "Processing";
 
   const pct =
-    op != null && op.total != null
+    active && op.total != null
       ? Math.min(100, Math.round((op.processed / Math.max(op.total, 1)) * 100))
       : undefined;
   const count =
-    op != null && op.total != null
+    active && op.total != null
       ? `${op.processed}/${op.total}`
-      : op != null
+      : active && op.processed > 0
         ? `${op.processed}`
         : "";
 
@@ -200,13 +269,15 @@ function NavProcessingStatus({
       : paused
         ? "bg-yellow-500"
         : "bg-green-500"
-    : "bg-blue-500 animate-pulse";
+      : "bg-blue-500 animate-pulse";
 
-  const detail = status?.last_cycle_error
-    ? `Last failure: ${status.last_cycle_error}`
-    : status
-      ? `Last cycle: ${status.last_cycle_count} email${status.last_cycle_count === 1 ? "" : "s"}`
-      : "";
+  const detail = active && op.detail
+    ? op.detail
+    : status?.last_cycle_error
+      ? `Last failure: ${status.last_cycle_error}`
+      : status
+        ? `Last cycle: ${status.last_cycle_count} email${status.last_cycle_count === 1 ? "" : "s"}`
+        : "";
 
   return (
     <div className="bg-gray-200/70 dark:bg-gray-700/50 border border-gray-300 dark:border-gray-600 rounded p-2">
@@ -236,7 +307,7 @@ function NavProcessingStatus({
       )}
       {status?.last_successful && (
         <div className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
-          Last at: {new Date(status.last_successful).toLocaleString()}
+          Last at: {formatLocalDateTime(status.last_successful, "Never")}
         </div>
       )}
     </div>

@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { rulesList, ruleMetrics, type RuleMetrics } from "../lib/tauri";
+import {
+  rulesList,
+  ruleMetrics,
+  ruleRoiMetrics,
+  type RuleMetrics,
+  type RuleRoiMetrics,
+} from "../lib/tauri";
 
 interface Rule {
   id: number;
@@ -15,6 +21,7 @@ export default function Rules() {
   const [metricsByRule, setMetricsByRule] = useState<Record<number, RuleMetrics>>(
     {},
   );
+  const [roiByRule, setRoiByRule] = useState<Record<number, RuleRoiMetrics>>({});
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -23,13 +30,20 @@ export default function Rules() {
 
   async function loadRules() {
     try {
-      const [r, m] = await Promise.all([
+      const [r, m, roi] = await Promise.all([
         rulesList() as Promise<Rule[]>,
         ruleMetrics(),
+        ruleRoiMetrics(),
       ]);
       setRules(r);
       setMetricsByRule(
         m.reduce<Record<number, RuleMetrics>>((acc, metric) => {
+          acc[metric.rule_id] = metric;
+          return acc;
+        }, {}),
+      );
+      setRoiByRule(
+        roi.reduce<Record<number, RuleRoiMetrics>>((acc, metric) => {
           acc[metric.rule_id] = metric;
           return acc;
         }, {}),
@@ -82,10 +96,20 @@ export default function Rules() {
                 </span>
               </div>
               <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                <MetricLine label="24h" metric={metricsByRule[rule.id]} window="24h" />
+                <MetricLine
+                  label="24h"
+                  metric={metricsByRule[rule.id]}
+                  roi={roiByRule[rule.id]}
+                  window="24h"
+                />
               </div>
               <div className="text-xs text-gray-500 dark:text-gray-400">
-                <MetricLine label="7d" metric={metricsByRule[rule.id]} window="7d" />
+                <MetricLine
+                  label="7d"
+                  metric={metricsByRule[rule.id]}
+                  roi={roiByRule[rule.id]}
+                  window="7d"
+                />
               </div>
               {rule.description && (
                 <div className="text-sm text-gray-500 dark:text-gray-400 mt-1">
@@ -120,10 +144,12 @@ export default function Rules() {
 function MetricLine({
   label,
   metric,
+  roi,
   window,
 }: {
   label: string;
   metric?: RuleMetrics;
+  roi?: RuleRoiMetrics;
   window: "24h" | "7d";
 }) {
   const checked = window === "24h" ? metric?.checked_24h ?? 0 : metric?.checked_7d ?? 0;
@@ -131,15 +157,32 @@ function MetricLine({
     window === "24h" ? metric?.succeeded_24h ?? 0 : metric?.succeeded_7d ?? 0;
   const llmCalls =
     window === "24h" ? metric?.llm_calls_24h ?? 0 : metric?.llm_calls_7d ?? 0;
+  const llmChecks =
+    window === "24h" ? roi?.llm_checks_24h ?? 0 : roi?.llm_checks_7d ?? 0;
+  const llmCost =
+    window === "24h" ? roi?.estimated_cost_24h_usd ?? 0 : roi?.estimated_cost_7d_usd ?? 0;
+  const avgLatencyMs =
+    window === "24h" ? roi?.avg_duration_24h_ms ?? 0 : roi?.avg_duration_7d_ms ?? 0;
   const successRate = checked === 0 ? 0 : Math.round((succeeded / checked) * 100);
   const showLlmCalls = llmCalls > 0 && llmCalls !== checked;
+  const avgLatencySeconds = avgLatencyMs / 1000;
+  const totalCost = formatUsdUp(llmCost);
   return (
     <>
       {label}: {checked} checked • {succeeded} success •{" "}
       <span className={successRateTone(successRate)}>{successRate}% success</span>
       {showLlmCalls && <> • {llmCalls} LLM calls</>}
+      {llmChecks > 0 && (
+        <>
+          {" "}• {avgLatencySeconds.toFixed(1)} s/check • ${totalCost} total
+        </>
+      )}
     </>
   );
+}
+
+function formatUsdUp(value: number): string {
+  return (Math.ceil(value * 100) / 100).toFixed(2);
 }
 
 function successRateTone(rate: number): string {

@@ -3,7 +3,7 @@ use super::models::Rule;
 use super::response_parser::{extract_reasoning, parse_llm_response, ParsedAction};
 use crate::db::rules::RuleRepository;
 use crate::gmail::models::Message;
-use crate::llm::{LlmClient, ProcessRequest};
+use crate::llm::{InferenceRouter, ProcessRequest};
 use crate::rules::prompts::RULE_SYSTEM_PROMPT;
 
 pub struct RuleEngine<'a> {
@@ -35,10 +35,10 @@ impl<'a> RuleEngine<'a> {
 /// actions that *would* be taken (structured actions, or the LLM's verdict)
 /// plus the raw LLM reply (empty for the structured-action path).
 ///
-/// Takes `&LlmClient` directly so callers don't need a `RuleRepository` — this
+/// Takes the router directly so callers don't need a `RuleRepository` — this
 /// is what lets the test/apply commands run without blocking the async runtime.
 pub async fn resolve_rule(
-    llm: &LlmClient,
+    llm: &InferenceRouter,
     rule: &Rule,
     email: &Message,
     memories: &[String],
@@ -58,7 +58,7 @@ pub async fn resolve_rule(
 
 /// Dry-run variant of `resolve_rule` that produces a frontend-friendly result.
 pub async fn test_rule(
-    llm: &LlmClient,
+    llm: &InferenceRouter,
     rule: &Rule,
     email: &Message,
     memories: &[String],
@@ -80,7 +80,7 @@ pub async fn test_rule(
 }
 
 async fn execute_rule(
-    llm: &LlmClient,
+    llm: &InferenceRouter,
     rule: &Rule,
     email: &Message,
     memories: &[String],
@@ -93,6 +93,12 @@ async fn execute_rule(
                 actions: vec![],
                 llm_response: String::new(),
                 reasoning: String::new(),
+                llm_model: None,
+                llm_provider: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                llm_duration_ms: None,
             });
         }
         let actions: Vec<ParsedAction> = rule.actions.iter().map(ParsedAction::from).collect();
@@ -100,6 +106,12 @@ async fn execute_rule(
             actions,
             llm_response: String::new(),
             reasoning: String::new(),
+            llm_model: None,
+            llm_provider: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            llm_duration_ms: None,
         });
     }
 
@@ -109,13 +121,16 @@ async fn execute_rule(
     let user_prompt = build_user_prompt(&rule.prompt, email, memories);
 
     let llm_response = llm
-        .process(ProcessRequest {
-            system_prompt: Some(RULE_SYSTEM_PROMPT.to_string()),
-            user_prompt,
-            model: None,
-            temperature: None,
-            max_tokens: None,
-        })
+        .process(
+            &rule.inference_policy,
+            ProcessRequest {
+                system_prompt: Some(RULE_SYSTEM_PROMPT.to_string()),
+                user_prompt,
+                model: None,
+                temperature: None,
+                max_tokens: None,
+            },
+        )
         .await?;
 
     let parsed = parse_llm_response(&llm_response.content);
@@ -126,6 +141,12 @@ async fn execute_rule(
         actions,
         llm_response: llm_response.content.clone(),
         reasoning: extract_reasoning(&llm_response.content),
+        llm_model: Some(llm_response.model),
+        llm_provider: llm_response.provider_id,
+        prompt_tokens: llm_response.prompt_tokens,
+        completion_tokens: llm_response.completion_tokens,
+        total_tokens: llm_response.tokens_used,
+        llm_duration_ms: Some(llm_response.duration_ms),
     })
 }
 
@@ -143,6 +164,12 @@ pub struct Resolved {
     pub actions: Vec<ParsedAction>,
     pub llm_response: String,
     pub reasoning: String,
+    pub llm_model: Option<String>,
+    pub llm_provider: Option<String>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+    pub llm_duration_ms: Option<u64>,
 }
 
 /// Frontend-friendly result of a dry-run test against a single email.
@@ -209,7 +236,8 @@ pub fn display_action(action: &ParsedAction) -> ActionDisplay {
 /// Resolve the final action list from an LLM token under hybrid semantics:
 /// - SKIP/invalid (`None`) -> no action
 /// - APPLY -> rule's configured actions
-/// - Explicit action token -> execute that token directly
+/// - TRASH/SPAM -> execute that explicit token directly
+/// - Other explicit action token -> run explicit token + configured actions
 pub(crate) fn resolve_effective_actions(
     rule: &Rule,
     parsed: Option<ParsedAction>,
@@ -217,7 +245,17 @@ pub(crate) fn resolve_effective_actions(
     match parsed {
         None => vec![],
         Some(ParsedAction::Apply) => rule.actions.iter().map(ParsedAction::from).collect(),
-        Some(action) => vec![action],
+        Some(ParsedAction::Trash) => vec![ParsedAction::Trash],
+        Some(ParsedAction::Spam) => vec![ParsedAction::Spam],
+        Some(action) => {
+            let mut resolved = vec![action];
+            for configured in rule.actions.iter().map(ParsedAction::from) {
+                if !resolved.contains(&configured) {
+                    resolved.push(configured);
+                }
+            }
+            resolved
+        }
     }
 }
 
@@ -339,6 +377,7 @@ mod tests {
             priority: 0,
             enabled: true,
             parent_id: None,
+            inference_policy: "default".into(),
         }
     }
 
@@ -367,6 +406,22 @@ mod tests {
 
         let resolved = resolve_effective_actions(&rule, Some(ParsedAction::Trash));
         assert_eq!(resolved, vec![ParsedAction::Trash]);
+    }
+
+    #[test]
+    fn explicit_non_destructive_token_runs_with_structured_actions() {
+        let rule = rule_with_actions(vec![Action::Archive]);
+
+        let resolved = resolve_effective_actions(&rule, Some(ParsedAction::Star));
+        assert_eq!(resolved, vec![ParsedAction::Star, ParsedAction::Archive]);
+    }
+
+    #[test]
+    fn explicit_spam_does_not_run_structured_actions() {
+        let rule = rule_with_actions(vec![Action::Archive]);
+
+        let resolved = resolve_effective_actions(&rule, Some(ParsedAction::Spam));
+        assert_eq!(resolved, vec![ParsedAction::Spam]);
     }
 
     #[test]

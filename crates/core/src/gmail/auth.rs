@@ -53,13 +53,29 @@ impl GmailAuth {
             form.push(("client_secret", secret));
         }
 
-        let token: TokenResponse = http
+        let response = http
             .post("https://oauth2.googleapis.com/token")
             .form(&form)
             .send()
-            .await?
-            .json()
             .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Err(GmailError::Auth(format!(
+                "token refresh failed ({}): {}",
+                status,
+                summarize_oauth_error(&body)
+            )));
+        }
+
+        let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
+            GmailError::Auth(format!(
+                "failed to decode token refresh response: {} (body: {})",
+                e,
+                truncate_for_log(&body)
+            ))
+        })?;
 
         self.access_token = token.access_token;
         self.expires_at =
@@ -83,13 +99,42 @@ impl GmailAuth {
     }
 }
 
+#[derive(Deserialize)]
+struct OAuthErrorBody {
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn summarize_oauth_error(body: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<OAuthErrorBody>(body) {
+        match (parsed.error, parsed.error_description) {
+            (Some(code), Some(desc)) if !desc.trim().is_empty() => {
+                return format!("{} ({})", code, desc.trim());
+            }
+            (Some(code), _) => return code,
+            _ => {}
+        }
+    }
+
+    truncate_for_log(body)
+}
+
+fn truncate_for_log(s: &str) -> String {
+    const MAX: usize = 300;
+    let trimmed = s.trim();
+    if trimmed.len() <= MAX {
+        return trimmed.to_string();
+    }
+    format!("{}...", &trimmed[..MAX])
+}
+
 pub fn store_tokens(account: &str, access: &str, refresh: &str) -> Result<(), GmailError> {
     let entry = Entry::new(SERVICE_NAME, account)?;
     let tokens = TokenStore {
         access: access.to_string(),
         refresh: refresh.to_string(),
     };
-    let _ = entry.set_password(&serde_json::to_string(&tokens)?)?;
+    entry.set_password(&serde_json::to_string(&tokens)?)?;
     Ok(())
 }
 

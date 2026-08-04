@@ -13,8 +13,10 @@ impl<'a> RuleRepository<'a> {
 
     pub fn list_all(&self) -> Result<Vec<Rule>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, conditions, prompt, actions, priority, enabled, parent_id
-             FROM rules
+            "SELECT r.id, r.name, r.description, r.conditions, r.prompt, r.actions, r.priority, r.enabled, r.parent_id,
+                     COALESCE(p.policy_id, 'default')
+             FROM rules r
+             LEFT JOIN rule_inference_policy p ON p.rule_id = r.id
              ORDER BY priority ASC",
         )?;
 
@@ -30,6 +32,7 @@ impl<'a> RuleRepository<'a> {
                     priority: row.get(6)?,
                     enabled: row.get::<_, i32>(7)? != 0,
                     parent_id: row.get(8)?,
+                    inference_policy: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -39,9 +42,11 @@ impl<'a> RuleRepository<'a> {
 
     pub fn get_enabled_rules(&self) -> Result<Vec<Rule>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, conditions, prompt, actions, priority, enabled, parent_id
-             FROM rules
-             WHERE enabled = 1
+            "SELECT r.id, r.name, r.description, r.conditions, r.prompt, r.actions, r.priority, r.enabled, r.parent_id,
+                     COALESCE(p.policy_id, 'default')
+             FROM rules r
+             LEFT JOIN rule_inference_policy p ON p.rule_id = r.id
+             WHERE r.enabled = 1
              ORDER BY priority ASC",
         )?;
 
@@ -57,6 +62,7 @@ impl<'a> RuleRepository<'a> {
                     priority: row.get(6)?,
                     enabled: row.get::<_, i32>(7)? != 0,
                     parent_id: row.get(8)?,
+                    inference_policy: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -72,10 +78,12 @@ impl<'a> RuleRepository<'a> {
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, name, description, conditions, prompt, actions, priority, enabled, parent_id
-             FROM rules
-             WHERE id IN ({placeholders})
-             ORDER BY priority ASC"
+            "SELECT r.id, r.name, r.description, r.conditions, r.prompt, r.actions, r.priority, r.enabled, r.parent_id,
+                     COALESCE(p.policy_id, 'default')
+             FROM rules r
+             LEFT JOIN rule_inference_policy p ON p.rule_id = r.id
+             WHERE r.id IN ({placeholders})
+             ORDER BY r.priority ASC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mapped = stmt.query_map(rusqlite::params_from_iter(ids.iter().copied()), |row| {
@@ -89,6 +97,7 @@ impl<'a> RuleRepository<'a> {
                 priority: row.get(6)?,
                 enabled: row.get::<_, i32>(7)? != 0,
                 parent_id: row.get(8)?,
+                inference_policy: row.get(9)?,
             })
         })?;
         let rules = mapped.collect::<Result<Vec<_>>>()?;
@@ -113,6 +122,11 @@ impl<'a> RuleRepository<'a> {
 
         let id = self.conn.last_insert_rowid();
 
+        self.conn.execute(
+            "INSERT INTO rule_inference_policy (rule_id, policy_id) VALUES (?1, ?2)",
+            params![id, rule.inference_policy],
+        )?;
+
         Ok(Rule {
             id,
             name: rule.name.clone(),
@@ -123,6 +137,7 @@ impl<'a> RuleRepository<'a> {
             priority: rule.priority,
             enabled: rule.enabled,
             parent_id: None,
+            inference_policy: rule.inference_policy.clone(),
         })
     }
 
@@ -143,6 +158,12 @@ impl<'a> RuleRepository<'a> {
             ],
         )?;
 
+        self.conn.execute(
+            "INSERT INTO rule_inference_policy (rule_id, policy_id, updated_at) VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(rule_id) DO UPDATE SET policy_id = excluded.policy_id, updated_at = datetime('now')",
+            params![id, rule.inference_policy],
+        )?;
+
         self.get_by_id(id)?
             .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
     }
@@ -155,8 +176,11 @@ impl<'a> RuleRepository<'a> {
 
     pub fn get_by_id(&self, id: i64) -> Result<Option<Rule>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, conditions, prompt, actions, priority, enabled, parent_id
-             FROM rules WHERE id = ?1",
+            "SELECT r.id, r.name, r.description, r.conditions, r.prompt, r.actions, r.priority, r.enabled, r.parent_id,
+                     COALESCE(p.policy_id, 'default')
+             FROM rules r
+             LEFT JOIN rule_inference_policy p ON p.rule_id = r.id
+             WHERE r.id = ?1",
         )?;
 
         let mut rules = stmt.query_map(params![id], |row| {
@@ -170,6 +194,7 @@ impl<'a> RuleRepository<'a> {
                 priority: row.get(6)?,
                 enabled: row.get::<_, i32>(7)? != 0,
                 parent_id: row.get(8)?,
+                inference_policy: row.get(9)?,
             })
         })?;
 
@@ -186,6 +211,7 @@ pub struct CreateRuleRequest {
     pub actions: Vec<crate::rules::models::Action>,
     pub priority: i32,
     pub enabled: bool,
+    pub inference_policy: String,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +223,7 @@ pub struct UpdateRuleRequest {
     pub actions: Vec<crate::rules::models::Action>,
     pub priority: i32,
     pub enabled: bool,
+    pub inference_policy: String,
 }
 
 #[cfg(test)]
@@ -227,6 +254,7 @@ mod tests {
             }],
             priority: 0,
             enabled: true,
+            inference_policy: "default".into(),
         };
 
         let db = Database::open(Path::new(":memory:")).unwrap();

@@ -9,6 +9,22 @@ export async function configSet(key: string, value: string) {
   return invoke("config_set", { key, value });
 }
 
+export interface LlmConfigUpdate {
+  base_url: string;
+  api_key: string;
+  default_model: string;
+  input_cost_per_million_usd: number;
+  output_cost_per_million_usd: number;
+  timeout_secs: number;
+  providers: unknown[];
+  routing_policies: unknown[];
+  default_policy: string;
+}
+
+export async function llmConfigSet(update: LlmConfigUpdate): Promise<void> {
+  return invoke("llm_config_set", { update });
+}
+
 export async function rulesList() {
   return invoke("rules_list");
 }
@@ -21,6 +37,7 @@ export async function rulesCreate(rule: {
   actions: unknown[];
   priority: number;
   enabled: boolean;
+  inference_policy: string;
 }) {
   return invoke("rules_create", { rule });
 }
@@ -35,6 +52,7 @@ export async function rulesUpdate(
     actions: unknown[];
     priority: number;
     enabled: boolean;
+    inference_policy: string;
   }
 ) {
   return invoke("rules_update", { id, rule });
@@ -56,6 +74,28 @@ export interface RuleMetrics {
 
 export async function ruleMetrics(): Promise<RuleMetrics[]> {
   return invoke("rules_metrics");
+}
+
+export interface RuleRoiMetrics {
+  rule_id: number;
+  llm_checks_24h: number;
+  llm_successes_24h: number;
+  prompt_tokens_24h: number;
+  completion_tokens_24h: number;
+  total_tokens_24h: number;
+  estimated_cost_24h_usd: number;
+  avg_duration_24h_ms: number;
+  llm_checks_7d: number;
+  llm_successes_7d: number;
+  prompt_tokens_7d: number;
+  completion_tokens_7d: number;
+  total_tokens_7d: number;
+  estimated_cost_7d_usd: number;
+  avg_duration_7d_ms: number;
+}
+
+export async function ruleRoiMetrics(): Promise<RuleRoiMetrics[]> {
+  return invoke("rule_roi_metrics");
 }
 
 export interface ChatMessage {
@@ -145,6 +185,7 @@ export async function rulesTest(
     actions: unknown[];
     priority: number;
     enabled: boolean;
+    inference_policy: string;
   },
   messageId: string
 ): Promise<TestResult> {
@@ -160,6 +201,7 @@ export async function rulesApply(
     actions: unknown[];
     priority: number;
     enabled: boolean;
+    inference_policy: string;
   },
   messageId: string
 ): Promise<ApplyResult> {
@@ -182,6 +224,7 @@ export async function bulkEvaluate(
     actions: unknown[];
     priority: number;
     enabled: boolean;
+    inference_policy: string;
   },
   messageIds: string[]
 ): Promise<BulkVerdict[]> {
@@ -197,6 +240,31 @@ export async function historyList(
 
 export async function historySearch(query: string) {
   return invoke("history_search", { query });
+}
+
+export interface InferenceJob {
+  id: number;
+  email_id: string;
+  rule_id: number | null;
+  source: string;
+  status: string;
+  attempt_count: number;
+  next_attempt_at: string;
+  lease_until: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function inferenceJobsList(
+  page: number,
+  perPage: number,
+): Promise<InferenceJob[]> {
+  return invoke("inference_jobs_list", { page, perPage });
+}
+
+export async function inferenceJobRetry(jobId: number): Promise<boolean> {
+  return invoke("inference_job_retry", { jobId });
 }
 
 export async function processingStatus() {
@@ -215,15 +283,30 @@ export async function processingBackfill(
   after: string,
   before: string,
   ruleIds: number[],
-) {
+): Promise<BackfillResult> {
   return invoke("processing_backfill", { after, before, ruleIds });
 }
 
+export async function processingBackfillStop(): Promise<boolean> {
+  return invoke("processing_backfill_stop");
+}
+
+export interface BackfillResult {
+  processed: number;
+  discovered: number;
+  stopped: boolean;
+}
+
 export interface OpProgress {
+  source: string;
   phase: string;
   processed: number;
   total: Option<number>;
   detail: string | null;
+  current_email_id: string | null;
+  current_email_from: string | null;
+  current_email_subject: string | null;
+  current_email_sent_at: string | null;
 }
 
 type Option<T> = T | null;
@@ -235,6 +318,10 @@ export function onCycleProgress(cb: (p: OpProgress) => void): Promise<UnlistenFn
 
 export function onBackfillProgress(cb: (p: OpProgress) => void): Promise<UnlistenFn> {
   return listen<OpProgress>("backfill-progress", (e) => cb(e.payload));
+}
+
+export function onSyncProgress(cb: (p: OpProgress) => void): Promise<UnlistenFn> {
+  return listen<OpProgress>("sync-progress", (e) => cb(e.payload));
 }
 
 export type UnlistenFn = () => void;
@@ -264,11 +351,14 @@ export interface HistoryEntry {
   email_id: string;
   email_from: string | null;
   email_subject: string | null;
+  email_sent_at: string | null;
   rule_id: number | null;
   rule_name: string | null;
   action: string;
   status: string;
   llm_model: string | null;
+  llm_provider: string | null;
+  policy_id: string | null;
   llm_response: string | null;
   error: string | null;
   duration_ms: number | null;
@@ -279,7 +369,15 @@ export async function historyByEmail(emailId: string): Promise<HistoryEntry[]> {
   return invoke("history_by_email", { emailId });
 }
 
-export async function gmailListLabels() {
+export interface GmailLabel {
+  id: string;
+  name: string;
+  type: string;
+  messageListVisibility?: string | null;
+  labelListVisibility?: string | null;
+}
+
+export async function gmailListLabels(): Promise<GmailLabel[]> {
   return invoke("gmail_list_labels");
 }
 
@@ -301,6 +399,10 @@ export async function llmTest(
   });
 }
 
+export async function llmProviderTest(providerId: string): Promise<LlmTestResult> {
+  return invoke("llm_provider_test", { providerId });
+}
+
 export async function llmListModels(
   baseUrl: string,
   apiKey: string,
@@ -311,6 +413,71 @@ export async function llmListModels(
   });
 }
 
+export async function llmProviderSetApiKey(
+  providerId: string,
+  apiKey: string,
+): Promise<void> {
+  return invoke("llm_provider_set_api_key", { providerId, apiKey });
+}
+
+export interface LlmProviderStatus {
+  provider_id: string;
+  rate_limited_until: string | null;
+  last_error: string | null;
+  updated_at: string;
+}
+
+export async function llmProviderStatusList(): Promise<LlmProviderStatus[]> {
+  return invoke("llm_provider_status_list");
+}
+
 export async function trayRefresh() {
   return invoke("tray_refresh");
+}
+
+export interface SyncState {
+  account_email: string;
+  last_history_id: string;
+  watch_expiration: string | null;
+  watch_status: string;
+  last_notification_at: string | null;
+  last_history_pull_at: string | null;
+  last_sync_error: string | null;
+  updated_at: string;
+}
+
+export interface SyncStatus {
+  enabled: boolean;
+  relay_enabled: boolean;
+  account_email: string | null;
+  state: SyncState | null;
+  pending_events: number;
+}
+
+export interface ReplayResult {
+  from_history_id: string;
+  to_history_id: string;
+  touched_messages: number;
+  processed_messages: number;
+}
+
+export interface WatchResponse {
+  history_id: string;
+  expiration: string;
+}
+
+export async function syncStatus(): Promise<SyncStatus> {
+  return invoke("sync_status");
+}
+
+export async function syncReplayNow(): Promise<ReplayResult> {
+  return invoke("sync_replay_now");
+}
+
+export async function syncWatchStart(): Promise<WatchResponse> {
+  return invoke("sync_watch_start");
+}
+
+export async function syncWatchStop(): Promise<void> {
+  return invoke("sync_watch_stop");
 }
