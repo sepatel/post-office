@@ -13,6 +13,9 @@ pub struct AppConfig {
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
     pub llm_timeout_secs: u64,
+    pub llm_legacy_quality_tier: String,
+    pub llm_legacy_privacy_status: String,
+    pub llm_legacy_enabled: bool,
     pub llm_input_cost_per_million_usd: f64,
     pub llm_output_cost_per_million_usd: f64,
     pub llm_providers: Vec<LlmProviderProfile>,
@@ -43,6 +46,9 @@ impl Default for AppConfig {
             llm_temperature: 0.3,
             llm_max_tokens: 1024,
             llm_timeout_secs: 30,
+            llm_legacy_quality_tier: "balanced".into(),
+            llm_legacy_privacy_status: "unknown".into(),
+            llm_legacy_enabled: true,
             llm_input_cost_per_million_usd: 0.0,
             llm_output_cost_per_million_usd: 0.0,
             llm_providers: vec![],
@@ -82,6 +88,9 @@ impl AppConfig {
             llm_temperature: get("llm.temperature", "0.3").parse().unwrap_or(0.3),
             llm_max_tokens: get("llm.max_tokens", "1024").parse().unwrap_or(1024),
             llm_timeout_secs: get("llm.timeout_secs", "30").parse().unwrap_or(30),
+            llm_legacy_quality_tier: get("llm.legacy_quality_tier", "balanced"),
+            llm_legacy_privacy_status: get("llm.legacy_privacy_status", "unknown"),
+            llm_legacy_enabled: get("llm.legacy_enabled", "true").parse().unwrap_or(true),
             llm_input_cost_per_million_usd: get("llm.input_cost_per_million_usd", "0")
                 .parse()
                 .unwrap_or(0.0),
@@ -121,6 +130,9 @@ impl AppConfig {
         set("llm.temperature", &self.llm_temperature.to_string())?;
         set("llm.max_tokens", &self.llm_max_tokens.to_string())?;
         set("llm.timeout_secs", &self.llm_timeout_secs.to_string())?;
+        set("llm.legacy_quality_tier", &self.llm_legacy_quality_tier)?;
+        set("llm.legacy_privacy_status", &self.llm_legacy_privacy_status)?;
+        set("llm.legacy_enabled", &self.llm_legacy_enabled.to_string())?;
         set(
             "llm.input_cost_per_million_usd",
             &self.llm_input_cost_per_million_usd.to_string(),
@@ -206,6 +218,9 @@ mod tests {
             }],
             llm_default_policy: "travel".into(),
             llm_timeout_secs: 45,
+            llm_legacy_quality_tier: "strong".into(),
+            llm_legacy_privacy_status: "local".into(),
+            llm_legacy_enabled: true,
             ..AppConfig::default()
         };
 
@@ -214,6 +229,8 @@ mod tests {
 
         assert_eq!(loaded.llm_default_policy, "travel");
         assert_eq!(loaded.llm_timeout_secs, 45);
+        assert_eq!(loaded.llm_legacy_quality_tier, "strong");
+        assert_eq!(loaded.llm_legacy_privacy_status, "local");
         assert_eq!(loaded.llm_providers[0].model, "example/cheap");
         assert_eq!(
             loaded.llm_routing_policies[0].candidate_provider_ids,

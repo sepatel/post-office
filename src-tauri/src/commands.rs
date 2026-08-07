@@ -259,6 +259,14 @@ pub async fn config_set(
                 .map_err(|e: std::num::ParseIntError| e.to_string())?;
             config.llm_timeout_secs = val;
         }
+        "llm.legacy_quality_tier" => config.llm_legacy_quality_tier = value,
+        "llm.legacy_privacy_status" => config.llm_legacy_privacy_status = value,
+        "llm.legacy_enabled" => {
+            let val: bool = value
+                .parse()
+                .map_err(|e: std::str::ParseBoolError| e.to_string())?;
+            config.llm_legacy_enabled = val;
+        }
         "llm.input_cost_per_million_usd" => {
             let val: f64 = value
                 .parse()
@@ -348,6 +356,9 @@ pub struct LlmConfigUpdate {
     pub input_cost_per_million_usd: f64,
     pub output_cost_per_million_usd: f64,
     pub timeout_secs: u64,
+    pub legacy_quality_tier: String,
+    pub legacy_privacy_status: String,
+    pub legacy_enabled: bool,
     pub providers: Vec<LlmProviderProfile>,
     pub routing_policies: Vec<LlmRoutingPolicy>,
     pub default_policy: String,
@@ -365,6 +376,9 @@ pub async fn llm_config_set(
     config.llm_input_cost_per_million_usd = update.input_cost_per_million_usd;
     config.llm_output_cost_per_million_usd = update.output_cost_per_million_usd;
     config.llm_timeout_secs = update.timeout_secs;
+    config.llm_legacy_quality_tier = update.legacy_quality_tier;
+    config.llm_legacy_privacy_status = update.legacy_privacy_status;
+    config.llm_legacy_enabled = update.legacy_enabled;
     config.llm_providers = update.providers;
     config.llm_routing_policies = update.routing_policies;
     config.llm_default_policy = update.default_policy;

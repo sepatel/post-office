@@ -41,6 +41,9 @@ export interface InferenceConfig {
   llm_input_cost_per_million_usd: number;
   llm_output_cost_per_million_usd: number;
   llm_timeout_secs: number;
+  llm_legacy_quality_tier: string;
+  llm_legacy_privacy_status: string;
+  llm_legacy_enabled: boolean;
   llm_providers: ProviderProfile[];
   llm_routing_policies: RoutingPolicy[];
   llm_default_policy: string;
@@ -267,6 +270,9 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
         input_cost_per_million_usd: legacy.input_cost_per_million_usd,
         output_cost_per_million_usd: legacy.output_cost_per_million_usd,
         timeout_secs: legacy.timeout_secs,
+        legacy_quality_tier: legacy.quality_tier,
+        legacy_privacy_status: legacy.privacy_status,
+        legacy_enabled: legacy.enabled,
         providers: persistedProviders,
         routing_policies: policies,
         default_policy: selectedPolicyId,
@@ -279,6 +285,9 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
         llm_input_cost_per_million_usd: legacy.input_cost_per_million_usd,
         llm_output_cost_per_million_usd: legacy.output_cost_per_million_usd,
         llm_timeout_secs: legacy.timeout_secs,
+        llm_legacy_quality_tier: legacy.quality_tier,
+        llm_legacy_privacy_status: legacy.privacy_status,
+        llm_legacy_enabled: legacy.enabled,
         llm_providers: persistedProviders,
         llm_routing_policies: policies,
         llm_default_policy: selectedPolicyId,
@@ -829,12 +838,12 @@ function withLegacyProvider(config: InferenceConfig): ProviderProfile[] {
       base_url: config.llm_base_url,
       model: config.llm_default_model,
       api_key_ref: "legacy",
-      quality_tier: "balanced",
-      privacy_status: "unknown",
+      quality_tier: config.llm_legacy_quality_tier,
+      privacy_status: config.llm_legacy_privacy_status,
       input_cost_per_million_usd: config.llm_input_cost_per_million_usd,
       output_cost_per_million_usd: config.llm_output_cost_per_million_usd,
       timeout_secs: config.llm_timeout_secs,
-      enabled: true,
+      enabled: config.llm_legacy_enabled,
     },
     ...config.llm_providers.filter((provider) => provider.id !== "legacy"),
   ];

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -199,11 +199,7 @@ impl InferenceRouter {
                 continue;
             };
 
-            let retries = if policy.allow_fallback {
-                MAX_RETRIES_PER_PROVIDER
-            } else {
-                1
-            };
+            let retries = attempts_per_candidate(&policy);
             for attempt in 0..retries {
                 match client.process(request.clone()).await {
                     Ok(response) => {
@@ -241,7 +237,11 @@ impl InferenceRouter {
             }
         }
 
-        Err(LlmError::Routing(failures.join("; ")))
+        Err(LlmError::Routing(format!(
+            "policy '{}' exhausted: {}",
+            policy.id,
+            failures.join("; ")
+        )))
     }
 
     pub async fn chat_json(
@@ -290,18 +290,42 @@ impl InferenceRouter {
     fn candidates(&self, policy: &LlmRoutingPolicy) -> (Vec<&ProviderClient>, Vec<String>) {
         let mut candidates = Vec::new();
         let mut unavailable = Vec::new();
+        let mut seen = HashSet::new();
         for provider_id in &policy.candidate_provider_ids {
+            if !seen.insert(provider_id) {
+                unavailable.push(format!("{}: listed more than once", provider_id));
+                continue;
+            }
             let Some(provider) = self.providers.get(provider_id) else {
                 unavailable.push(format!("{}: not configured", provider_id));
                 continue;
             };
-            if !provider.profile.enabled
-                || !quality_at_least(&provider.profile.quality_tier, &policy.minimum_quality)
-                || !privacy_allowed(
-                    &provider.profile.privacy_status,
-                    &policy.privacy_requirement,
-                )
-            {
+            let label = format!("{} ({})", provider.profile.id, provider.profile.model);
+            if !provider.profile.enabled {
+                unavailable.push(format!("{}: disabled", label));
+                continue;
+            }
+            if !quality_at_least(&provider.profile.quality_tier, &policy.minimum_quality) {
+                unavailable.push(format!(
+                    "{}: quality '{}' is below required '{}'",
+                    label, provider.profile.quality_tier, policy.minimum_quality
+                ));
+                continue;
+            }
+            if !privacy_allowed(
+                &provider.profile.privacy_status,
+                &policy.privacy_requirement,
+            ) {
+                unavailable.push(format!(
+                    "{}: privacy '{}' does not meet '{}'",
+                    label,
+                    provider.profile.privacy_status,
+                    privacy_requirement_name(&policy.privacy_requirement)
+                ));
+                continue;
+            }
+            if let Some(error) = &provider.init_error {
+                unavailable.push(format!("{}: unavailable ({})", label, error));
                 continue;
             }
             if let Some(until) = self.rate_limited_until(&provider.profile.id) {
@@ -361,12 +385,12 @@ fn legacy_profile(config: &crate::config::AppConfig) -> LlmProviderProfile {
         base_url: config.llm_base_url.clone(),
         model: config.llm_default_model.clone(),
         api_key_ref: "legacy".into(),
-        quality_tier: "balanced".into(),
-        privacy_status: "unknown".into(),
+        quality_tier: config.llm_legacy_quality_tier.clone(),
+        privacy_status: config.llm_legacy_privacy_status.clone(),
         input_cost_per_million_usd: config.llm_input_cost_per_million_usd,
         output_cost_per_million_usd: config.llm_output_cost_per_million_usd,
         timeout_secs: config.llm_timeout_secs,
-        enabled: true,
+        enabled: config.llm_legacy_enabled,
     }
 }
 
@@ -391,6 +415,23 @@ fn privacy_allowed(status: &str, requirement: &PrivacyRequirement) -> bool {
         }
         PrivacyRequirement::ZdrOnly => status == "verified_zdr" || status == "self_attested_zdr",
         PrivacyRequirement::LocalOnly => status == "local",
+    }
+}
+
+fn privacy_requirement_name(requirement: &PrivacyRequirement) -> &'static str {
+    match requirement {
+        PrivacyRequirement::Any => "any provider",
+        PrivacyRequirement::LocalOrZdr => "local or ZDR",
+        PrivacyRequirement::ZdrOnly => "ZDR only",
+        PrivacyRequirement::LocalOnly => "local only",
+    }
+}
+
+fn attempts_per_candidate(policy: &LlmRoutingPolicy) -> usize {
+    if policy.allow_fallback {
+        1
+    } else {
+        MAX_RETRIES_PER_PROVIDER
     }
 }
 
@@ -530,6 +571,65 @@ mod tests {
         assert!(quality_at_least("strong", "balanced"));
         assert!(quality_at_least("balanced", "cheap"));
         assert!(!quality_at_least("cheap", "strong"));
+    }
+
+    #[test]
+    fn fallback_policy_attempts_each_provider_once() {
+        let policy = LlmRoutingPolicy {
+            id: "fallback".into(),
+            name: "Fallback".into(),
+            candidate_provider_ids: vec!["first".into(), "second".into()],
+            minimum_quality: String::new(),
+            privacy_requirement: PrivacyRequirement::Any,
+            allow_fallback: true,
+        };
+
+        assert_eq!(attempts_per_candidate(&policy), 1);
+    }
+
+    #[test]
+    fn legacy_metadata_can_satisfy_local_strong_policy() {
+        let config = AppConfig {
+            llm_legacy_quality_tier: "strong".into(),
+            llm_legacy_privacy_status: "local".into(),
+            llm_routing_policies: vec![LlmRoutingPolicy {
+                id: "local".into(),
+                name: "Local".into(),
+                candidate_provider_ids: vec!["legacy".into()],
+                minimum_quality: "strong".into(),
+                privacy_requirement: PrivacyRequirement::LocalOnly,
+                allow_fallback: true,
+            }],
+            ..AppConfig::default()
+        };
+
+        let router = InferenceRouter::from_config(&config);
+        let policy = router.policy("local");
+        let (candidates, unavailable) = router.candidates(&policy);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(unavailable.is_empty());
+    }
+
+    #[test]
+    fn reports_privacy_filtered_provider() {
+        let config = AppConfig {
+            llm_routing_policies: vec![LlmRoutingPolicy {
+                id: "local".into(),
+                name: "Local".into(),
+                candidate_provider_ids: vec!["legacy".into()],
+                minimum_quality: String::new(),
+                privacy_requirement: PrivacyRequirement::LocalOnly,
+                allow_fallback: true,
+            }],
+            ..AppConfig::default()
+        };
+        let router = InferenceRouter::from_config(&config);
+        let policy = router.policy("local");
+        let (candidates, unavailable) = router.candidates(&policy);
+
+        assert!(candidates.is_empty());
+        assert!(unavailable[0].contains("does not meet 'local only'"));
     }
 
     #[test]

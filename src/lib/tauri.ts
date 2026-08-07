@@ -16,6 +16,9 @@ export interface LlmConfigUpdate {
   input_cost_per_million_usd: number;
   output_cost_per_million_usd: number;
   timeout_secs: number;
+  legacy_quality_tier: string;
+  legacy_privacy_status: string;
+  legacy_enabled: boolean;
   providers: unknown[];
   routing_policies: unknown[];
   default_policy: string;
