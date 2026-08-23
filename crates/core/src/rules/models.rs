@@ -7,12 +7,23 @@ pub struct Rule {
     pub description: Option<String>,
     pub conditions: Vec<Condition>,
     pub prompt: String,
+    /// The outcomes the model picks between. Empty asks a plain
+    /// match-or-not question instead.
+    #[serde(default)]
+    pub choices: Vec<Action>,
+    /// Offer every Gmail user label as a choice, ignoring `choices`.
+    #[serde(default)]
+    pub choose_from_all_labels: bool,
+    /// Runs on every match, whatever the model chose.
     pub actions: Vec<Action>,
     pub priority: i32,
     pub enabled: bool,
     pub parent_id: Option<i64>,
     #[serde(default = "default_inference_policy")]
     pub inference_policy: String,
+    /// Keep evaluating lower-priority rules after this one matches and acts.
+    #[serde(default)]
+    pub continue_after_match: bool,
 }
 
 fn default_inference_policy() -> String {
@@ -73,6 +84,9 @@ pub enum Operator {
 pub enum Action {
     #[serde(rename = "label")]
     Label { value: String },
+
+    #[serde(rename = "remove_label")]
+    RemoveLabel { value: String },
 
     #[serde(rename = "archive")]
     Archive,

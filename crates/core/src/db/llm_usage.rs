@@ -10,11 +10,12 @@ impl<'a> LlmUsageRepository<'a> {
         Self { conn }
     }
 
-    pub fn insert(&self, entry: &NewLlmUsageEntry) -> Result<i64> {
+    pub fn insert(&self, account_email: &str, entry: &NewLlmUsageEntry) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO llm_usage (history_id, email_id, rule_id, model, prompt_tokens, completion_tokens, total_tokens, duration_ms, estimated_cost_usd, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO llm_usage (account_email, history_id, email_id, rule_id, model, prompt_tokens, completion_tokens, total_tokens, duration_ms, estimated_cost_usd, source)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
+                account_email,
                 entry.history_id,
                 entry.email_id,
                 entry.rule_id,
@@ -31,7 +32,7 @@ impl<'a> LlmUsageRepository<'a> {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn rule_roi_metrics(&self) -> Result<Vec<RuleRoiMetrics>> {
+    pub fn rule_roi_metrics(&self, account_email: &str) -> Result<Vec<RuleRoiMetrics>> {
         let mut stmt = self.conn.prepare(
             "SELECT
                 u.rule_id,
@@ -51,13 +52,14 @@ impl<'a> LlmUsageRepository<'a> {
                 CAST(COALESCE(ROUND(AVG(u.duration_ms)), 0) AS INTEGER) AS avg_duration_7d_ms
              FROM llm_usage u
              LEFT JOIN history h ON h.id = u.history_id
-             WHERE u.source = 'cycle'
-               AND u.created_at >= datetime('now', '-7 days')
+              WHERE u.account_email = ?1
+                AND u.source = 'cycle'
+                AND u.created_at >= datetime('now', '-7 days')
              GROUP BY u.rule_id",
         )?;
 
         let entries = stmt
-            .query_map([], |row| {
+            .query_map(params![account_email], |row| {
                 Ok(RuleRoiMetrics {
                     rule_id: row.get(0)?,
                     llm_checks_24h: row.get(1)?,

@@ -15,10 +15,15 @@ pub struct Rule {
     pub description: Option<String>,
     pub conditions: Vec<Condition>,
     pub prompt: String,
+    /// The outcomes the model picks between; empty asks a plain match-or-not question.
+    pub choices: Vec<Action>,
+    pub choose_from_all_labels: bool,
+    /// Runs on every match, whatever the model chose.
     pub actions: Vec<Action>,
     pub priority: i32,
     pub enabled: bool,
     pub parent_id: Option<i64>,
+    pub continue_after_match: bool,
 }
 ```
 
@@ -87,6 +92,9 @@ Actions map directly to Gmail API label operations.
 pub enum Action {
     #[serde(rename = "label")]
     Label { value: String },
+
+    #[serde(rename = "remove_label")]
+    RemoveLabel { value: String },
 
     #[serde(rename = "archive")]
     Archive,
@@ -208,14 +216,39 @@ fn parse_email_date(email: &Message) -> Option<NaiveDate> {
 
 ## Rule Evaluation Flow
 
-Rules run in first-match-wins order (lowest `priority` value). For the matched
-rule, execution depends on whether a prompt exists:
+Rules run in priority order. Deterministic conditions are a cheap pre-filter.
 
-- No prompt: execute `rule.actions` directly (deterministic, no LLM call)
-- Prompt present: parse first token from LLM response and resolve hybridly:
-  - `APPLY` => execute `rule.actions`
-  - `SKIP` or invalid => no action
-  - explicit token (`ARCHIVE`, `TRASH`, `SPAM`, `MARK_READ`, `MARK_UNREAD`, `STAR`, `LABEL: <name>`) => execute token directly
+- No prompt and no menu: the action recipe runs and claims the email, with no
+  inference at all.
+- Otherwise the model answers with a choice or `NO_MATCH`. `NO_MATCH` continues
+  to the next rule; a choice claims the email and runs both the chosen action and
+  the rule's recipe.
+- A choice may be a label or an action, so one rule can say "file it under A, B,
+  or bin it". The model picks by name and cannot create labels or invent
+  operations outside the menu.
+- Recoverable deviations (an unknown name, a selection with no menu, a bare
+  action token) resolve and carry a non-fatal note.
+- A reply that carries no readable decision for an email queues that email for a
+  per-email re-ask and does not fall through in the meantime.
+
+A match claims the email and stops evaluation. `continue_after_match` opts a rule
+out of that: its actions run and the email still passes to lower-priority rules,
+which is how a classifier can add a label and let a later rule archive it. An
+unreadable reply never continues, opt-in or not: the queued re-ask owns the email
+from there, and running lower rules first would race it.
+
+Continuation does not re-fetch the message, so a later rule's label conditions do
+not see labels applied earlier in the same pass; they take effect on the next run.
+
+`engine::rules_after` is the single definition of "the next rule": everything
+after the declining rule in priority order that is enabled and passes its own
+deterministic conditions. The live pipeline, the retry queue, and the rule tester
+all walk it, so the tester cannot disagree with production.
+
+A chain that ends without any rule claiming the email records a single
+`FALLTHROUGH_EXHAUSTED` history row. Condition-filtered rules are otherwise
+invisible, which makes "fallthrough found nothing" indistinguishable from
+"fallthrough never ran".
 
 ```rust
 // crates/core/src/rules/engine.rs (simplified)
@@ -226,7 +259,19 @@ pub(crate) fn resolve_effective_actions(
     match parsed {
         None => vec![],
         Some(ParsedAction::Apply) => rule.actions.iter().map(ParsedAction::from).collect(),
-        Some(action) => vec![action],
+        // Destructive tokens run alone so they cannot drag configured labels along.
+        Some(ParsedAction::Trash) => vec![ParsedAction::Trash],
+        Some(ParsedAction::Spam) => vec![ParsedAction::Spam],
+        Some(action) => {
+            let mut actions = vec![action];
+            actions.extend(
+                rule.actions
+                    .iter()
+                    .map(ParsedAction::from)
+                    .filter(|configured| !actions.contains(configured)),
+            );
+            actions
+        }
     }
 }
 ```
@@ -247,10 +292,8 @@ pub async fn execute_action(
     existing_labels: &[Label],
 ) -> Result<(), RuleError> {
     let (add, remove) = match action {
-        ParsedAction::Label(name) => {
-            let label = get_or_create_label(gmail, name, existing_labels).await?;
-            (vec![label.id], vec![])
-        }
+        ParsedAction::Label(value) => (vec![resolve_existing_label_id(value, existing_labels)?], vec![]),
+        ParsedAction::RemoveLabel(value) => (vec![], vec![resolve_existing_label_id(value, existing_labels)?]),
         ParsedAction::Archive => (vec![], vec!["INBOX".into()]),
         ParsedAction::Trash => (vec!["TRASH".into()], vec!["INBOX".into()]),
         ParsedAction::Spam => (vec!["SPAM".into()], vec!["INBOX".into()]),
@@ -271,24 +314,30 @@ pub async fn execute_action(
     Ok(())
 }
 
-async fn get_or_create_label(
-    gmail: &mut GmailClient,
-    name: &str,
+/// Labels are never created automatically: a rule may only act on labels the
+/// user already has, so an unresolvable reference is an error.
+fn resolve_existing_label_id(
+    value: &str,
     existing_labels: &[Label],
-) -> Result<crate::gmail::models::Label, RuleError> {
-    if let Some(existing) = existing_labels.iter().find(|l| l.name == name) {
-        return Ok(existing.clone());
-    }
-
-    gmail.create_label(name).await
+) -> Result<String, RuleError> {
+    find_label(value, existing_labels)
+        .map(|label| label.id.clone())
+        .ok_or_else(|| unknown_label(value))
 }
 ```
 
+`existing_labels` comes from the per-account label cache, so a label added in
+Gmail resolves once that cache refreshes.
+
 ## Rule Priority and Evaluation
 
-### First-Match Mode (Only Mode)
+### Priority And Fallthrough
 
-Rules are evaluated by priority (lower number = higher priority). The first matching rule wins. This is the only evaluation mode — simpler, more predictable, and cheaper (fewer LLM calls).
+Rules are evaluated by priority (lower number = higher priority). The first
+deterministic or LLM-confirmed match wins. A decision rule that returns
+`NO_MATCH` is deliberately not a match, so lower-priority rules can inspect the
+same email. This costs additional LLM calls only when broad rules decline an
+email, so deterministic conditions should remain selective.
 
 ```rust
 let matching_rule = rules.iter()
@@ -324,7 +373,7 @@ The Gmail query used to fetch emails is configurable. Stored in the config table
 | Specific label | `label:Newsletters is:unread` |
 | Exclude categories | `in:inbox -category:promotions -category:social is:unread` |
 
-The polling service fetches emails matching the query, then evaluates rules against each one. If a rule matches and has no prompt, configured actions run directly. If it has a prompt, the LLM token is resolved with hybrid semantics (`APPLY` runs configured actions, explicit tokens override per email, `SKIP`/invalid does nothing). If no rule matches, the email is skipped.
+The polling service fetches emails matching the query, then evaluates rules against each one. A rule with no prompt and no menu runs its actions directly. Otherwise the model answers with a choice or `NO_MATCH`, and a match runs the chosen action plus the rule's recipe. If no rule matches, the email is skipped.
 
 ## Example Rules
 
@@ -349,25 +398,10 @@ The polling service fetches emails matching the query, then evaluates rules agai
 }
 ```
 
-The LLM will see:
-```
---- Email Headers ---
-From: newsletter@example.com
-Subject: Weekly Update
+No menu, so the model answers `MATCH` or `NO_MATCH`; a match labels and
+archives.
 
---- Email Body ---
-This week's top stories...
-
---- Rule Instruction ---
-This is a newsletter email.
-
---- Response Format ---
-Respond with EXACTLY two lines:
-1) Action token: ARCHIVE, TRASH, SPAM, MARK_READ, MARK_UNREAD, STAR, APPLY, SKIP, or LABEL: <name>
-2) One-sentence imperative explanation
-```
-
-Expected LLM response token: `APPLY`
+Expected LLM response: `1: MATCH | Weekly newsletter digest.`
 
 ### Rule 2: Invoice Detection
 
@@ -383,7 +417,8 @@ Expected LLM response token: `APPLY`
       ]
     }
   ],
-  "prompt": "Does this email contain an invoice or payment request? If yes, respond with LABEL: Invoices. If no, respond with SKIP.",
+  "prompt": "Does this email contain an invoice or payment request?",
+  "choices": [{ "type": "label", "value": "Invoices" }],
   "actions": [],
   "priority": 20
 }
@@ -397,7 +432,7 @@ Expected LLM response token: `APPLY`
   "conditions": [
     { "type": "from", "operator": "equals", "value": "boss@company.com" }
   ],
-  "prompt": "This is from my boss. Respond with STAR.",
+  "prompt": "This is from my boss.",
   "actions": [
     { "type": "star" }
   ],
@@ -419,7 +454,8 @@ Expected LLM response token: `APPLY`
       ]
     }
   ],
-  "prompt": "Does this look like spam or a scam? If yes, respond with SPAM. If unsure, respond with SKIP.",
+  "prompt": "Does this look like spam or a scam? Answer NO_MATCH if unsure.",
+  "choices": [{ "type": "spam" }],
   "actions": [],
   "priority": 50
 }

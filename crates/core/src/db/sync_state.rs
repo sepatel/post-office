@@ -133,7 +133,7 @@ impl<'a> SyncStateRepository<'a> {
         self.conn.execute(
             "INSERT INTO gmail_pending_events(account_email, event_key, min_history_id, status)
              VALUES (?1, ?2, ?3, 'pending')
-             ON CONFLICT(event_key) DO UPDATE SET
+              ON CONFLICT(account_email, event_key) DO UPDATE SET
                 min_history_id = CASE
                     WHEN CAST(excluded.min_history_id AS INTEGER) < CAST(gmail_pending_events.min_history_id AS INTEGER)
                         THEN excluded.min_history_id
@@ -168,10 +168,15 @@ impl<'a> SyncStateRepository<'a> {
         rows.collect::<Result<Vec<_>>>()
     }
 
-    pub fn mark_event_status(&self, event_key: &str, status: &str) -> Result<()> {
+    pub fn mark_event_status(
+        &self,
+        account_email: &str,
+        event_key: &str,
+        status: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE gmail_pending_events SET status = ?2 WHERE event_key = ?1",
-            params![event_key, status],
+            "UPDATE gmail_pending_events SET status = ?3 WHERE account_email = ?1 AND event_key = ?2",
+            params![account_email, event_key, status],
         )?;
         Ok(())
     }

@@ -236,142 +236,130 @@ fn html_to_text(html: &str) -> String {
 
 ## Response Parsing
 
-The classifier path enforces a strict token contract. The first non-empty token line drives actions; malformed or `SKIP` responses produce no action.
+One email is a batch of one, so there is a single response contract, a single
+prompt builder, and a single parser. Each email gets one line:
+
+```text
+1: "Invoices" | Billing statement from the bank.
+2: NO_MATCH | Unrelated tech news.
+```
+
+The answer is a choice from the rule's menu, or `NO_MATCH`, which advances to
+the next rule. With no menu the only choices are `MATCH` and `NO_MATCH`.
+
+### Ordering, Not Numbering
+
+The leading number is an alignment aid for the model; the parser strips any
+leading marker without caring what it was (`3:`, a copied `N:`, a bullet) and
+correlates rows to emails **by order**. Numbering the rows and then trusting
+those numbers is what lets a miscounting model apply one email's decision to
+another; order cannot misassign.
+
+The cost is that a reply carrying the wrong number of decisions is refused
+whole. Those emails are queued for a per-email re-ask, where correlation is not
+a question at all. That is cheaper than it looks — it only happens when the
+model breaks the contract — and it is the only alternative that neither guesses
+nor drops the email, since the resume floor moves past an email exactly once.
+
+Example lines carry real digits rather than a placeholder letter: a placeholder
+is indistinguishable from literal text, so models copy it through verbatim.
+
+### Leniency
+
+Parsing is lenient wherever the meaning is unambiguous, because refusing a row
+costs a re-ask:
+
+- A name outside the menu is dropped and reported as a non-fatal note.
+- A selection made against an empty menu is vacuous and ignored.
+- A bare action token with no menu counts as a match; the token is discarded so
+  the rule's own actions decide the effect.
+- `MATCH | CHOOSE: x`, `MATCH | LABELS: x`, and a bare `x` all read the same,
+  as does the same content spread over several lines.
+
+A line that opens with prose rather than a choice is not an answer, so a
+preamble or trailing summary is skipped rather than miscounted.
+
+### Choices
+
+A rule's menu is `choices`, a list of actions the model picks between; `actions`
+is the recipe that runs on any match. Because a choice is an action, a label and
+"move to trash" are the same kind of thing to the model, so "file it under A, B,
+or bin it" is one rule rather than two modes.
+
+| Menu | On match |
+| --- | --- |
+| empty | a plain match-or-not question; `actions` run |
+| `choices` | the chosen action runs, plus `actions` |
+| `choose_from_all_labels` | every Gmail user label is offered; the chosen label is added to `actions` |
+
+Choices are always referenced by name; a positional index is only meaningful
+within the request that produced it, so resolving a stray number would silently
+pick whatever choice sat at that offset. `choose_from_all_labels` sends every
+label name with every email, so it costs prompt budget proportional to the
+mailbox.
+
+### Label Cache
+
+Labels are cached per account in `gmail_labels` (id, name, type as a JSON blob
+plus `fetched_at`) and refreshed on read once older than the staleness window.
+The app never creates labels, so nothing invalidates the cache out of band.
+
+A failed refresh degrades to the stale copy rather than an empty list: an empty
+catalog silently strips label actions and makes execution fail with "unknown
+label". Only a failure with nothing cached at all surfaces as an error.
+
+### Context Budgeting
+
+Each provider profile records its context window. Rules reserve completion
+tokens and size a routing policy against its smallest eligible provider. Batch
+packing is adaptive rather than a fixed message count. When a single email body
+exceeds the remaining budget, the prompt keeps headers plus the beginning and
+end of the body and marks the omitted middle.
 
 ### Prompt Template
 
-The user prompt is constructed as:
+The contract and the menu live in the system prompt, which is built per rule.
+The payload carries only what varies per request:
 
 ```text
---- Email Headers ---
-From: sender@example.com
-To: recipient@example.com
-Subject: Check in
-
---- Email Body ---
-Hey, just wanted to check in about...
-
---- Rule Instruction ---
+RULE INSTRUCTION:
 {user's rule prompt}
 
-Respond with EXACTLY two lines:
-1) Token only: ARCHIVE, TRASH, SPAM, MARK_READ, MARK_UNREAD, STAR, APPLY, SKIP, or LABEL: <name>
-2) One-sentence imperative explanation
+--- Learned Memory ---
+{exceptions and notes}
+
+EMAILS:
+--- EMAIL 1 ---
+From: sender@example.com
+Subject: Check in
+
+Hey, just wanted to check in about...
+
+Answer with 1 decision lines.
 ```
 
-Batch mode uses one line per email: `N: <TOKEN>`.
+Batching only changes how many emails ride along; the contract is the same one
+line per email either way.
 
 ### Parser
 
-```rust
-// crates/core/src/rules/response_parser.rs
+`rules::engine::parse_row` reads one line into a decision; `rules::evaluation`
+assembles rows into a batch. Both are small enough to read directly, and the
+copies of them that used to live here went stale, so they are not reproduced.
 
-use std::str::FromStr;
+The shape: strip the leading marker, split on `|` and newlines, take the decline
+keyword off the head if present, otherwise resolve the selection against the
+menu by name.
 
-/// Parse a strict-format LLM response into a single action.
-/// Returns None if the response doesn't match the expected format (skip the email).
-pub fn parse_llm_response(response: &str) -> Option<ParsedAction> {
-    let line = response.trim();
+### Why This Format
 
-    // Handle multi-line responses: take the first non-empty line
-    let first_line = line.lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())?;
-
-    ParsedAction::from_str(first_line).ok()
-}
-
-/// A single action parsed from the LLM response.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ParsedAction {
-    Archive,
-    Trash,
-    Spam,
-    MarkRead,
-    MarkUnread,
-    Star,
-    Apply,
-    Label(String),
-}
-
-impl FromStr for ParsedAction {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
-
-        if s.eq_ignore_ascii_case("ARCHIVE") {
-            return Ok(ParsedAction::Archive);
-        }
-        if s.eq_ignore_ascii_case("TRASH") {
-            return Ok(ParsedAction::Trash);
-        }
-        if s.eq_ignore_ascii_case("SPAM") {
-            return Ok(ParsedAction::Spam);
-        }
-        if s.eq_ignore_ascii_case("MARK_READ") {
-            return Ok(ParsedAction::MarkRead);
-        }
-        if s.eq_ignore_ascii_case("MARK_UNREAD") {
-            return Ok(ParsedAction::MarkUnread);
-        }
-        if s.eq_ignore_ascii_case("STAR") {
-            return Ok(ParsedAction::Star);
-        }
-        if s.eq_ignore_ascii_case("APPLY") {
-            return Ok(ParsedAction::Apply);
-        }
-        if s.eq_ignore_ascii_case("SKIP") {
-            return Err(ParseError::Skip);
-        }
-
-        // LABEL: <name>
-        s.strip_prefix("LABEL:")
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(|name| ParsedAction::Label(name.to_string()))
-            .ok_or(ParseError::InvalidFormat)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ParseError {
-    #[error("LLM response does not match expected format")]
-    InvalidFormat,
-
-    #[error("LLM responded with SKIP")]
-    Skip,
-}
-```
-
-### Hybrid Execution Contract
-
-When a rule has both a prompt and configured structured actions, token execution is hybrid:
-
-- `APPLY` => run configured `rule.actions`
-- `SKIP` or invalid token => no action
-- explicit token (`ARCHIVE`, `TRASH`, `SPAM`, `MARK_READ`, `MARK_UNREAD`, `STAR`, `LABEL: <name>`) => execute that token directly
-
-```rust
-// crates/core/src/rules/engine.rs
-pub(crate) fn resolve_effective_actions(
-    rule: &Rule,
-    parsed: Option<ParsedAction>,
-) -> Vec<ParsedAction> {
-    match parsed {
-        None => vec![],
-        Some(ParsedAction::Apply) => rule.actions.iter().map(ParsedAction::from).collect(),
-        Some(action) => vec![action],
-    }
-}
-```
-
-### Why Strict Format
-
-- **Cost efficiency**: No retry loops, no wasted tokens on malformed responses
-- **Predictability**: Every response is either valid or skipped, no ambiguity
-- **Debugging**: When an email is skipped, the full LLM response is logged for review
-- **Simplicity**: The parser is ~30 lines of code with no regex, no keyword heuristics
+- **Cost efficiency**: one call per batch, and a re-ask only when the model
+  breaks the contract
+- **Predictability**: a row is a decision or it is not; nothing is inferred from
+  a number the model wrote
+- **Debugging**: the row that produced a decision is stored on the history entry
+- **Simplicity**: one contract, one prompt, one parser, whether the batch holds
+  one email or ten
 
 ## Configuration
 

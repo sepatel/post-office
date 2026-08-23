@@ -1,0 +1,2 @@
+-- This migration is implemented by migrate_multi_account_schema in db/mod.rs.
+-- It inspects and resumes partially applied schemas from early 0.2.0 builds.

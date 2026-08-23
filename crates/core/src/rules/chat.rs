@@ -22,6 +22,8 @@ pub struct ChatProposal {
     pub prompt: Option<String>,
     #[serde(default, deserialize_with = "deserialize_lossy_actions")]
     pub actions_add: Vec<Action>,
+    #[serde(default, deserialize_with = "deserialize_lossy_actions")]
+    pub choices_add: Vec<Action>,
     #[serde(default, deserialize_with = "deserialize_lossy_conditions")]
     pub conditions_add: Vec<Condition>,
     #[serde(default, deserialize_with = "deserialize_lossy_memories")]
@@ -58,11 +60,12 @@ pub enum ChatError {
 pub async fn chat_with_rule(
     db: &Database,
     llm: &InferenceRouter,
+    account_email: &str,
     rule_id: i64,
     message: &str,
 ) -> Result<ChatTurn, ChatError> {
     let rule = db
-        .with_rules(|repo| repo.get_by_id(rule_id))?
+        .with_rules(|repo| repo.get_by_id(account_email, rule_id))?
         .ok_or(ChatError::RuleNotFound)?;
 
     let memories = db.with_rule_memory(|repo| repo.list_for_rule(rule_id))?;
@@ -91,9 +94,14 @@ pub async fn chat_with_rule(
 /// conditions into the rule. Safe to call only after the user accepts.
 pub async fn apply_proposal(
     db: &Database,
+    account_email: &str,
     rule_id: i64,
     proposal: &ChatProposal,
 ) -> Result<(), ChatError> {
+    let mut rule = db
+        .with_rules(|repo| repo.get_by_id(account_email, rule_id))?
+        .ok_or(ChatError::RuleNotFound)?;
+
     db.with_rule_memory(|repo| {
         for m in &proposal.memories_add {
             repo.insert(rule_id, &m.kind, &m.text, "chat")?;
@@ -103,17 +111,15 @@ pub async fn apply_proposal(
 
     let mutates_rule = proposal.prompt.is_some()
         || !proposal.actions_add.is_empty()
+        || !proposal.choices_add.is_empty()
         || !proposal.conditions_add.is_empty();
 
     if mutates_rule {
-        let mut rule = db
-            .with_rules(|repo| repo.get_by_id(rule_id))?
-            .ok_or(ChatError::RuleNotFound)?;
-
         if let Some(prompt) = &proposal.prompt {
             rule.prompt = prompt.clone();
         }
         rule.actions.extend(proposal.actions_add.clone());
+        rule.choices.extend(proposal.choices_add.clone());
         rule.conditions.extend(proposal.conditions_add.clone());
 
         let update = UpdateRuleRequest {
@@ -121,19 +127,28 @@ pub async fn apply_proposal(
             description: rule.description,
             conditions: rule.conditions,
             prompt: rule.prompt,
+            choices: rule.choices,
+            choose_from_all_labels: rule.choose_from_all_labels,
             actions: rule.actions,
             priority: rule.priority,
             enabled: rule.enabled,
             inference_policy: rule.inference_policy,
+            continue_after_match: rule.continue_after_match,
         };
-        db.with_rules(|repo| repo.update(rule.id, &update))?;
+        db.with_rules(|repo| repo.update(account_email, rule.id, &update))?;
     }
 
     Ok(())
 }
 
 /// Recent transcript for a rule (for rendering the chat UI).
-pub fn chat_history(db: &Database, rule_id: i64) -> Result<Vec<ChatMessageRow>, ChatError> {
+pub fn chat_history(
+    db: &Database,
+    account_email: &str,
+    rule_id: i64,
+) -> Result<Vec<ChatMessageRow>, ChatError> {
+    db.with_rules(|repo| repo.get_by_id(account_email, rule_id))?
+        .ok_or(ChatError::RuleNotFound)?;
     Ok(db.with_rule_chat(|repo| repo.list(rule_id))?)
 }
 
@@ -143,12 +158,19 @@ fn build_chat_user_prompt(
     history: &[ChatMessageRow],
     message: &str,
 ) -> String {
-    let actions = rule
-        .actions
-        .iter()
-        .map(|a| serde_json::to_string(a).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let render = |items: &[Action]| {
+        items
+            .iter()
+            .map(|action| serde_json::to_string(action).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let actions = render(&rule.actions);
+    let choices = if rule.choose_from_all_labels {
+        "(every Gmail user label)".to_string()
+    } else {
+        render(&rule.choices)
+    };
 
     let conditions = rule
         .conditions
@@ -181,13 +203,14 @@ fn build_chat_user_prompt(
         "CURRENT RULE STATE:\n\
          name: {}\n\
          prompt: {}\n\
-         actions:\n{}\n\
+         choices the model picks from:\n{}\n\
+         actions that run on any match:\n{}\n\
          conditions:\n{}\n\
          learned memory:\n{}\n\n\
          RECENT CHAT:\n{}\n\n\
          USER MESSAGE:\n{}\n\n\
          Respond with the JSON proposal described in your instructions.",
-        rule.name, rule.prompt, actions, conditions, memory_block, history_block, message,
+        rule.name, rule.prompt, choices, actions, conditions, memory_block, history_block, message,
     )
 }
 

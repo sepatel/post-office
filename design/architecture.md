@@ -79,15 +79,15 @@ See `design/gmail-push-sync.md` for protocol and rollout details.
    │
    ├── 5c. If rule matched:
    │       │
-   │       ├── If rule.prompt is empty:
+   │       ├── If rule.prompt is empty and the rule offers no choices:
    │       │     → Resolve configured structured actions locally (no LLM call)
    │       │
-   │       ├── Else LlmClient::process(rule.prompt + email_content)
-   │       │   → Parse first non-empty token line (APPLY, SKIP, explicit action)
-   │       │   → Hybrid resolution:
-   │       │       APPLY => run configured structured actions
-   │       │       SKIP / invalid => no action
-   │       │       ARCHIVE/TRASH/SPAM/MARK_READ/MARK_UNREAD/STAR/LABEL:<name> => execute token directly
+   │       ├── Else LlmClient::process(rule.prompt + choices + email_content)
+   │       │   → One decision line per email, correlated by order
+   │       │       <choice> => run that action plus the rule's actions
+   │       │       MATCH (no menu) => run the rule's actions
+   │       │       NO_MATCH => fall through to the next rule
+   │       │       unreadable => queue a per-email re-ask
    │       │
    │       └── GmailClient::modify_labels(email_id, add, remove)
    │           → Execute resolved Gmail label mutations

@@ -1,6 +1,29 @@
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, Result, Row, ToSql};
 
 use crate::rules::models::Rule;
+
+const RULE_COLUMNS: &str = "r.id, r.name, r.description, r.conditions, r.prompt, r.choices, r.choose_from_all_labels,
+     r.actions, r.priority, r.enabled, r.parent_id, COALESCE(p.policy_id, 'default'), r.continue_after_match";
+
+const RULE_FROM: &str = "FROM rules r LEFT JOIN rule_inference_policy p ON p.rule_id = r.id";
+
+fn map_rule_row(row: &Row<'_>) -> Result<Rule> {
+    Ok(Rule {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        conditions: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+        prompt: row.get(4)?,
+        choices: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+        choose_from_all_labels: row.get::<_, i32>(6)? != 0,
+        actions: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+        priority: row.get(8)?,
+        enabled: row.get::<_, i32>(9)? != 0,
+        parent_id: row.get(10)?,
+        inference_policy: row.get(11)?,
+        continue_after_match: row.get::<_, i32>(12)? != 0,
+    })
+}
 
 pub struct RuleRepository<'a> {
     conn: &'a Connection,
@@ -11,112 +34,70 @@ impl<'a> RuleRepository<'a> {
         Self { conn }
     }
 
-    pub fn list_all(&self) -> Result<Vec<Rule>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.name, r.description, r.conditions, r.prompt, r.actions, r.priority, r.enabled, r.parent_id,
-                     COALESCE(p.policy_id, 'default')
-             FROM rules r
-             LEFT JOIN rule_inference_policy p ON p.rule_id = r.id
-             ORDER BY priority ASC",
-        )?;
+    pub fn list_all(&self, account_email: &str) -> Result<Vec<Rule>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RULE_COLUMNS} {RULE_FROM}
+             WHERE r.account_email = ?1
+             ORDER BY priority ASC"
+        ))?;
 
         let rules = stmt
-            .query_map([], |row| {
-                Ok(Rule {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    conditions: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                    prompt: row.get(4)?,
-                    actions: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                    priority: row.get(6)?,
-                    enabled: row.get::<_, i32>(7)? != 0,
-                    parent_id: row.get(8)?,
-                    inference_policy: row.get(9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(rules)
+            .query_map(params![account_email], map_rule_row)?
+            .collect();
+        rules
     }
 
-    pub fn get_enabled_rules(&self) -> Result<Vec<Rule>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.name, r.description, r.conditions, r.prompt, r.actions, r.priority, r.enabled, r.parent_id,
-                     COALESCE(p.policy_id, 'default')
-             FROM rules r
-             LEFT JOIN rule_inference_policy p ON p.rule_id = r.id
-             WHERE r.enabled = 1
-             ORDER BY priority ASC",
-        )?;
+    pub fn get_enabled_rules(&self, account_email: &str) -> Result<Vec<Rule>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RULE_COLUMNS} {RULE_FROM}
+             WHERE r.account_email = ?1 AND r.enabled = 1
+             ORDER BY priority ASC"
+        ))?;
 
         let rules = stmt
-            .query_map([], |row| {
-                Ok(Rule {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    conditions: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                    prompt: row.get(4)?,
-                    actions: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                    priority: row.get(6)?,
-                    enabled: row.get::<_, i32>(7)? != 0,
-                    parent_id: row.get(8)?,
-                    inference_policy: row.get(9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(rules)
+            .query_map(params![account_email], map_rule_row)?
+            .collect();
+        rules
     }
 
     /// Load only the rules whose ids are in `ids`, preserving the requested
     /// order. Used by one-off backfills that apply a selected subset of rules.
-    pub fn get_by_ids(&self, ids: &[i64]) -> Result<Vec<Rule>> {
+    pub fn get_by_ids(&self, account_email: &str, ids: &[i64]) -> Result<Vec<Rule>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT r.id, r.name, r.description, r.conditions, r.prompt, r.actions, r.priority, r.enabled, r.parent_id,
-                     COALESCE(p.policy_id, 'default')
-             FROM rules r
-             LEFT JOIN rule_inference_policy p ON p.rule_id = r.id
-             WHERE r.id IN ({placeholders})
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RULE_COLUMNS} {RULE_FROM}
+             WHERE r.account_email = ?1 AND r.id IN ({placeholders})
              ORDER BY r.priority ASC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mapped = stmt.query_map(rusqlite::params_from_iter(ids.iter().copied()), |row| {
-            Ok(Rule {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                conditions: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                prompt: row.get(4)?,
-                actions: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                priority: row.get(6)?,
-                enabled: row.get::<_, i32>(7)? != 0,
-                parent_id: row.get(8)?,
-                inference_policy: row.get(9)?,
-            })
-        })?;
-        let rules = mapped.collect::<Result<Vec<_>>>()?;
-
-        Ok(rules)
+        ))?;
+        let mut values: Vec<&dyn ToSql> = Vec::with_capacity(ids.len() + 1);
+        values.push(&account_email);
+        for id in ids {
+            values.push(id);
+        }
+        let rules = stmt.query_map(&*values, map_rule_row)?.collect();
+        rules
     }
 
-    pub fn create(&self, rule: &CreateRuleRequest) -> Result<Rule> {
+    pub fn create(&self, account_email: &str, rule: &CreateRuleRequest) -> Result<Rule> {
         self.conn.execute(
-            "INSERT INTO rules (name, description, conditions, prompt, actions, priority, enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO rules (account_email, name, description, conditions, prompt, choices,
+                                choose_from_all_labels, actions, priority, enabled, continue_after_match)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
+                account_email,
                 rule.name,
                 rule.description,
                 serde_json::to_string(&rule.conditions).unwrap_or_default(),
                 rule.prompt,
+                serde_json::to_string(&rule.choices).unwrap_or_default(),
+                rule.choose_from_all_labels as i32,
                 serde_json::to_string(&rule.actions).unwrap_or_default(),
                 rule.priority,
                 rule.enabled as i32,
+                rule.continue_after_match as i32,
             ],
         )?;
 
@@ -133,28 +114,36 @@ impl<'a> RuleRepository<'a> {
             description: rule.description.clone(),
             conditions: rule.conditions.clone(),
             prompt: rule.prompt.clone(),
+            choices: rule.choices.clone(),
+            choose_from_all_labels: rule.choose_from_all_labels,
             actions: rule.actions.clone(),
             priority: rule.priority,
             enabled: rule.enabled,
             parent_id: None,
             inference_policy: rule.inference_policy.clone(),
+            continue_after_match: rule.continue_after_match,
         })
     }
 
-    pub fn update(&self, id: i64, rule: &UpdateRuleRequest) -> Result<Rule> {
+    pub fn update(&self, account_email: &str, id: i64, rule: &UpdateRuleRequest) -> Result<Rule> {
         self.conn.execute(
             "UPDATE rules SET name = ?1, description = ?2, conditions = ?3, prompt = ?4,
-             actions = ?5, priority = ?6, enabled = ?7, updated_at = datetime('now')
-             WHERE id = ?8",
+             choices = ?5, choose_from_all_labels = ?6, actions = ?7, priority = ?8, enabled = ?9,
+             continue_after_match = ?10, updated_at = datetime('now')
+             WHERE id = ?11 AND account_email = ?12",
             params![
                 rule.name,
                 rule.description,
                 serde_json::to_string(&rule.conditions).unwrap_or_default(),
                 rule.prompt,
+                serde_json::to_string(&rule.choices).unwrap_or_default(),
+                rule.choose_from_all_labels as i32,
                 serde_json::to_string(&rule.actions).unwrap_or_default(),
                 rule.priority,
                 rule.enabled as i32,
+                rule.continue_after_match as i32,
                 id,
+                account_email,
             ],
         )?;
 
@@ -164,41 +153,29 @@ impl<'a> RuleRepository<'a> {
             params![id, rule.inference_policy],
         )?;
 
-        self.get_by_id(id)?
+        self.get_by_id(account_email, id)?
             .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
     }
 
-    pub fn delete(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM rules WHERE id = ?1", params![id])?;
+    pub fn delete(&self, account_email: &str, id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM rules WHERE id = ?1 AND account_email = ?2",
+            params![id, account_email],
+        )?;
         Ok(())
     }
 
-    pub fn get_by_id(&self, id: i64) -> Result<Option<Rule>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.name, r.description, r.conditions, r.prompt, r.actions, r.priority, r.enabled, r.parent_id,
-                     COALESCE(p.policy_id, 'default')
-             FROM rules r
-             LEFT JOIN rule_inference_policy p ON p.rule_id = r.id
-             WHERE r.id = ?1",
-        )?;
+    pub fn get_by_id(&self, account_email: &str, id: i64) -> Result<Option<Rule>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RULE_COLUMNS} {RULE_FROM}
+             WHERE r.id = ?1 AND r.account_email = ?2"
+        ))?;
 
-        let mut rules = stmt.query_map(params![id], |row| {
-            Ok(Rule {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                conditions: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                prompt: row.get(4)?,
-                actions: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                priority: row.get(6)?,
-                enabled: row.get::<_, i32>(7)? != 0,
-                parent_id: row.get(8)?,
-                inference_policy: row.get(9)?,
-            })
-        })?;
-
-        rules.next().transpose()
+        let rule = stmt
+            .query_map(params![id, account_email], map_rule_row)?
+            .next()
+            .transpose();
+        rule
     }
 }
 
@@ -208,10 +185,13 @@ pub struct CreateRuleRequest {
     pub description: Option<String>,
     pub conditions: Vec<crate::rules::models::Condition>,
     pub prompt: String,
+    pub choices: Vec<crate::rules::models::Action>,
+    pub choose_from_all_labels: bool,
     pub actions: Vec<crate::rules::models::Action>,
     pub priority: i32,
     pub enabled: bool,
     pub inference_policy: String,
+    pub continue_after_match: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -220,10 +200,13 @@ pub struct UpdateRuleRequest {
     pub description: Option<String>,
     pub conditions: Vec<crate::rules::models::Condition>,
     pub prompt: String,
+    pub choices: Vec<crate::rules::models::Action>,
+    pub choose_from_all_labels: bool,
     pub actions: Vec<crate::rules::models::Action>,
     pub priority: i32,
     pub enabled: bool,
     pub inference_policy: String,
+    pub continue_after_match: bool,
 }
 
 #[cfg(test)]
@@ -234,8 +217,48 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn conditions_roundtrip_through_db() {
-        let req = CreateRuleRequest {
+    fn the_menu_and_the_recipe_roundtrip_separately() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+
+        let mut req = sample_request();
+        req.continue_after_match = true;
+        req.choices = vec![Action::Trash];
+        let created = db
+            .with_rules(|repo| repo.create("test@example.com", &req))
+            .unwrap();
+        assert!(created.continue_after_match);
+        let stored = db
+            .with_rules(|repo| repo.get_by_id("test@example.com", created.id))
+            .unwrap()
+            .unwrap();
+        assert!(stored.continue_after_match);
+        assert_eq!(stored.choices.len(), 1);
+        assert_eq!(stored.actions.len(), 1);
+
+        let update = UpdateRuleRequest {
+            name: req.name.clone(),
+            description: None,
+            conditions: vec![],
+            prompt: req.prompt.clone(),
+            choices: vec![],
+            choose_from_all_labels: true,
+            actions: vec![],
+            priority: 0,
+            enabled: true,
+            inference_policy: "default".into(),
+            continue_after_match: false,
+        };
+        let updated = db
+            .with_rules(|repo| repo.update("test@example.com", created.id, &update))
+            .unwrap();
+        assert!(!updated.continue_after_match);
+        assert!(updated.choose_from_all_labels);
+        assert!(updated.choices.is_empty());
+    }
+
+    fn sample_request() -> CreateRuleRequest {
+        CreateRuleRequest {
             name: "t".into(),
             description: None,
             conditions: vec![
@@ -249,18 +272,32 @@ mod tests {
                 },
             ],
             prompt: "do something".into(),
+            choices: vec![],
+            choose_from_all_labels: false,
             actions: vec![Action::Label {
                 value: "Mongo".into(),
             }],
             priority: 0,
             enabled: true,
             inference_policy: "default".into(),
-        };
+            continue_after_match: false,
+        }
+    }
 
+    #[test]
+    fn conditions_roundtrip_through_db() {
+        let req = sample_request();
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
-        let _created = db.with_rules(|repo| repo.create(&req)).unwrap();
-        let all = db.with_rules(|repo| repo.list_all()).unwrap();
+        let _created = db
+            .with_rules(|repo| repo.create("test@example.com", &req))
+            .unwrap();
+        let _other = db
+            .with_rules(|repo| repo.create("other@example.com", &req))
+            .unwrap();
+        let all = db
+            .with_rules(|repo| repo.list_all("test@example.com"))
+            .unwrap();
 
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].conditions.len(), 2);
