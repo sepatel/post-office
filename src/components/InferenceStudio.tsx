@@ -22,6 +22,7 @@ export interface ProviderProfile {
   input_cost_per_million_usd: number;
   output_cost_per_million_usd: number;
   timeout_secs: number;
+  context_window_tokens: number;
   enabled: boolean;
 }
 
@@ -41,6 +42,8 @@ export interface InferenceConfig {
   llm_input_cost_per_million_usd: number;
   llm_output_cost_per_million_usd: number;
   llm_timeout_secs: number;
+  llm_context_window_tokens: number;
+  llm_legacy_name: string;
   llm_legacy_quality_tier: string;
   llm_legacy_privacy_status: string;
   llm_legacy_enabled: boolean;
@@ -90,9 +93,11 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
     withLegacyProvider(config),
   );
   const [policies, setPolicies] = useState<RoutingPolicy[]>(() =>
-    config.llm_routing_policies.length > 0
-      ? config.llm_routing_policies
-      : [DEFAULT_POLICY],
+    uniquePolicyIds(
+      config.llm_routing_policies.length > 0
+        ? config.llm_routing_policies
+        : [DEFAULT_POLICY],
+    ),
   );
   const [selectedProviderId, setSelectedProviderId] = useState("legacy");
   const [selectedPolicyId, setSelectedPolicyId] = useState(
@@ -212,7 +217,7 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
   }
 
   function addPolicy() {
-    const id = `policy-${policies.length + 1}`;
+    const id = nextPolicyId(new Set(policies.map((policy) => policy.id)));
     const policy: RoutingPolicy = {
       ...DEFAULT_POLICY,
       id,
@@ -263,6 +268,12 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
     try {
       const persistedProviders = providers.filter((provider) => provider.id !== "legacy");
       const legacy = providers.find((provider) => provider.id === "legacy") ?? withLegacyProvider(config)[0];
+      const routingPolicies = uniquePolicyIds(policies);
+      const defaultPolicy = routingPolicies.some(
+        (policy) => policy.id === selectedPolicyId,
+      )
+        ? selectedPolicyId
+        : routingPolicies[0]?.id ?? "default";
       await llmConfigSet({
         base_url: legacy.base_url,
         api_key: legacyApiKey,
@@ -270,13 +281,17 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
         input_cost_per_million_usd: legacy.input_cost_per_million_usd,
         output_cost_per_million_usd: legacy.output_cost_per_million_usd,
         timeout_secs: legacy.timeout_secs,
+        context_window_tokens: legacy.context_window_tokens,
+        legacy_name: legacy.name,
         legacy_quality_tier: legacy.quality_tier,
         legacy_privacy_status: legacy.privacy_status,
         legacy_enabled: legacy.enabled,
         providers: persistedProviders,
-        routing_policies: policies,
-        default_policy: selectedPolicyId,
+        routing_policies: routingPolicies,
+        default_policy: defaultPolicy,
       });
+      setPolicies(routingPolicies);
+      setSelectedPolicyId(defaultPolicy);
       onConfigChange({
         ...config,
         llm_base_url: legacy.base_url,
@@ -285,12 +300,14 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
         llm_input_cost_per_million_usd: legacy.input_cost_per_million_usd,
         llm_output_cost_per_million_usd: legacy.output_cost_per_million_usd,
         llm_timeout_secs: legacy.timeout_secs,
+        llm_context_window_tokens: legacy.context_window_tokens,
+        llm_legacy_name: legacy.name,
         llm_legacy_quality_tier: legacy.quality_tier,
         llm_legacy_privacy_status: legacy.privacy_status,
         llm_legacy_enabled: legacy.enabled,
         llm_providers: persistedProviders,
-        llm_routing_policies: policies,
-        llm_default_policy: selectedPolicyId,
+        llm_routing_policies: routingPolicies,
+        llm_default_policy: defaultPolicy,
       });
       toast.success("Inference settings saved");
     } catch (error) {
@@ -300,10 +317,10 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
     }
   }
 
-  async function testProvider(provider: ProviderProfile) {
+  async function testProvider(provider: ProviderProfile, apiKey?: string) {
     setTestingProviderId(provider.id);
     try {
-      const result = await llmProviderTest(provider.id);
+      const result = await llmProviderTest(provider, apiKey);
       setTestResults({ ...testResults, [provider.id]: result });
       await loadProviderStatuses();
     } catch (error) {
@@ -314,6 +331,19 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
     } finally {
       setTestingProviderId(null);
     }
+  }
+
+  function testProviderDraft() {
+    if (!providerDraft) return;
+    if (!providerDraft.base_url.trim() || !providerDraft.model.trim()) {
+      toast.error("Base URL and model are required to test a provider.");
+      return;
+    }
+    const apiKey =
+      providerDraft.id === "legacy" || providerKey.trim()
+        ? providerKey
+        : undefined;
+    void testProvider(providerDraft, apiKey);
   }
 
   const availableCandidates = providers.filter(
@@ -408,6 +438,7 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
                   <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500 dark:text-gray-400">
                     <span>{formatCost(provider)}</span>
                     <span>{provider.timeout_secs}s timeout</span>
+                    <span>{formatTokens(provider.context_window_tokens)} context</span>
                     <span>{provider.id === "legacy" ? "Compatibility endpoint" : `Key: ${provider.api_key_ref || provider.id}`}</span>
                   </div>
                   {result && (
@@ -424,7 +455,12 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
             <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-gray-200 pt-4 dark:border-gray-700">
               <button
                 type="button"
-                onClick={() => void testProvider(selectedProvider)}
+                onClick={() =>
+                  void testProvider(
+                    selectedProvider,
+                    selectedProvider.id === "legacy" ? legacyApiKey : undefined,
+                  )
+                }
                 disabled={
                   testingProviderId === selectedProvider.id ||
                   selectedProviderRateLimit != null
@@ -585,6 +621,9 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
             onCredentialChange={setProviderKey}
             onCancel={() => setProviderEditorOpen(false)}
             onSave={saveProviderDraft}
+            onTest={testProviderDraft}
+            testing={testingProviderId === providerDraft.id}
+            testResult={testResults[providerDraft.id]}
           />
         </Modal>
       )}
@@ -617,6 +656,9 @@ function ProviderForm({
   onCredentialChange,
   onCancel,
   onSave,
+  onTest,
+  testing,
+  testResult,
 }: {
   draft: ProviderProfile;
   credential: string;
@@ -626,6 +668,9 @@ function ProviderForm({
   onCredentialChange: (value: string) => void;
   onCancel: () => void;
   onSave: () => void;
+  onTest: () => void;
+  testing: boolean;
+  testResult: LlmTestResult | undefined;
 }) {
   const set = (changes: Partial<ProviderProfile>) => onChange({ ...draft, ...changes });
   return (
@@ -652,7 +697,7 @@ function ProviderForm({
           <Dropdown value={draft.privacy_status} options={PRIVACY_OPTIONS} onChange={(value) => set({ privacy_status: value })} />
         </Field>
       </div>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
         <Field label="Input $ / 1M">
           <input type="number" min="0" step="0.000001" value={draft.input_cost_per_million_usd} onChange={(e) => set({ input_cost_per_million_usd: Number(e.target.value) })} className={inputClass} />
         </Field>
@@ -661,6 +706,9 @@ function ProviderForm({
         </Field>
         <Field label="Timeout seconds">
           <input type="number" min="1" value={draft.timeout_secs} onChange={(e) => set({ timeout_secs: Number(e.target.value) })} className={inputClass} />
+        </Field>
+        <Field label="Context window tokens">
+          <input type="number" min="1024" value={draft.context_window_tokens} onChange={(e) => set({ context_window_tokens: Number(e.target.value) })} className={inputClass} />
         </Field>
       </div>
       <div className="rounded-xl bg-gray-50 p-3 dark:bg-gray-900/60">
@@ -683,9 +731,21 @@ function ProviderForm({
         <input type="checkbox" checked={draft.enabled} onChange={(e) => set({ enabled: e.target.checked })} className="rounded" />
         Available for routing
       </label>
-      <div className="flex justify-end gap-2 border-t border-gray-200 pt-4 dark:border-gray-700">
-        <button type="button" onClick={onCancel} className="rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700">Cancel</button>
-        <button type="button" onClick={onSave} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Save provider</button>
+      {testResult && (
+        <p className={`text-sm ${testResult.ok ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>
+          {testResult.ok
+            ? `Connected to ${testResult.model || draft.model}`
+            : testResult.error}
+        </p>
+      )}
+      <div className="flex flex-wrap justify-between gap-2 border-t border-gray-200 pt-4 dark:border-gray-700">
+        <button type="button" onClick={onTest} disabled={testing} className="rounded-lg px-3 py-2 text-sm font-medium text-blue-600 hover:bg-blue-50 disabled:opacity-50 dark:text-blue-300 dark:hover:bg-blue-950/40">
+          {testing ? "Testing…" : "Test connection"}
+        </button>
+        <div className="flex gap-2">
+          <button type="button" onClick={onCancel} className="rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700">Cancel</button>
+          <button type="button" onClick={onSave} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Save provider</button>
+        </div>
       </div>
     </div>
   );
@@ -826,15 +886,38 @@ function newProvider(): ProviderProfile {
     input_cost_per_million_usd: 0,
     output_cost_per_million_usd: 0,
     timeout_secs: 30,
+    context_window_tokens: 8192,
     enabled: true,
   };
+}
+
+function uniquePolicyIds(policies: RoutingPolicy[]): RoutingPolicy[] {
+  const ids = new Set<string>();
+  const unique: RoutingPolicy[] = [];
+  for (const policy of [...policies].reverse()) {
+    const id = policy.id.trim();
+    if (id && ids.has(id)) {
+      continue;
+    }
+    const nextId = nextPolicyId(ids);
+    const uniqueId = id || nextId;
+    ids.add(uniqueId);
+    unique.push(uniqueId === policy.id ? policy : { ...policy, id: uniqueId });
+  }
+  return unique.reverse();
+}
+
+function nextPolicyId(ids: ReadonlySet<string>): string {
+  let index = 1;
+  while (ids.has(`policy-${index}`)) index += 1;
+  return `policy-${index}`;
 }
 
 function withLegacyProvider(config: InferenceConfig): ProviderProfile[] {
   return [
     {
       id: "legacy",
-      name: "Current endpoint",
+      name: config.llm_legacy_name,
       base_url: config.llm_base_url,
       model: config.llm_default_model,
       api_key_ref: "legacy",
@@ -843,6 +926,7 @@ function withLegacyProvider(config: InferenceConfig): ProviderProfile[] {
       input_cost_per_million_usd: config.llm_input_cost_per_million_usd,
       output_cost_per_million_usd: config.llm_output_cost_per_million_usd,
       timeout_secs: config.llm_timeout_secs,
+      context_window_tokens: config.llm_context_window_tokens,
       enabled: config.llm_legacy_enabled,
     },
     ...config.llm_providers.filter((provider) => provider.id !== "legacy"),
@@ -868,6 +952,10 @@ function requirementLabel(value: string | undefined): string {
 function formatCost(provider: ProviderProfile): string {
   if (provider.input_cost_per_million_usd === 0 && provider.output_cost_per_million_usd === 0) return "Cost not set";
   return `$${provider.input_cost_per_million_usd}/$${provider.output_cost_per_million_usd} per 1M`;
+}
+
+function formatTokens(tokens: number): string {
+  return tokens >= 1000 ? `${tokens / 1000}k` : `${tokens}`;
 }
 
 function activeRateLimit(status: LlmProviderStatus | undefined): Date | null {

@@ -5,8 +5,56 @@ export async function configGet() {
   return invoke("config_get");
 }
 
+export interface LlmRoutingPolicy {
+  id: string;
+  name: string;
+}
+
+export function policyDisplayName(
+  policyId: string,
+  policies: LlmRoutingPolicy[],
+): string {
+  const id = policyId || "default";
+  const name = policies.find((policy) => policy.id === id)?.name;
+  return name ?? (id === "default" ? "Default" : id);
+}
+
 export async function configSet(key: string, value: string) {
   return invoke("config_set", { key, value });
+}
+
+export interface Account {
+  email: string;
+  sort_order: number;
+  paused: boolean;
+  status: "healthy" | "paused" | "error" | string;
+  last_successful: string | null;
+  last_error: string | null;
+}
+
+export interface AccountsState {
+  accounts: Account[];
+  active_email: string | null;
+}
+
+export async function accountsList(): Promise<AccountsState> {
+  return invoke("accounts_list");
+}
+
+export async function accountsSelect(email: string): Promise<void> {
+  return invoke("accounts_select", { email });
+}
+
+export async function accountsSetPaused(email: string, paused: boolean): Promise<void> {
+  return invoke("accounts_set_paused", { email, paused });
+}
+
+export async function accountsReorder(emails: string[]): Promise<void> {
+  return invoke("accounts_reorder", { emails });
+}
+
+export async function accountsRemove(email: string): Promise<void> {
+  return invoke("accounts_remove", { email });
 }
 
 export interface LlmConfigUpdate {
@@ -16,6 +64,8 @@ export interface LlmConfigUpdate {
   input_cost_per_million_usd: number;
   output_cost_per_million_usd: number;
   timeout_secs: number;
+  context_window_tokens: number;
+  legacy_name: string;
   legacy_quality_tier: string;
   legacy_privacy_status: string;
   legacy_enabled: boolean;
@@ -32,31 +82,30 @@ export async function rulesList() {
   return invoke("rules_list");
 }
 
-export async function rulesCreate(rule: {
+export interface RulePayload {
   name: string;
   description: string | null;
   conditions: unknown[];
   prompt: string;
+  /// The outcomes the model picks between; empty asks a plain match-or-not question.
+  choices: unknown[];
+  choose_from_all_labels: boolean;
+  /// Runs on every match, whatever the model chose.
   actions: unknown[];
   priority: number;
   enabled: boolean;
   inference_policy: string;
-}) {
+  continue_after_match: boolean;
+  source_rule_id?: number;
+}
+
+export async function rulesCreate(rule: RulePayload) {
   return invoke("rules_create", { rule });
 }
 
 export async function rulesUpdate(
   id: number,
-  rule: {
-    name: string;
-    description: string | null;
-    conditions: unknown[];
-    prompt: string;
-    actions: unknown[];
-    priority: number;
-    enabled: boolean;
-    inference_policy: string;
-  }
+  rule: RulePayload
 ) {
   return invoke("rules_update", { id, rule });
 }
@@ -115,9 +164,25 @@ export interface MemoryInput {
   text: string;
 }
 
+export interface MemoryEntry extends MemoryInput {
+  id: number;
+  rule_id: number;
+  source: string;
+  created_at: string;
+}
+
+export async function ruleMemoriesList(ruleId: number): Promise<MemoryEntry[]> {
+  return invoke("rule_memories_list", { ruleId });
+}
+
+export async function ruleMemoryDelete(ruleId: number, memoryId: number): Promise<void> {
+  return invoke("rule_memory_delete", { ruleId, memoryId });
+}
+
 export interface ChatProposal {
   prompt: string | null;
   actions_add: unknown[];
+  choices_add: unknown[];
   conditions_add: unknown[];
   memories_add: MemoryInput[];
 }
@@ -153,11 +218,25 @@ export interface ActionDisplay {
   display: string;
 }
 
+export interface FallthroughStep {
+  rule_id: number;
+  rule_name: string;
+  matched: boolean;
+  indeterminate: boolean;
+  continued: boolean;
+  actions: ActionDisplay[];
+  reasoning: string;
+  diagnostic: string | null;
+}
+
 export interface TestResult {
   matched: boolean;
+  indeterminate: boolean;
   actions: ActionDisplay[];
   llm_response: string;
   reasoning: string;
+  diagnostic: string | null;
+  fallthrough: FallthroughStep[];
 }
 
 export interface ApplyResult {
@@ -180,32 +259,14 @@ export async function gmailRecentMessages(
 }
 
 export async function rulesTest(
-  rule: {
-    name: string;
-    description: string | null;
-    conditions: unknown[];
-    prompt: string;
-    actions: unknown[];
-    priority: number;
-    enabled: boolean;
-    inference_policy: string;
-  },
+  rule: RulePayload,
   messageId: string
 ): Promise<TestResult> {
   return invoke("rules_test", { rule, messageId });
 }
 
 export async function rulesApply(
-  rule: {
-    name: string;
-    description: string | null;
-    conditions: unknown[];
-    prompt: string;
-    actions: unknown[];
-    priority: number;
-    enabled: boolean;
-    inference_policy: string;
-  },
+  rule: RulePayload,
   messageId: string
 ): Promise<ApplyResult> {
   return invoke("rules_apply", { rule, messageId });
@@ -214,21 +275,15 @@ export async function rulesApply(
 export interface BulkVerdict {
   email_id: string;
   matched: boolean;
+  indeterminate: boolean;
   actions: ActionDisplay[];
   llm_response: string;
+  reason: string;
+  diagnostic: string | null;
 }
 
 export async function bulkEvaluate(
-  rule: {
-    name: string;
-    description: string | null;
-    conditions: unknown[];
-    prompt: string;
-    actions: unknown[];
-    priority: number;
-    enabled: boolean;
-    inference_policy: string;
-  },
+  rule: RulePayload,
   messageIds: string[]
 ): Promise<BulkVerdict[]> {
   return invoke("bulk_evaluate", { rule, messageIds });
@@ -301,6 +356,7 @@ export interface BackfillResult {
 }
 
 export interface OpProgress {
+  account_email?: string;
   source: string;
   phase: string;
   processed: number;
@@ -380,14 +436,22 @@ export interface GmailLabel {
   labelListVisibility?: string | null;
 }
 
-export async function gmailListLabels(): Promise<GmailLabel[]> {
-  return invoke("gmail_list_labels");
+export async function gmailListLabels(refresh = false): Promise<GmailLabel[]> {
+  return invoke("gmail_list_labels", { refresh });
 }
 
 export interface LlmTestResult {
   ok: boolean;
   model: string;
   error: string | null;
+}
+
+export interface LlmProviderTestProfile {
+  id: string;
+  base_url: string;
+  model: string;
+  api_key_ref: string;
+  timeout_secs: number;
 }
 
 export async function llmTest(
@@ -402,8 +466,11 @@ export async function llmTest(
   });
 }
 
-export async function llmProviderTest(providerId: string): Promise<LlmTestResult> {
-  return invoke("llm_provider_test", { providerId });
+export async function llmProviderTest(
+  provider: LlmProviderTestProfile,
+  apiKey?: string,
+): Promise<LlmTestResult> {
+  return invoke("llm_provider_test", { provider, apiKey });
 }
 
 export async function llmListModels(

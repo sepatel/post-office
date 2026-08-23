@@ -95,6 +95,11 @@ CREATE INDEX idx_rules_parent ON rules(parent_id);
 CREATE INDEX idx_rules_enabled ON rules(enabled) WHERE enabled = 1;
 ```
 
+Later migrations add `account_email` (009), `continue_after_match` (013), and
+`choices` + `choose_from_all_labels` (014, collapsing the `response_mode` and
+`label_selection` columns that 010 and 011 introduced). See `migrations/` for
+the authoritative schema; the sections below describe the initial tables only.
+
 #### Conditions JSON Format
 
 ```json

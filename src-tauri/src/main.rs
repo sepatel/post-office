@@ -1,6 +1,5 @@
 use post_office_core::config::AppConfig;
 use post_office_core::processing::ProcessingState;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::tray::TrayIcon;
 use tauri::Manager;
@@ -11,13 +10,43 @@ mod commands;
 mod sync_runtime;
 mod tray;
 
+pub type ProcessingStates =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<Mutex<ProcessingState>>>>>;
+
 pub struct AppState {
     pub db: post_office_core::db::Database,
-    pub processing_state: Arc<Mutex<ProcessingState>>,
+    pub processing_states: ProcessingStates,
     pub config: Arc<Mutex<AppConfig>>,
     pub sync_trigger: mpsc::UnboundedSender<sync_runtime::SyncTrigger>,
-    pub poller_started: Arc<AtomicBool>,
+    pub pollers_started: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub tray: Arc<std::sync::Mutex<Option<TrayIcon>>>,
+}
+
+impl AppState {
+    pub fn processing_state_for(&self, account_email: &str) -> Arc<Mutex<ProcessingState>> {
+        let mut states = self.processing_states.lock().unwrap();
+        states
+            .entry(account_email.to_string())
+            .or_insert_with(|| {
+                let mut processing = ProcessingState::new();
+                post_office_core::processing::hydrate_processing_state(
+                    &self.db,
+                    &mut processing,
+                    account_email,
+                );
+                if let Ok(Some(account)) = self.db.with_accounts(|repo| repo.get(account_email)) {
+                    processing
+                        .paused
+                        .store(account.paused, std::sync::atomic::Ordering::Relaxed);
+                }
+                Arc::new(Mutex::new(processing))
+            })
+            .clone()
+    }
+
+    pub fn remove_processing_state(&self, account_email: &str) {
+        self.processing_states.lock().unwrap().remove(account_email);
+    }
 }
 
 fn main() {
@@ -38,23 +67,22 @@ fn main() {
             db.migrate().expect("Failed to run migrations");
 
             let config = db.with_config(|repo| AppConfig::load(&repo));
-            let mut processing = ProcessingState::new();
-            post_office_core::processing::hydrate_processing_state(&db, &mut processing);
-            let processing_state = Arc::new(Mutex::new(processing));
             let config_arc = Arc::new(Mutex::new(config.clone()));
+            let processing_states =
+                Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let sync_trigger = sync_runtime::spawn(
                 app.handle().clone(),
                 Arc::new(db.clone()),
-                processing_state.clone(),
+                processing_states.clone(),
                 config_arc.clone(),
             );
 
             let app_state = AppState {
                 db,
-                processing_state: processing_state.clone(),
+                processing_states,
                 config: config_arc.clone(),
                 sync_trigger,
-                poller_started: Arc::new(AtomicBool::new(false)),
+                pollers_started: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
                 tray: Arc::new(std::sync::Mutex::new(None)),
             };
 
@@ -62,11 +90,18 @@ fn main() {
 
             if !config.sync_enabled {
                 let state_handle = app.state::<AppState>();
-                crate::commands::ensure_polling_started(
-                    app.handle().clone(),
-                    &state_handle,
-                    &config,
-                );
+                let accounts = state_handle
+                    .db
+                    .with_accounts(|repo| repo.list())
+                    .unwrap_or_default();
+                for account in accounts.into_iter().filter(|account| !account.paused) {
+                    crate::commands::ensure_polling_started(
+                        app.handle().clone(),
+                        &state_handle,
+                        &config,
+                        account.email,
+                    );
+                }
             }
 
             let tray = tray::setup_tray(app, &config.tray_theme)?;
@@ -79,11 +114,18 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::config_get,
             commands::config_set,
+            commands::accounts_list,
+            commands::accounts_select,
+            commands::accounts_set_paused,
+            commands::accounts_reorder,
+            commands::accounts_remove,
             commands::llm_config_set,
             commands::rules_list,
             commands::rules_create,
             commands::rules_update,
             commands::rules_delete,
+            commands::rule_memories_list,
+            commands::rule_memory_delete,
             commands::rule_chat_history,
             commands::rule_chat_send,
             commands::rule_apply_proposal,

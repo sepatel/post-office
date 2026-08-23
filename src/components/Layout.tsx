@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Outlet, NavLink, useNavigate } from "react-router-dom";
+import { Outlet, NavLink } from "react-router-dom";
 import ThemeToggle from "./ThemeToggle";
-import ConnectionStatus from "./ConnectionStatus";
+import AccountSwitcher from "./AccountSwitcher";
 import { useGate } from "../lib/gate";
 import { formatLocalDateTime } from "../lib/datetime";
 import {
@@ -41,8 +41,7 @@ function isActiveProgress(progress: OpProgress | null | undefined): progress is 
 }
 
 export default function Layout() {
-  const { connection } = useGate();
-  const navigate = useNavigate();
+  const { connection, activeEmail } = useGate();
   const [status, setStatus] = useState<ProcessingStatus | null>(null);
   const [cycle, setCycle] = useState<OpProgress | null>(null);
   const [backfill, setBackfill] = useState<OpProgress | null>(null);
@@ -84,6 +83,7 @@ export default function Layout() {
 
     const unlisteners = Promise.all([
       onCycleProgress((p) => {
+        if (p.account_email && p.account_email !== activeEmail) return;
         setCycle(isTerminalPhase(p.phase) ? null : p);
         if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
           window.setTimeout(() => {
@@ -93,6 +93,7 @@ export default function Layout() {
         if (isTerminalPhase(p.phase)) loadStatus();
       }),
       onBackfillProgress((p) => {
+        if (p.account_email && p.account_email !== activeEmail) return;
         setBackfill(isTerminalPhase(p.phase) ? null : p);
         if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
           window.setTimeout(() => {
@@ -102,6 +103,7 @@ export default function Layout() {
         if (isTerminalPhase(p.phase)) loadStatus();
       }),
       onSyncProgress((p) => {
+        if (p.account_email && p.account_email !== activeEmail) return;
         setSync(isTerminalPhase(p.phase) ? null : p);
         if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
           window.setTimeout(() => {
@@ -120,7 +122,7 @@ export default function Layout() {
         c();
       });
     };
-  }, []);
+  }, [activeEmail]);
 
   async function togglePause() {
     if (!status) return;
@@ -148,9 +150,8 @@ export default function Layout() {
     <div className="flex h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 transition-colors">
       <nav className="w-56 bg-gray-100 dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col">
         <div className="p-4 border-b border-gray-200 dark:border-gray-700">
-          <h1 className="text-lg font-semibold" data-tauri-drag-region>
-            Post Office
-          </h1>
+          <div data-tauri-drag-region className="h-2" />
+          <AccountSwitcher />
         </div>
         <div className="flex-1 p-2">
           {navItems.map((item) => (
@@ -191,13 +192,6 @@ export default function Layout() {
           </div>
         </div>
         <div className="p-3 border-t border-gray-200 dark:border-gray-700 space-y-3">
-          <button
-            onClick={() => navigate("/settings")}
-            className="w-full text-left"
-            title="Open Settings to connect or manage Gmail"
-          >
-            <ConnectionStatus connection={connection} />
-          </button>
           {mailboxSummary && (
             <div className="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
               {mailboxSummary}
