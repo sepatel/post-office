@@ -20,6 +20,32 @@ pub enum LlmError {
     Routing(String),
 }
 
+impl LlmError {
+    pub fn user_message(&self) -> String {
+        let Self::Api(async_openai::error::OpenAIError::JSONDeserialize(_, content)) = self else {
+            return self.to_string();
+        };
+        let Some(error) = serde_json::from_str::<serde_json::Value>(content)
+            .ok()
+            .and_then(|response| response.get("error").cloned())
+        else {
+            return self.to_string();
+        };
+        let Some(message) = error.get("message").and_then(serde_json::Value::as_str) else {
+            return self.to_string();
+        };
+        let code = error.get("code").and_then(|code| {
+            code.as_str()
+                .map(str::to_owned)
+                .or_else(|| code.as_i64().map(|code| code.to_string()))
+        });
+        match code {
+            Some(code) => format!("LLM API error: {code}: {message}"),
+            None => format!("LLM API error: {message}"),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ProcessRequest {
     pub system_prompt: Option<String>,
@@ -49,4 +75,24 @@ pub struct ProcessResponse {
     pub completion_tokens: Option<u32>,
     pub tokens_used: Option<u32>,
     pub duration_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposes_numeric_provider_error_codes() {
+        let content = r#"{"error":{"message":"No eligible endpoints","code":404}}"#;
+        let decode_error = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let error = LlmError::Api(async_openai::error::OpenAIError::JSONDeserialize(
+            decode_error,
+            content.into(),
+        ));
+
+        assert_eq!(
+            error.user_message(),
+            "LLM API error: 404: No eligible endpoints"
+        );
+    }
 }

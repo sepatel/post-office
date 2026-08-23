@@ -212,7 +212,7 @@ export default function History() {
         <table className="w-full min-w-[72rem] table-fixed text-sm">
           <colgroup>
             <col className="w-[2.5rem]" />
-            <col className="w-[11rem]" />
+            <col className="w-[14rem]" />
             <col className="w-[18rem]" />
             <col />
             <col className="w-[9rem]" />

@@ -1,51 +1,32 @@
-use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
 
-use regex::Regex;
-
-use crate::gmail::models::Message;
+use crate::gmail::models::{Label, Message};
 use crate::llm::{InferenceRouter, ProcessRequest};
 use crate::rules::engine::{
-    display_action, email_parts, resolve_effective_actions, ActionDisplay, RuleError,
+    choice_catalog, display_action, effective_actions, email_parts, estimated_tokens, memory_block,
+    parse_row, ActionDisplay, Choice, Outcome, Resolved, Row, RuleError,
 };
 use crate::rules::matcher;
 use crate::rules::models::Rule;
-use crate::rules::prompts::BATCH_SYSTEM_PROMPT;
+use crate::rules::prompts::decision_prompt;
 use crate::rules::response_parser::ParsedAction;
 
-/// Emails per LLM call. Kept small so local models (Ollama/llama3) stay within a
-/// context they classify accurately; one call still covers many emails.
-const BATCH_SIZE: usize = 10;
+const MAX_BATCH_SIZE: usize = 10;
 
-/// Proposed outcome for a single email after bulk evaluation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BulkVerdict {
     pub email_id: String,
-    /// True when the rule's conditions matched (the email was actually considered).
     pub matched: bool,
+    pub indeterminate: bool,
     pub actions: Vec<ActionDisplay>,
-    /// This email's indexed LLM reply, including its explanation (empty for
-    /// rules that resolve locally without calling the model).
     pub llm_response: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct BulkResolvedEmail {
-    pub actions: Vec<ParsedAction>,
-    pub llm_response: String,
-    pub llm_model: Option<String>,
-    pub llm_provider: Option<String>,
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-    pub total_tokens: Option<u32>,
-    pub llm_duration_ms: Option<u64>,
+    pub reason: String,
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BulkRuleResolution {
-    pub resolved: Vec<BulkResolvedEmail>,
+    pub resolved: Vec<Resolved>,
     pub stopped: bool,
 }
 
@@ -53,6 +34,8 @@ pub async fn bulk_resolve_for_rule(
     llm: &InferenceRouter,
     rule: &Rule,
     emails: &[Message],
+    memories: &[String],
+    labels: &[Label],
     cancel_requested: Option<&AtomicBool>,
 ) -> Result<BulkRuleResolution, RuleError> {
     if emails.is_empty() {
@@ -62,29 +45,30 @@ pub async fn bulk_resolve_for_rule(
         });
     }
 
-    if rule.prompt.trim().is_empty() {
+    let has_instruction = !rule.prompt.trim().is_empty();
+    let menu = choice_catalog(rule, labels);
+    // An empty prompt normally means a deterministic conditions-and-actions rule
+    // that costs no inference. A menu overrides that: offering one is an
+    // explicit request for the model to classify.
+    if !has_instruction && menu.is_empty() {
         let actions: Vec<ParsedAction> = rule.actions.iter().map(ParsedAction::from).collect();
         return Ok(BulkRuleResolution {
             resolved: emails
                 .iter()
-                .map(|_| BulkResolvedEmail {
-                    actions: actions.clone(),
-                    llm_response: String::new(),
-                    llm_model: None,
-                    llm_provider: None,
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    total_tokens: None,
-                    llm_duration_ms: None,
-                })
+                .map(|_| Resolved::local(Outcome::Matched, actions.clone()))
                 .collect(),
             stopped: false,
         });
     }
 
+    let system_prompt = decision_prompt(&menu, has_instruction);
+    let budget = llm
+        .input_token_budget(&rule.inference_policy)
+        .saturating_sub(estimated_tokens(&system_prompt));
+    let chunks = batch_chunks(rule, emails, memories, budget)?;
     let mut resolved = Vec::with_capacity(emails.len());
 
-    for chunk in emails.chunks(BATCH_SIZE) {
+    for chunk in chunks {
         if cancel_requested
             .map(|flag| flag.load(Ordering::Relaxed))
             .unwrap_or(false)
@@ -95,40 +79,28 @@ pub async fn bulk_resolve_for_rule(
             });
         }
 
-        let refs: Vec<&Message> = chunk.iter().collect();
-        let user_prompt = build_batch_prompt(rule, &refs);
+        let user_prompt = build_batch_prompt(rule, &chunk, memories, budget)?;
         let response = llm
             .process(
                 &rule.inference_policy,
                 ProcessRequest {
-                    system_prompt: Some(BATCH_SYSTEM_PROMPT.to_string()),
+                    system_prompt: Some(system_prompt.clone()),
                     user_prompt,
                     model: None,
                     temperature: None,
-                    max_tokens: None,
+                    max_tokens: Some(llm.max_tokens()),
                 },
             )
-            .await
-            .map_err(RuleError::Llm)?;
-
-        let parsed = parse_batch(&response.content, chunk.len());
-        let prompt_tokens = split_even(response.prompt_tokens, chunk.len());
-        let completion_tokens = split_even(response.completion_tokens, chunk.len());
-        let total_tokens = split_even(response.tokens_used, chunk.len());
-        let duration_ms = split_even_u64(Some(response.duration_ms), chunk.len());
-
-        for (offset, decision) in parsed.into_iter().enumerate() {
-            resolved.push(BulkResolvedEmail {
-                actions: resolve_effective_actions(rule, decision.action),
-                llm_response: decision.llm_response,
-                llm_model: Some(response.model.clone()),
-                llm_provider: response.provider_id.clone(),
-                prompt_tokens: prompt_tokens[offset],
-                completion_tokens: completion_tokens[offset],
-                total_tokens: total_tokens[offset],
-                llm_duration_ms: duration_ms[offset],
-            });
-        }
+            .await?;
+        resolved.extend(match parse_rows(&response.content, chunk.len(), &menu) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| from_row(rule, row, &response))
+                .collect(),
+            Err(diagnostic) => (0..chunk.len())
+                .map(|_| unparsed(response.content.trim().to_string(), &diagnostic, &response))
+                .collect::<Vec<_>>(),
+        });
     }
 
     Ok(BulkRuleResolution {
@@ -137,225 +109,320 @@ pub async fn bulk_resolve_for_rule(
     })
 }
 
-/// Evaluate a rule against many emails in bounded batches. Emails whose
-/// conditions don't match are reported with `matched: false` and no LLM call.
-/// Structured-action rules resolve locally; only prompt-based rules hit the LLM,
-/// one call per `BATCH_SIZE` matched emails.
 pub async fn bulk_evaluate(
     llm: &InferenceRouter,
     rule: &Rule,
     emails: &[Message],
+    memories: &[String],
+    labels: &[Label],
 ) -> Result<Vec<BulkVerdict>, RuleError> {
     let mut verdicts: Vec<BulkVerdict> = emails
         .iter()
-        .map(|e| BulkVerdict {
-            email_id: e.id.clone(),
+        .map(|email| BulkVerdict {
+            email_id: email.id.clone(),
             matched: false,
+            indeterminate: false,
             actions: vec![],
             llm_response: String::new(),
+            reason: String::new(),
+            diagnostic: None,
         })
         .collect();
-
     let matched: Vec<usize> = emails
         .iter()
         .enumerate()
-        .filter(|(_, e)| {
+        .filter(|(_, email)| {
             rule.conditions
                 .iter()
-                .all(|c| matcher::evaluate(c, e, &e.label_ids))
+                .all(|condition| matcher::evaluate(condition, email, &email.label_ids))
         })
-        .map(|(i, _)| i)
+        .map(|(index, _)| index)
         .collect();
-
     if matched.is_empty() {
         return Ok(verdicts);
     }
-
-    for &i in &matched {
-        verdicts[i].matched = true;
+    let candidates: Vec<Message> = matched.iter().map(|index| emails[*index].clone()).collect();
+    let resolved = bulk_resolve_for_rule(llm, rule, &candidates, memories, labels, None).await?;
+    for (index, result) in matched.into_iter().zip(resolved.resolved) {
+        verdicts[index].matched = result.outcome == Outcome::Matched;
+        verdicts[index].indeterminate = result.outcome == Outcome::Unparsed;
+        verdicts[index].actions = result.actions.iter().map(display_action).collect();
+        verdicts[index].llm_response = result.llm_response;
+        verdicts[index].reason = result.reason;
+        verdicts[index].diagnostic = result.diagnostic;
     }
-
-    // No prompt: structured actions resolve deterministically, no LLM call.
-    if rule.prompt.trim().is_empty() {
-        for &i in &matched {
-            verdicts[i].actions = rule
-                .actions
-                .iter()
-                .map(ParsedAction::from)
-                .map(|a| display_action(&a))
-                .collect();
-        }
-        return Ok(verdicts);
-    }
-
-    let matched_emails: Vec<&Message> = matched.iter().map(|&i| &emails[i]).collect();
-    let mut chunk_start = 0;
-    for chunk in matched_emails.chunks(BATCH_SIZE) {
-        let user_prompt = build_batch_prompt(rule, chunk);
-        let response = llm
-            .process(
-                &rule.inference_policy,
-                ProcessRequest {
-                    system_prompt: Some(BATCH_SYSTEM_PROMPT.to_string()),
-                    user_prompt,
-                    model: None,
-                    temperature: None,
-                    max_tokens: None,
-                },
-            )
-            .await
-            .map_err(RuleError::Llm)?;
-
-        let parsed = parse_batch(&response.content, chunk.len());
-        for (offset, decision) in parsed.into_iter().enumerate() {
-            let global_idx = matched[chunk_start + offset];
-            verdicts[global_idx].actions = resolve_effective_actions(rule, decision.action)
-                .into_iter()
-                .map(|a| display_action(&a))
-                .collect();
-            verdicts[global_idx].llm_response = decision.llm_response;
-        }
-        chunk_start += chunk.len();
-    }
-
     Ok(verdicts)
 }
 
-fn build_batch_prompt(rule: &Rule, emails: &[&Message]) -> String {
-    let mut s = String::new();
-    s.push_str("RULE INSTRUCTION:\n");
-    s.push_str(rule.prompt.trim());
-    s.push_str("\n\nEMAILS:\n");
-    for (i, email) in emails.iter().enumerate() {
-        let (headers, body) = email_parts(email);
-        s.push_str(&format!("--- EMAIL {} ---\n{headers}\n\n{body}\n", i + 1));
-    }
-    s.push_str(&format!(
-        "\nRespond with one `N: <TOKEN> | <brief explanation>` line per email, in order (1 to {}).\n",
-        emails.len()
-    ));
-    s
-}
-
-fn split_even(total: Option<u32>, parts: usize) -> Vec<Option<u32>> {
-    let Some(total) = total else {
-        return vec![None; parts];
+fn from_row(rule: &Rule, row: Row, response: &crate::llm::ProcessResponse) -> Resolved {
+    let (outcome, actions) = if row.matched {
+        (Outcome::Matched, effective_actions(rule, &row.chosen))
+    } else {
+        (Outcome::NoMatch, vec![])
     };
-    if parts == 0 {
-        return vec![];
+    Resolved {
+        outcome,
+        actions,
+        llm_response: row.text,
+        reason: row.reason,
+        diagnostic: row.note,
+        ..metrics(response)
     }
-    let base = total / parts as u32;
-    let remainder = total % parts as u32;
-    (0..parts)
-        .map(|idx| Some(base + u32::from((idx as u32) < remainder)))
-        .collect()
 }
 
-fn split_even_u64(total: Option<u64>, parts: usize) -> Vec<Option<u64>> {
-    let Some(total) = total else {
-        return vec![None; parts];
-    };
-    if parts == 0 {
-        return vec![];
-    }
-    let base = total / parts as u64;
-    let remainder = total % parts as u64;
-    (0..parts)
-        .map(|idx| Some(base + u64::from((idx as u64) < remainder)))
-        .collect()
-}
-
-static BATCH_LINE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(\d+)\s*:\s*(.+?)\s*$").unwrap());
-
-#[derive(Debug, Clone, Default)]
-struct BatchDecision {
-    action: Option<ParsedAction>,
+fn unparsed(
     llm_response: String,
+    diagnostic: &str,
+    response: &crate::llm::ProcessResponse,
+) -> Resolved {
+    Resolved {
+        outcome: Outcome::Unparsed,
+        llm_response,
+        diagnostic: Some(diagnostic.to_string()),
+        ..metrics(response)
+    }
 }
 
-/// Parse `N: <TOKEN> | <explanation>` lines into per-email decisions. The
-/// explanation is retained with its email so history can show why it matched.
-fn parse_batch(response: &str, count: usize) -> Vec<BatchDecision> {
-    let mut map: HashMap<usize, BatchDecision> = HashMap::new();
-    for line in response.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some(caps) = BATCH_LINE_RE.captures(line) else {
-            continue;
-        };
-        let Ok(idx) = caps.get(1).unwrap().as_str().parse::<usize>() else {
-            continue;
-        };
-        if idx == 0 {
-            continue;
-        }
-        let decision = caps.get(2).unwrap().as_str().trim();
-        let token = decision
-            .split_once('|')
-            .map(|(token, _)| token.trim())
-            .unwrap_or(decision);
-        if token.eq_ignore_ascii_case("SKIP") || ParsedAction::from_str(token).is_ok() {
-            map.insert(
-                idx,
-                BatchDecision {
-                    action: ParsedAction::from_str(token).ok(),
-                    llm_response: format!("{}: {}", idx, decision),
-                },
-            );
-        }
+fn metrics(response: &crate::llm::ProcessResponse) -> Resolved {
+    Resolved {
+        outcome: Outcome::Unparsed,
+        actions: vec![],
+        llm_response: String::new(),
+        reason: String::new(),
+        llm_model: Some(response.model.clone()),
+        llm_provider: response.provider_id.clone(),
+        prompt_tokens: response.prompt_tokens,
+        completion_tokens: response.completion_tokens,
+        total_tokens: response.tokens_used,
+        llm_duration_ms: Some(response.duration_ms),
+        diagnostic: None,
     }
-    (1..=count)
-        .map(|i| map.get(&i).cloned().unwrap_or_default())
-        .collect()
+}
+
+/// Reads one decision per email, positionally.
+///
+/// Correlation is by order, never by the number the model wrote: a model that
+/// miscounts would otherwise apply one email's decision to another. A reply
+/// that does not carry exactly one decision per email is refused whole, which
+/// costs a re-ask but cannot mislabel anything.
+fn parse_rows(response: &str, count: usize, menu: &[Choice]) -> Result<Vec<Row>, String> {
+    // One email's answer is the whole reply, however the model laid it out.
+    if count == 1 {
+        return parse_row(response, menu)
+            .map(|row| vec![row])
+            .map_err(|error| error.to_string());
+    }
+    let rows: Vec<Row> = response
+        .lines()
+        .filter_map(|line| parse_row(line, menu).ok())
+        .collect();
+    if rows.len() == count {
+        return Ok(rows);
+    }
+    Err(format!(
+        "Expected one decision line for each of the {count} emails, found {}",
+        rows.len()
+    ))
+}
+
+fn batch_chunks<'a>(
+    rule: &Rule,
+    emails: &'a [Message],
+    memories: &[String],
+    budget: usize,
+) -> Result<Vec<Vec<&'a Message>>, RuleError> {
+    let base = batch_prefix(rule, memories);
+    if estimated_tokens(&base) >= budget {
+        return Err(RuleError::PromptTooLarge);
+    }
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = estimated_tokens(&base);
+    for email in emails {
+        let email_tokens = estimated_tokens(&render_email(email));
+        if !current.is_empty()
+            && (current.len() == MAX_BATCH_SIZE || current_tokens + email_tokens > budget)
+        {
+            chunks.push(current);
+            current = Vec::new();
+            current_tokens = estimated_tokens(&base);
+        }
+        current_tokens += email_tokens;
+        current.push(email);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+fn build_batch_prompt(
+    rule: &Rule,
+    emails: &[&Message],
+    memories: &[String],
+    budget: usize,
+) -> Result<String, RuleError> {
+    let prefix = batch_prefix(rule, memories);
+    let suffix = format!("\nAnswer with {} decision lines.\n", emails.len());
+    let emails_text = emails
+        .iter()
+        .enumerate()
+        .map(|(index, email)| format!("--- EMAIL {} ---\n{}", index + 1, render_email(email)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!("{prefix}{emails_text}{suffix}");
+    if estimated_tokens(&prompt) <= budget {
+        return Ok(prompt);
+    }
+    if emails.len() != 1 {
+        return Err(RuleError::PromptTooLarge);
+    }
+    let (headers, body) = email_parts(emails[0]);
+    let email_prefix = format!("{prefix}--- EMAIL 1 ---\n{headers}\n\n");
+    crate::rules::engine::fit_email_body(&email_prefix, &body, &suffix, budget)
+}
+
+/// The menu lives in the system prompt, which is built per rule, so the payload
+/// carries only the instruction, the memories, and the emails.
+fn batch_prefix(rule: &Rule, memories: &[String]) -> String {
+    let instruction = if rule.prompt.trim().is_empty() {
+        String::new()
+    } else {
+        format!("RULE INSTRUCTION:\n{}", rule.prompt.trim())
+    };
+    format!("{instruction}{}\n\nEMAILS:\n", memory_block(memories))
+}
+
+fn render_email(email: &Message) -> String {
+    let (headers, body) = email_parts(email);
+    format!("{headers}\n\n{body}\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_indexed_token_lines() {
-        let parsed = parse_batch("1: ARCHIVE\n2: LABEL: Invoices\n3: SKIP\n", 3);
-        assert_eq!(parsed[0].action, Some(ParsedAction::Archive));
-        assert_eq!(
-            parsed[1].action,
-            Some(ParsedAction::Label("Invoices".into()))
-        );
-        assert_eq!(parsed[2].action, None);
+    fn menu() -> Vec<Choice> {
+        vec![
+            Choice::label("Label_1", "Invoices"),
+            Choice::label("Label_2", "Education/Saarth"),
+        ]
+    }
+
+    fn labels_of(row: &Row) -> Vec<String> {
+        row.chosen
+            .iter()
+            .map(|action| match action {
+                ParsedAction::Label(id) => id.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
     }
 
     #[test]
-    fn missing_index_is_skip() {
-        let parsed = parse_batch("1: TRASH\n3: STAR", 3);
-        assert_eq!(parsed[0].action, Some(ParsedAction::Trash));
-        assert_eq!(parsed[1].action, None);
-        assert_eq!(parsed[2].action, Some(ParsedAction::Star));
+    fn reads_one_decision_per_email() {
+        let rows = parse_rows(
+            "1: Invoices | Categorize it.\n2: NO_MATCH | Ignore it.",
+            2,
+            &menu(),
+        )
+        .expect("reply should parse");
+
+        assert_eq!(labels_of(&rows[0]), vec!["Label_1".to_string()]);
+        assert!(!rows[1].matched);
+    }
+
+    /// The reported failure: the model copies the literal `N:` placeholder, so
+    /// no line carries a usable index. Order is enough to correlate them.
+    #[test]
+    fn a_copied_placeholder_marker_does_not_lose_the_batch() {
+        let rows = parse_rows(
+            "N: NO_MATCH | tech news update, not music\nN: NO_MATCH | banking notification, not music",
+            2,
+            &[],
+        )
+        .expect("reply should parse");
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| !row.matched));
+        assert_eq!(rows[1].reason, "banking notification, not music");
+    }
+
+    /// The same failure with one email, which used to report a missing decision
+    /// keyword because the marker was still attached to it.
+    #[test]
+    fn a_copied_placeholder_marker_does_not_lose_a_single_email() {
+        let rows = parse_rows("N: NO_MATCH | GitHub discussion, not music", 1, &[])
+            .expect("reply should parse");
+
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].matched);
+    }
+
+    /// The reported rule verbatim: a menu of labels plus an action, answered
+    /// with the bare choice name the prompt itself taught the model to use.
+    #[test]
+    fn a_menu_of_labels_and_actions_is_answered_by_name() {
+        let menu = vec![
+            Choice::label("Label_1", "Needs Action"),
+            Choice::label("Label_2", "Cold Outreach"),
+            Choice::label("Label_3", "Financial"),
+            Choice::label("Label_4", "Education"),
+            Choice {
+                name: "TRASH".into(),
+                action: ParsedAction::Trash,
+            },
+        ];
+
+        let rows = parse_rows(
+            "1: \"Financial\" | Invoice for an existing subscription.\n\
+             2: TRASH | GitHub notification unrelated to tekniq.\n\
+             3: NO_MATCH | Personal note with no action requested.",
+            3,
+            &menu,
+        )
+        .expect("reply should parse");
+
+        assert_eq!(labels_of(&rows[0]), vec!["Label_3".to_string()]);
+        assert_eq!(rows[1].chosen, vec![ParsedAction::Trash]);
+        assert!(!rows[2].matched);
     }
 
     #[test]
-    fn garbled_line_is_ignored() {
-        let parsed = parse_batch("1: ARCHIVE\nbanana\n2: SPAM", 2);
-        assert_eq!(parsed[0].action, Some(ParsedAction::Archive));
-        assert_eq!(parsed[1].action, Some(ParsedAction::Spam));
+    fn prose_around_the_decisions_is_ignored() {
+        let rows = parse_rows(
+            "Here are my decisions:\n1: Invoices | a bill\n2: NO_MATCH | spam\nLet me know if you need more.",
+            2,
+            &menu(),
+        )
+        .expect("reply should parse");
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// A miscount cannot be resolved without trusting the model's own numbering,
+    /// which is exactly what would misassign a decision to the wrong email.
+    #[test]
+    fn a_miscounted_reply_is_refused_whole() {
+        let error = parse_rows("1: Invoices | a bill", 3, &menu()).expect_err("should refuse");
+
+        assert!(error.contains("3 emails"));
+        assert!(error.contains("found 1"));
     }
 
     #[test]
-    fn retains_each_email_explanation() {
-        let parsed = parse_batch(
-            "1: LABEL: Finance | The subject is an invoice from the bank.\n",
-            1,
-        );
+    fn a_single_email_answer_may_span_lines() {
+        let rows = parse_rows("MATCH\nLABELS: Invoices\nIt is a bill.", 1, &menu())
+            .expect("reply should parse");
 
-        assert_eq!(
-            parsed[0].action,
-            Some(ParsedAction::Label("Finance".into()))
-        );
-        assert_eq!(
-            parsed[0].llm_response,
-            "1: LABEL: Finance | The subject is an invoice from the bank."
-        );
+        assert_eq!(labels_of(&rows[0]), vec!["Label_1".to_string()]);
+        assert_eq!(rows[0].reason, "It is a bill.");
+    }
+
+    #[test]
+    fn a_single_email_answer_that_is_not_a_decision_is_refused() {
+        let error = parse_rows("I could not decide", 1, &menu()).expect_err("should refuse");
+
+        assert!(error.contains("choice or NO_MATCH"));
     }
 }

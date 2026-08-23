@@ -57,4 +57,12 @@ impl<'a> RuleMemoryRepository<'a> {
         )?;
         Ok(())
     }
+
+    pub fn delete(&self, rule_id: i64, id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM rule_memory WHERE id = ?1 AND rule_id = ?2",
+            params![id, rule_id],
+        )?;
+        Ok(())
+    }
 }

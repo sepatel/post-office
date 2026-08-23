@@ -94,6 +94,7 @@ JSON so the same endpoint can expose separate cheap and strong model entries:
     "quality_tier": "cheap",
     "privacy_status": "unknown",
     "timeout_secs": 30,
+    "context_window_tokens": 32768,
     "enabled": true
   }
 ]

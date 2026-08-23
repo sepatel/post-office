@@ -36,9 +36,9 @@ A Rust desktop application for applying AI filters over Gmail emails. Runs local
 |----------|----------|
 | Email content for LLM | Plain text if available, full HTML as fallback |
 | Rule evaluation | First-match-wins (lowest priority number wins) |
-| Prompt + structured actions | Hybrid token resolution: APPLY runs configured actions; explicit tokens override per email |
+| Prompt + structured actions | The model picks from the rule's `choices`; the chosen action runs alongside the rule's `actions` |
 | Processing scope | Configurable per-instance (default: `is:unread`) |
 | Inbox sync model | Target state is Gmail push notifications + `historyId` replay |
 | Starter prompt templates | Not for MVP |
-| Malformed LLM responses | Strict prompt format, skip email if invalid (no retry) |
+| Malformed LLM responses | Strict one-line-per-email contract; a reply that does not fit is re-asked one email at a time |
 | Frontend framework | React (largest ecosystem, Tauri first-class support, least maintenance) |

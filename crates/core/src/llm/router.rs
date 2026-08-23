@@ -9,6 +9,7 @@ use super::{LlmClient, LlmError, ProcessRequest, ProcessResponse};
 use crate::db::Database;
 
 const MAX_RETRIES_PER_PROVIDER: usize = 2;
+const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmProviderProfile {
@@ -28,6 +29,8 @@ pub struct LlmProviderProfile {
     pub output_cost_per_million_usd: f64,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: u32,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -67,6 +70,7 @@ pub struct InferenceRouter {
     providers: HashMap<String, ProviderClient>,
     policies: HashMap<String, LlmRoutingPolicy>,
     default_policy: String,
+    max_tokens: u32,
     database: Option<Database>,
 }
 
@@ -160,6 +164,7 @@ impl InferenceRouter {
             } else {
                 config.llm_default_policy.clone()
             },
+            max_tokens: config.llm_max_tokens,
             database: None,
         }
     }
@@ -272,6 +277,21 @@ impl InferenceRouter {
         ids
     }
 
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens
+    }
+
+    pub fn input_token_budget(&self, policy_id: &str) -> usize {
+        let policy = self.policy(policy_id);
+        let (candidates, _) = self.candidates(&policy);
+        let context_window = candidates
+            .into_iter()
+            .map(|provider| provider.profile.context_window_tokens as usize)
+            .min()
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS as usize);
+        context_window.saturating_sub(self.max_tokens as usize)
+    }
+
     fn policy(&self, policy_id: &str) -> LlmRoutingPolicy {
         self.policies
             .get(policy_id)
@@ -381,7 +401,7 @@ impl InferenceRouter {
 fn legacy_profile(config: &crate::config::AppConfig) -> LlmProviderProfile {
     LlmProviderProfile {
         id: "legacy".into(),
-        name: "Current LLM endpoint".into(),
+        name: config.llm_legacy_name.clone(),
         base_url: config.llm_base_url.clone(),
         model: config.llm_default_model.clone(),
         api_key_ref: "legacy".into(),
@@ -390,6 +410,7 @@ fn legacy_profile(config: &crate::config::AppConfig) -> LlmProviderProfile {
         input_cost_per_million_usd: config.llm_input_cost_per_million_usd,
         output_cost_per_million_usd: config.llm_output_cost_per_million_usd,
         timeout_secs: config.llm_timeout_secs,
+        context_window_tokens: config.llm_context_window_tokens,
         enabled: config.llm_legacy_enabled,
     }
 }
@@ -459,7 +480,7 @@ fn describe_error(error: &LlmError) -> String {
         LlmError::Api(async_openai::error::OpenAIError::Reqwest(error)) if error.is_connect() => {
             format!("could not connect: {error:#}")
         }
-        _ => error.to_string(),
+        _ => error.user_message(),
     }
 }
 
@@ -538,6 +559,10 @@ fn default_privacy_status() -> String {
 
 fn default_timeout_secs() -> u64 {
     30
+}
+
+fn default_context_window_tokens() -> u32 {
+    DEFAULT_CONTEXT_WINDOW_TOKENS
 }
 
 fn default_true() -> bool {

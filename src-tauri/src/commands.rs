@@ -3,18 +3,19 @@ use post_office_core::db::rule_chat::ChatMessageRow;
 use post_office_core::db::rules::{CreateRuleRequest, UpdateRuleRequest};
 use post_office_core::gmail::models::Label;
 use post_office_core::gmail::oauth::{auth_url, exchange_code, generate_pkce};
-use post_office_core::gmail::{store_tokens, GmailAuth, GmailClient};
+use post_office_core::gmail::{delete_tokens, store_tokens, GmailAuth, GmailClient};
 use post_office_core::llm::{InferenceRouter, LlmClient};
 use post_office_core::llm::{LlmProviderProfile, LlmRoutingPolicy};
 use post_office_core::processing::{
     mark_last_successful, run_backfill, run_processing_loop, OpProgress,
 };
-use post_office_core::rules::actions::execute_action;
+use post_office_core::rules::actions::execute_actions;
 use post_office_core::rules::chat::{apply_proposal, chat_with_rule, ChatProposal, ChatTurn};
-use post_office_core::rules::engine::{display_action, ActionDisplay, TestResult};
+use post_office_core::rules::engine::{
+    display_action, rules_after, ActionDisplay, FallthroughStep, Outcome, TestResult,
+};
 use post_office_core::rules::evaluation::BulkVerdict;
 use post_office_core::rules::models::{Action, Condition, Rule};
-use post_office_core::rules::response_parser::ParsedAction;
 use post_office_core::sync::{replay_history, start_watch, stop_watch, ReplayResult};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
@@ -31,37 +32,56 @@ use crate::sync_runtime::SyncTrigger;
 use crate::tray;
 use crate::AppState;
 
-pub fn ensure_polling_started(app: tauri::AppHandle, state: &AppState, config: &AppConfig) {
-    if state.poller_started.swap(true, Ordering::SeqCst) {
+pub fn ensure_polling_started(
+    app: tauri::AppHandle,
+    state: &AppState,
+    config: &AppConfig,
+    account_email: String,
+) {
+    if !state
+        .pollers_started
+        .lock()
+        .unwrap()
+        .insert(account_email.clone())
+    {
         return;
     }
 
     let db_clone = Arc::new(state.db.clone());
-    let state_clone = state.processing_state.clone();
+    let state_clone = state.processing_state_for(&account_email);
     let config_clone = state.config.clone();
     let config_for_auth = config.clone();
-    let poller_flag = state.poller_started.clone();
+    let pollers_started = state.pollers_started.clone();
     tauri::async_runtime::spawn(async move {
-        match load_gmail_auth(&app, &config_for_auth) {
+        match load_gmail_auth_for_account(&app, &config_for_auth, &account_email) {
             Ok(auth) => {
                 let gmail = GmailClient::new(auth);
                 let emit_handle = app.clone();
+                let progress_account = account_email.clone();
                 run_processing_loop(
                     db_clone,
                     state_clone,
                     gmail,
                     config_clone,
+                    account_email.clone(),
                     move |progress| {
-                        let _ = emit_handle.emit("cycle-progress", &progress);
+                        let _ = emit_handle.emit(
+                            "cycle-progress",
+                            AccountProgress {
+                                account_email: progress_account.clone(),
+                                progress,
+                            },
+                        );
                     },
                 )
                 .await;
             }
             Err(e) => {
                 tracing::warn!("Gmail processing loop not started: {}", e);
+                let _ = db_clone.with_accounts(|repo| repo.record_error(&account_email, &e));
             }
         }
-        poller_flag.store(false, Ordering::SeqCst);
+        pollers_started.lock().unwrap().remove(&account_email);
     });
 }
 
@@ -71,11 +91,19 @@ pub struct RuleCreateRequest {
     pub description: Option<String>,
     pub conditions: Vec<Condition>,
     pub prompt: String,
+    #[serde(default)]
+    pub choices: Vec<Action>,
+    #[serde(default)]
+    pub choose_from_all_labels: bool,
     pub actions: Vec<Action>,
     pub priority: i32,
     pub enabled: bool,
     #[serde(default = "default_policy")]
     pub inference_policy: String,
+    #[serde(default)]
+    pub continue_after_match: bool,
+    #[serde(default)]
+    pub source_rule_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,11 +112,19 @@ pub struct RuleUpdateRequest {
     pub description: Option<String>,
     pub conditions: Vec<Condition>,
     pub prompt: String,
+    #[serde(default)]
+    pub choices: Vec<Action>,
+    #[serde(default)]
+    pub choose_from_all_labels: bool,
     pub actions: Vec<Action>,
     pub priority: i32,
     pub enabled: bool,
     #[serde(default = "default_policy")]
     pub inference_policy: String,
+    #[serde(default)]
+    pub continue_after_match: bool,
+    #[serde(default)]
+    pub source_rule_id: Option<i64>,
 }
 
 fn default_policy() -> String {
@@ -113,11 +149,13 @@ pub struct ApplyResult {
 /// Build an in-memory `Rule` from a request payload for dry-run/apply testing.
 fn build_rule_model(rule: &RuleCreateRequest) -> Rule {
     Rule {
-        id: 0,
+        id: rule.source_rule_id.unwrap_or(0),
         name: rule.name.clone(),
         description: rule.description.clone(),
         conditions: rule.conditions.clone(),
         prompt: rule.prompt.clone(),
+        choices: rule.choices.clone(),
+        choose_from_all_labels: rule.choose_from_all_labels,
         actions: rule.actions.clone(),
         priority: rule.priority,
         enabled: rule.enabled,
@@ -127,6 +165,7 @@ fn build_rule_model(rule: &RuleCreateRequest) -> Rule {
         } else {
             rule.inference_policy.clone()
         },
+        continue_after_match: rule.continue_after_match,
     }
 }
 
@@ -164,7 +203,7 @@ fn normalize_rule_label_fields(
     }
 
     for action in actions.iter_mut() {
-        if let Action::Label { value } = action {
+        if let Action::Label { value } | Action::RemoveLabel { value } = action {
             *value = normalize_label_ref_or_error(value, labels, "action")?;
         }
     }
@@ -177,7 +216,7 @@ fn normalize_proposal_label_actions(
     labels: &[Label],
 ) -> Result<(), String> {
     for action in proposal.actions_add.iter_mut() {
-        if let Action::Label { value } = action {
+        if let Action::Label { value } | Action::RemoveLabel { value } = action {
             *value = normalize_label_ref_or_error(value, labels, "proposal action")?;
         }
     }
@@ -193,7 +232,7 @@ fn conditions_need_label_resolution(conditions: &[Condition]) -> bool {
 fn actions_need_label_resolution(actions: &[Action]) -> bool {
     actions
         .iter()
-        .any(|action| matches!(action, Action::Label { .. }))
+        .any(|action| matches!(action, Action::Label { .. } | Action::RemoveLabel { .. }))
 }
 
 fn extract_header(email: &post_office_core::gmail::models::Message, name: &str) -> Option<String> {
@@ -218,6 +257,13 @@ pub struct ProcessingStatus {
     pub current_progress: Option<OpProgress>,
     pub backfill_running: bool,
     pub backfill_cancel_requested: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct AccountProgress {
+    account_email: String,
+    #[serde(flatten)]
+    progress: OpProgress,
 }
 
 #[tauri::command]
@@ -259,6 +305,13 @@ pub async fn config_set(
                 .map_err(|e: std::num::ParseIntError| e.to_string())?;
             config.llm_timeout_secs = val;
         }
+        "llm.context_window_tokens" => {
+            let val: u32 = value
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
+            config.llm_context_window_tokens = val;
+        }
+        "llm.legacy_name" => config.llm_legacy_name = value,
         "llm.legacy_quality_tier" => config.llm_legacy_quality_tier = value,
         "llm.legacy_privacy_status" => config.llm_legacy_privacy_status = value,
         "llm.legacy_enabled" => {
@@ -343,9 +396,143 @@ pub async fn config_set(
         let _ = state.sync_trigger.send(SyncTrigger::Startup);
     }
     if start_poller {
-        ensure_polling_started(app, &state, &config_snapshot);
+        let accounts = state
+            .db
+            .with_accounts(|repo| repo.list())
+            .map_err(|e| e.to_string())?;
+        for account in accounts.into_iter().filter(|account| !account.paused) {
+            ensure_polling_started(app.clone(), &state, &config_snapshot, account.email);
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccountsState {
+    pub accounts: Vec<post_office_core::db::accounts::Account>,
+    pub active_email: Option<String>,
+}
+
+#[tauri::command]
+pub async fn accounts_list(state: State<'_, AppState>) -> Result<AccountsState, String> {
+    let active_email = state.config.lock().await.gmail_account.clone();
+    let accounts = state
+        .db
+        .with_accounts(|repo| repo.list())
+        .map_err(|error| error.to_string())?;
+    Ok(AccountsState {
+        accounts,
+        active_email,
+    })
+}
+
+#[tauri::command]
+pub async fn accounts_select(state: State<'_, AppState>, email: String) -> Result<(), String> {
+    let exists = state
+        .db
+        .with_accounts(|repo| repo.get(&email))
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !exists {
+        return Err("Account not found".into());
+    }
+
+    let mut config = state.config.lock().await;
+    config.gmail_account = Some(email);
+    state
+        .db
+        .with_config(|repo| config.save(&repo))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn accounts_set_paused(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    paused: bool,
+) -> Result<(), String> {
+    state
+        .db
+        .with_accounts(|repo| repo.set_paused(&email, paused))
+        .map_err(|error| error.to_string())?;
+    let processing_state = state.processing_state_for(&email);
+    processing_state
+        .lock()
+        .await
+        .paused
+        .store(paused, std::sync::atomic::Ordering::Relaxed);
+
+    let config = state.config.lock().await.clone();
+    if !paused && !config.sync_enabled {
+        ensure_polling_started(app, &state, &config, email);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn accounts_reorder(
+    state: State<'_, AppState>,
+    emails: Vec<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .with_accounts(|repo| repo.reorder(&emails))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn accounts_remove(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<(), String> {
+    let exists = state
+        .db
+        .with_accounts(|repo| repo.get(&email))
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !exists {
+        return Err("Account not found".into());
+    }
+
+    let processing_state = state.processing_state_for(&email);
+    {
+        let processing = processing_state.lock().await;
+        processing
+            .stop_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    while state.pollers_started.lock().unwrap().contains(&email) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let config = state.config.lock().await.clone();
+    if let Ok(auth) = load_gmail_auth_for_account(&app, &config, &email) {
+        let mut gmail = GmailClient::new(auth);
+        let _ = stop_watch(&Arc::new(state.db.clone()), &mut gmail, &email).await;
+    }
+
+    state
+        .db
+        .with_accounts(|repo| repo.delete_with_data(&email))
+        .map_err(|error| error.to_string())?;
+    delete_tokens(&email).map_err(|error| error.to_string())?;
+    state.remove_processing_state(&email);
+
+    let next_active = state
+        .db
+        .with_accounts(|repo| repo.list())
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .map(|account| account.email);
+    let mut config = state.config.lock().await;
+    config.gmail_account = next_active;
+    state
+        .db
+        .with_config(|repo| config.save(&repo))
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,6 +543,8 @@ pub struct LlmConfigUpdate {
     pub input_cost_per_million_usd: f64,
     pub output_cost_per_million_usd: f64,
     pub timeout_secs: u64,
+    pub context_window_tokens: u32,
+    pub legacy_name: String,
     pub legacy_quality_tier: String,
     pub legacy_privacy_status: String,
     pub legacy_enabled: bool,
@@ -376,6 +565,8 @@ pub async fn llm_config_set(
     config.llm_input_cost_per_million_usd = update.input_cost_per_million_usd;
     config.llm_output_cost_per_million_usd = update.output_cost_per_million_usd;
     config.llm_timeout_secs = update.timeout_secs;
+    config.llm_context_window_tokens = update.context_window_tokens;
+    config.llm_legacy_name = update.legacy_name;
     config.llm_legacy_quality_tier = update.legacy_quality_tier;
     config.llm_legacy_privacy_status = update.legacy_privacy_status;
     config.llm_legacy_enabled = update.legacy_enabled;
@@ -392,9 +583,10 @@ pub async fn llm_config_set(
 pub async fn rules_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<post_office_core::rules::models::Rule>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_rules(|repo| repo.list_all())
+        .with_rules(|repo| repo.list_all(&account_email))
         .map_err(|e| e.to_string())
 }
 
@@ -404,15 +596,11 @@ pub async fn rules_create(
     state: State<'_, AppState>,
     mut rule: RuleCreateRequest,
 ) -> Result<post_office_core::rules::models::Rule, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     if conditions_need_label_resolution(&rule.conditions)
         || actions_need_label_resolution(&rule.actions)
     {
-        let config = state.config.lock().await;
-        let auth = load_gmail_auth(&app, &config)?;
-        drop(config);
-
-        let mut gmail = GmailClient::new(auth);
-        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+        let labels = account_labels(&app, &state, &account_email).await?;
         normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
     }
 
@@ -421,6 +609,8 @@ pub async fn rules_create(
         description: rule.description,
         conditions: rule.conditions,
         prompt: rule.prompt,
+        choices: rule.choices,
+        choose_from_all_labels: rule.choose_from_all_labels,
         actions: rule.actions,
         priority: rule.priority,
         enabled: rule.enabled,
@@ -429,10 +619,11 @@ pub async fn rules_create(
         } else {
             rule.inference_policy
         },
+        continue_after_match: rule.continue_after_match,
     };
     state
         .db
-        .with_rules(|repo| repo.create(&create))
+        .with_rules(|repo| repo.create(&account_email, &create))
         .map_err(|e| e.to_string())
 }
 
@@ -443,15 +634,11 @@ pub async fn rules_update(
     id: i64,
     mut rule: RuleUpdateRequest,
 ) -> Result<post_office_core::rules::models::Rule, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     if conditions_need_label_resolution(&rule.conditions)
         || actions_need_label_resolution(&rule.actions)
     {
-        let config = state.config.lock().await;
-        let auth = load_gmail_auth(&app, &config)?;
-        drop(config);
-
-        let mut gmail = GmailClient::new(auth);
-        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+        let labels = account_labels(&app, &state, &account_email).await?;
         normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
     }
 
@@ -460,6 +647,8 @@ pub async fn rules_update(
         description: rule.description,
         conditions: rule.conditions,
         prompt: rule.prompt,
+        choices: rule.choices,
+        choose_from_all_labels: rule.choose_from_all_labels,
         actions: rule.actions,
         priority: rule.priority,
         enabled: rule.enabled,
@@ -468,18 +657,20 @@ pub async fn rules_update(
         } else {
             rule.inference_policy
         },
+        continue_after_match: rule.continue_after_match,
     };
     state
         .db
-        .with_rules(|repo| repo.update(id, &update))
+        .with_rules(|repo| repo.update(&account_email, id, &update))
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn rules_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_rules(|repo| repo.delete(id))
+        .with_rules(|repo| repo.delete(&account_email, id))
         .map_err(|e| e.to_string())
 }
 
@@ -488,9 +679,50 @@ pub async fn rule_chat_history(
     state: State<'_, AppState>,
     rule_id: i64,
 ) -> Result<Vec<ChatMessageRow>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    state
+        .db
+        .with_rules(|repo| repo.get_by_id(&account_email, rule_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Rule not found".to_string())?;
     state
         .db
         .with_rule_chat(|repo| repo.list(rule_id))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rule_memories_list(
+    state: State<'_, AppState>,
+    rule_id: i64,
+) -> Result<Vec<post_office_core::db::rule_memory::MemoryEntry>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    state
+        .db
+        .with_rules(|repo| repo.get_by_id(&account_email, rule_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Rule not found".to_string())?;
+    state
+        .db
+        .with_rule_memory(|repo| repo.list_for_rule(rule_id))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rule_memory_delete(
+    state: State<'_, AppState>,
+    rule_id: i64,
+    memory_id: i64,
+) -> Result<(), String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    state
+        .db
+        .with_rules(|repo| repo.get_by_id(&account_email, rule_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Rule not found".to_string())?;
+    state
+        .db
+        .with_rule_memory(|repo| repo.delete(rule_id, memory_id))
         .map_err(|e| e.to_string())
 }
 
@@ -500,12 +732,13 @@ pub async fn rule_chat_send(
     rule_id: i64,
     message: String,
 ) -> Result<ChatTurn, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     let llm = {
         let config = state.config.lock().await;
         InferenceRouter::from_config(&config).with_database(state.db.clone())
     };
 
-    chat_with_rule(&state.db, &llm, rule_id, &message)
+    chat_with_rule(&state.db, &llm, &account_email, rule_id, &message)
         .await
         .map_err(|e| e.to_string())
 }
@@ -517,17 +750,13 @@ pub async fn rule_apply_proposal(
     rule_id: i64,
     mut proposal: ChatProposal,
 ) -> Result<(), String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     if actions_need_label_resolution(&proposal.actions_add) {
-        let config = state.config.lock().await;
-        let auth = load_gmail_auth(&app, &config)?;
-        drop(config);
-
-        let mut gmail = GmailClient::new(auth);
-        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+        let labels = account_labels(&app, &state, &account_email).await?;
         normalize_proposal_label_actions(&mut proposal, &labels)?;
     }
 
-    apply_proposal(&state.db, rule_id, &proposal)
+    apply_proposal(&state.db, &account_email, rule_id, &proposal)
         .await
         .map_err(|e| e.to_string())
 }
@@ -570,18 +799,21 @@ pub async fn rules_test(
     mut rule: RuleCreateRequest,
     message_id: String,
 ) -> Result<TestResult, String> {
-    let (auth, llm) = {
+    let (account_email, auth, llm) = {
         let config = state.config.lock().await;
+        let account_email = active_account(&config)?;
         let auth = load_gmail_auth(&app, &config)?;
         let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
-        (auth, llm)
+        (account_email, auth, llm)
     };
 
     let mut gmail = GmailClient::new(auth);
+    let labels = post_office_core::gmail::cached_labels(&state.db, &mut gmail, &account_email)
+        .await
+        .map_err(|e| e.to_string())?;
     if conditions_need_label_resolution(&rule.conditions)
         || actions_need_label_resolution(&rule.actions)
     {
-        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
         normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
     }
 
@@ -592,15 +824,54 @@ pub async fn rules_test(
 
     let rule_model = build_rule_model(&rule);
 
-    let memories = state.db.with_rule_memory(|repo| {
-        repo.list_for_rule(rule_model.id)
-            .map(|rows| rows.into_iter().map(|e| e.text).collect::<Vec<String>>())
-            .unwrap_or_default()
-    });
+    let mut result = post_office_core::rules::engine::test_rule(
+        &llm,
+        &rule_model,
+        &email,
+        &rule_memories(&state, rule_model.id),
+        &labels,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
-    post_office_core::rules::engine::test_rule(&llm, &rule_model, &email, &memories)
-        .await
-        .map_err(|e| e.to_string())
+    // A decision rule that declines hands the email to the next rule, so the
+    // tester has to walk the same chain or it misrepresents what would happen.
+    if !result.matched && !result.indeterminate {
+        let rules = state
+            .db
+            .with_rules(|repo| repo.list_all(&account_email))
+            .unwrap_or_default();
+        for candidate in rules_after(&rules, rule_model.id, &email) {
+            let step = post_office_core::rules::engine::test_rule(
+                &llm,
+                candidate,
+                &email,
+                &rule_memories(&state, candidate.id),
+                &labels,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            // Mirror the pipeline: a match ends the chain unless the rule opts
+            // into continuing, and an unvalidated decision ends it outright.
+            let stop = step.indeterminate || (step.matched && !candidate.continue_after_match);
+            result
+                .fallthrough
+                .push(FallthroughStep::new(candidate, &step));
+            if stop {
+                break;
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn rule_memories(state: &AppState, rule_id: i64) -> Vec<String> {
+    state.db.with_rule_memory(|repo| {
+        repo.list_for_rule(rule_id)
+            .map(|rows| rows.into_iter().map(|entry| entry.text).collect())
+            .unwrap_or_default()
+    })
 }
 
 /// Evaluates a rule against many emails in one batched LLM pass (or locally for
@@ -613,18 +884,21 @@ pub async fn bulk_evaluate(
     mut rule: RuleCreateRequest,
     message_ids: Vec<String>,
 ) -> Result<Vec<BulkVerdict>, String> {
-    let (auth, llm) = {
+    let (account_email, auth, llm) = {
         let config = state.config.lock().await;
+        let account_email = active_account(&config)?;
         let auth = load_gmail_auth(&app, &config)?;
         let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
-        (auth, llm)
+        (account_email, auth, llm)
     };
 
     let mut gmail = GmailClient::new(auth);
+    let labels = post_office_core::gmail::cached_labels(&state.db, &mut gmail, &account_email)
+        .await
+        .map_err(|e| e.to_string())?;
     if conditions_need_label_resolution(&rule.conditions)
         || actions_need_label_resolution(&rule.actions)
     {
-        let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
         normalize_rule_label_fields(&mut rule.conditions, &mut rule.actions, &labels)?;
     }
 
@@ -637,9 +911,21 @@ pub async fn bulk_evaluate(
 
     let rule_model = build_rule_model(&rule);
 
-    post_office_core::rules::evaluation::bulk_evaluate(&llm, &rule_model, &emails)
-        .await
-        .map_err(|e| e.to_string())
+    let memories = state.db.with_rule_memory(|repo| {
+        repo.list_for_rule(rule_model.id)
+            .map(|rows| rows.into_iter().map(|entry| entry.text).collect::<Vec<_>>())
+            .unwrap_or_default()
+    });
+
+    post_office_core::rules::evaluation::bulk_evaluate(
+        &llm,
+        &rule_model,
+        &emails,
+        &memories,
+        &labels,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -649,15 +935,18 @@ pub async fn rules_apply(
     mut rule: RuleCreateRequest,
     message_id: String,
 ) -> Result<ApplyResult, String> {
-    let (auth, llm) = {
+    let (account_email, auth, llm) = {
         let config = state.config.lock().await;
+        let account_email = active_account(&config)?;
         let auth = load_gmail_auth(&app, &config)?;
         let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
-        (auth, llm)
+        (account_email, auth, llm)
     };
 
     let mut gmail = GmailClient::new(auth);
-    let labels = gmail.list_labels().await.map_err(|e| e.to_string())?;
+    let labels = post_office_core::gmail::cached_labels(&state.db, &mut gmail, &account_email)
+        .await
+        .map_err(|e| e.to_string())?;
     if conditions_need_label_resolution(&rule.conditions)
         || actions_need_label_resolution(&rule.actions)
     {
@@ -677,46 +966,52 @@ pub async fn rules_apply(
             .unwrap_or_default()
     });
 
-    let resolved =
-        post_office_core::rules::engine::resolve_rule(&llm, &rule_model, &email, &memories)
-            .await
-            .map_err(|e| e.to_string())?;
+    let resolved = post_office_core::rules::engine::resolve_rule(
+        &llm,
+        &rule_model,
+        &email,
+        &memories,
+        &labels,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
-    let resolved = match resolved {
-        None => {
+    match resolved.outcome {
+        Outcome::NoMatch => {
             return Ok(ApplyResult {
                 matched: false,
                 applied: vec![],
                 error: None,
             });
         }
-        Some(r) => r,
-    };
-
-    let mut outcomes: Vec<(&ParsedAction, Option<String>)> = Vec::new();
-    for action in &resolved.actions {
-        let error = execute_action(&mut gmail, &message_id, action, &labels)
-            .await
-            .err()
-            .map(|e| e.to_string());
-        outcomes.push((action, error));
+        Outcome::Unparsed => {
+            return Ok(ApplyResult {
+                matched: false,
+                applied: vec![],
+                error: Some(
+                    resolved
+                        .diagnostic
+                        .unwrap_or_else(|| "The LLM response could not be validated".into()),
+                ),
+            });
+        }
+        Outcome::Matched => {}
     }
 
-    let applied: Vec<ActionDisplay> = outcomes
-        .iter()
-        .filter(|(_, e)| e.is_none())
-        .map(|(a, _)| display_action(a))
-        .collect();
-    let errors: Vec<String> = outcomes.iter().filter_map(|(_, e)| e.clone()).collect();
+    let error = execute_actions(&mut gmail, &message_id, &resolved.actions, &labels)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let applied = if error.is_none() {
+        resolved.actions.iter().map(display_action).collect()
+    } else {
+        vec![]
+    };
 
     Ok(ApplyResult {
         matched: true,
         applied,
-        error: if errors.is_empty() {
-            None
-        } else {
-            Some(errors.join("; "))
-        },
+        error,
     })
 }
 
@@ -726,9 +1021,10 @@ pub async fn history_list(
     page: u32,
     per_page: u32,
 ) -> Result<Vec<post_office_core::db::history::HistoryEntry>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_history(|repo| repo.list(page, per_page))
+        .with_history(|repo| repo.list(&account_email, page, per_page))
         .map_err(|e| e.to_string())
 }
 
@@ -736,9 +1032,10 @@ pub async fn history_list(
 pub async fn rules_metrics(
     state: State<'_, AppState>,
 ) -> Result<Vec<post_office_core::db::history::RuleMetrics>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_history(|repo| repo.rules_metrics())
+        .with_history(|repo| repo.rules_metrics(&account_email))
         .map_err(|e| e.to_string())
 }
 
@@ -746,9 +1043,10 @@ pub async fn rules_metrics(
 pub async fn rule_roi_metrics(
     state: State<'_, AppState>,
 ) -> Result<Vec<post_office_core::db::llm_usage::RuleRoiMetrics>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_llm_usage(|repo| repo.rule_roi_metrics())
+        .with_llm_usage(|repo| repo.rule_roi_metrics(&account_email))
         .map_err(|e| e.to_string())
 }
 
@@ -757,9 +1055,10 @@ pub async fn history_search(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<post_office_core::db::history::HistoryEntry>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_history(|repo| repo.search(&query))
+        .with_history(|repo| repo.search(&account_email, &query))
         .map_err(|e| e.to_string())
 }
 
@@ -769,17 +1068,19 @@ pub async fn inference_jobs_list(
     page: u32,
     per_page: u32,
 ) -> Result<Vec<post_office_core::db::inference::InferenceJob>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_inference(|repo| repo.list(page, per_page))
+        .with_inference(|repo| repo.list(&account_email, page, per_page))
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn inference_job_retry(state: State<'_, AppState>, job_id: i64) -> Result<bool, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_inference(|repo| repo.retry(job_id))
+        .with_inference(|repo| repo.retry(&account_email, job_id))
         .map_err(|e| e.to_string())
 }
 
@@ -800,8 +1101,10 @@ pub async fn llm_provider_status_list(
 
 #[tauri::command]
 pub async fn processing_status(state: State<'_, AppState>) -> Result<ProcessingStatus, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     let polling_enabled = state.config.lock().await.polling_enabled;
-    let ps = state.processing_state.lock().await;
+    let processing_state = state.processing_state_for(&account_email);
+    let ps = processing_state.lock().await;
     Ok(ProcessingStatus {
         paused: ps.paused.load(std::sync::atomic::Ordering::Relaxed),
         polling_enabled,
@@ -823,15 +1126,35 @@ pub async fn processing_status(state: State<'_, AppState>) -> Result<ProcessingS
 
 #[tauri::command]
 pub async fn processing_pause(state: State<'_, AppState>) -> Result<(), String> {
-    let ps = state.processing_state.lock().await;
+    let account_email = active_account(&*state.config.lock().await)?;
+    state
+        .db
+        .with_accounts(|repo| repo.set_paused(&account_email, true))
+        .map_err(|e| e.to_string())?;
+    let processing_state = state.processing_state_for(&account_email);
+    let ps = processing_state.lock().await;
     ps.paused.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn processing_resume(state: State<'_, AppState>) -> Result<(), String> {
-    let ps = state.processing_state.lock().await;
+pub async fn processing_resume(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let config = state.config.lock().await.clone();
+    let account_email = active_account(&config)?;
+    state
+        .db
+        .with_accounts(|repo| repo.set_paused(&account_email, false))
+        .map_err(|e| e.to_string())?;
+    let processing_state = state.processing_state_for(&account_email);
+    let ps = processing_state.lock().await;
     ps.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+    drop(ps);
+    if !config.sync_enabled {
+        ensure_polling_started(app, &state, &config, account_email);
+    }
     Ok(())
 }
 
@@ -890,7 +1213,7 @@ pub async fn sync_replay_now(
     let mut gmail = GmailClient::new(auth);
 
     let db = Arc::new(state.db.clone());
-    let processing_state = state.processing_state.clone();
+    let processing_state = state.processing_state_for(&account_email);
 
     {
         let mut s = processing_state.lock().await;
@@ -923,7 +1246,7 @@ pub async fn sync_replay_now(
     .await
     {
         Ok(result) => {
-            mark_last_successful(&db, &processing_state, Utc::now()).await;
+            mark_last_successful(&db, &processing_state, &account_email, Utc::now()).await;
             {
                 let mut s = processing_state.lock().await;
                 s.current_progress = None;
@@ -1040,16 +1363,17 @@ pub async fn processing_backfill(
     let after_dt = parse_day(&after).map_err(|e| format!("Invalid 'after' date: {}", e))?;
     let before_dt = parse_day_end(&before).map_err(|e| format!("Invalid 'before' date: {}", e))?;
 
-    let (auth, llm) = {
+    let (account_email, auth, llm) = {
         let config = state.config.lock().await;
+        let account_email = active_account(&config)?;
         let auth = load_gmail_auth(&app, &config)?;
         let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
-        (auth, llm)
+        (account_email, auth, llm)
     };
 
     let mut gmail = GmailClient::new(auth);
     let db = Arc::new(state.db.clone());
-    let state_clone = state.processing_state.clone();
+    let state_clone = state.processing_state_for(&account_email);
     let config = state.config.lock().await.clone();
 
     let cancel_flag = {
@@ -1064,6 +1388,7 @@ pub async fn processing_backfill(
 
     let run_result = run_backfill(
         &db,
+        &account_email,
         &state_clone,
         &mut gmail,
         &llm,
@@ -1147,7 +1472,9 @@ pub struct BackfillResult {
 
 #[tauri::command]
 pub async fn processing_backfill_stop(state: State<'_, AppState>) -> Result<bool, String> {
-    let ps = state.processing_state.lock().await;
+    let account_email = active_account(&*state.config.lock().await)?;
+    let processing_state = state.processing_state_for(&account_email);
+    let ps = processing_state.lock().await;
     let running = ps
         .backfill_running
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1200,47 +1527,43 @@ pub async fn llm_test(
         Err(e) => Ok(LlmTestResult {
             ok: false,
             model: String::new(),
-            error: Some(e.to_string()),
+            error: Some(e.user_message()),
         }),
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LlmProviderTestProfile {
+    pub id: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_ref: String,
+    pub timeout_secs: u64,
+}
+
 #[tauri::command]
 pub async fn llm_provider_test(
-    state: State<'_, AppState>,
-    provider_id: String,
+    provider: LlmProviderTestProfile,
+    api_key: Option<String>,
 ) -> Result<LlmTestResult, String> {
-    let config = state.config.lock().await.clone();
-    let (base_url, api_key, model, timeout_secs) = if provider_id == "legacy" {
-        (
-            config.llm_base_url,
-            config.llm_api_key,
-            config.llm_default_model,
-            config.llm_timeout_secs,
-        )
+    let api_key = if let Some(api_key) = api_key {
+        api_key
     } else {
-        let provider = config
-            .llm_providers
-            .iter()
-            .find(|profile| profile.id == provider_id)
-            .ok_or_else(|| format!("Provider not found: {provider_id}"))?;
         let key_ref = if provider.api_key_ref.trim().is_empty() {
             &provider.id
         } else {
             &provider.api_key_ref
         };
-        let api_key =
-            post_office_core::llm::credentials::load_provider_api_key(key_ref)?.unwrap_or_default();
-        (
-            provider.base_url.clone(),
-            api_key,
-            provider.model.clone(),
-            provider.timeout_secs,
-        )
+        post_office_core::llm::credentials::load_provider_api_key(key_ref)?.unwrap_or_default()
     };
 
-    let client =
-        LlmClient::with_options(&base_url, &api_key, &model, timeout_secs, Some(provider_id));
+    let client = LlmClient::with_options(
+        &provider.base_url,
+        &api_key,
+        &provider.model,
+        provider.timeout_secs,
+        Some(provider.id),
+    );
     match client.test_connection().await {
         Ok(response) => Ok(LlmTestResult {
             ok: true,
@@ -1250,7 +1573,7 @@ pub async fn llm_provider_test(
         Err(error) => Ok(LlmTestResult {
             ok: false,
             model: String::new(),
-            error: Some(error.to_string()),
+            error: Some(error.user_message()),
         }),
     }
 }
@@ -1343,15 +1666,46 @@ pub fn resolve_client_secret(app: &tauri::AppHandle) -> Option<String> {
 /// empty unless the user overrode it. `GmailAuth::load` rejects an empty
 /// client_id, so using the raw config value here previously reported a working
 /// connection as unauthenticated.
-pub fn load_gmail_auth(app: &tauri::AppHandle, config: &AppConfig) -> Result<GmailAuth, String> {
-    let account = config
+fn active_account(config: &AppConfig) -> Result<String, String> {
+    config
         .gmail_account
-        .as_ref()
-        .ok_or("No Gmail account configured")?;
+        .as_deref()
+        .filter(|account| !account.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "No Gmail account selected".to_string())
+}
+
+pub fn load_gmail_auth_for_account(
+    app: &tauri::AppHandle,
+    config: &AppConfig,
+    account: &str,
+) -> Result<GmailAuth, String> {
     let client_id = resolve_client_id(app, config)?;
     let secret = resolve_client_secret(app);
     GmailAuth::load(account, &client_id, secret.as_deref())
         .ok_or_else(|| "Gmail not authenticated".to_string())
+}
+
+pub fn load_gmail_auth(app: &tauri::AppHandle, config: &AppConfig) -> Result<GmailAuth, String> {
+    let account = active_account(config)?;
+    load_gmail_auth_for_account(app, config, &account)
+}
+
+/// Cached labels for the active account, for the commands that need labels but
+/// no other Gmail call.
+async fn account_labels(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    account_email: &str,
+) -> Result<Vec<Label>, String> {
+    let config = state.config.lock().await;
+    let auth = load_gmail_auth(app, &config)?;
+    drop(config);
+
+    let mut gmail = GmailClient::new(auth);
+    post_office_core::gmail::cached_labels(&state.db, &mut gmail, account_email)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1404,6 +1758,11 @@ pub async fn gmail_authenticate(
     store_tokens(&profile.email_address, &access_token, &refresh_token)
         .map_err(|e| format!("Failed to store tokens: {}", e))?;
 
+    state
+        .db
+        .with_accounts(|repo| repo.add(&profile.email_address))
+        .map_err(|e| e.to_string())?;
+
     let sync_enabled = {
         let mut config = state.config.lock().await;
         config.gmail_account = Some(profile.email_address.clone());
@@ -1416,7 +1775,7 @@ pub async fn gmail_authenticate(
 
     if !sync_enabled {
         let cfg = state.config.lock().await.clone();
-        ensure_polling_started(app.clone(), &state, &cfg);
+        ensure_polling_started(app.clone(), &state, &cfg, profile.email_address.clone());
     }
 
     let _ = state.sync_trigger.send(SyncTrigger::Startup);
@@ -1493,11 +1852,20 @@ pub async fn gmail_get_profile(
 pub async fn gmail_list_labels(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<Vec<post_office_core::gmail::models::Label>, String> {
+    refresh: Option<bool>,
+) -> Result<Vec<Label>, String> {
     let config = state.config.lock().await;
+    let account_email = active_account(&config)?;
     let auth = load_gmail_auth(&app, &config)?;
+    drop(config);
+
     let mut gmail = GmailClient::new(auth);
-    gmail.list_labels().await.map_err(|e| e.to_string())
+    let labels = if refresh.unwrap_or(false) {
+        post_office_core::gmail::refresh_labels(&state.db, &mut gmail, &account_email).await
+    } else {
+        post_office_core::gmail::cached_labels(&state.db, &mut gmail, &account_email).await
+    };
+    labels.map_err(|e| e.to_string())
 }
 
 /// Reports the *verified* Gmail connection state: it loads the stored tokens and
@@ -1508,7 +1876,19 @@ pub async fn gmail_connection_status(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<post_office_core::gmail::models::GmailConnection, String> {
-    let config = state.config.lock().await;
+    let config = state.config.lock().await.clone();
+    let account_email = match active_account(&config) {
+        Ok(account_email) => account_email,
+        Err(_) => {
+            return Ok(post_office_core::gmail::models::GmailConnection {
+                connected: false,
+                email: None,
+                messages_total: None,
+                threads_total: None,
+                error: None,
+            });
+        }
+    };
     if config.gmail_account.is_none() {
         return Ok(post_office_core::gmail::models::GmailConnection {
             connected: false,
@@ -1519,9 +1899,12 @@ pub async fn gmail_connection_status(
         });
     }
 
-    let auth = match load_gmail_auth(&app, &config) {
+    let auth = match load_gmail_auth_for_account(&app, &config, &account_email) {
         Ok(auth) => auth,
         Err(e) => {
+            let _ = state
+                .db
+                .with_accounts(|repo| repo.record_error(&account_email, &e));
             return Ok(post_office_core::gmail::models::GmailConnection {
                 connected: false,
                 email: None,
@@ -1534,23 +1917,34 @@ pub async fn gmail_connection_status(
 
     let mut gmail = GmailClient::new(auth);
     match gmail.get_profile().await {
-        Ok(profile) => Ok(post_office_core::gmail::models::GmailConnection {
-            connected: true,
-            email: Some(profile.email_address),
-            messages_total: Some(profile.messages_total),
-            threads_total: Some(profile.threads_total),
-            error: None,
-        }),
-        Err(e) => Ok(post_office_core::gmail::models::GmailConnection {
-            connected: true,
-            email: None,
-            messages_total: None,
-            threads_total: None,
-            error: Some(format!(
+        Ok(profile) => {
+            let _ = state
+                .db
+                .with_accounts(|repo| repo.record_success(&account_email));
+            Ok(post_office_core::gmail::models::GmailConnection {
+                connected: true,
+                email: Some(profile.email_address),
+                messages_total: Some(profile.messages_total),
+                threads_total: Some(profile.threads_total),
+                error: None,
+            })
+        }
+        Err(e) => {
+            let error = format!(
                 "Gmail auth is no longer valid (token may be expired or revoked). Reconnect to fix: {}",
                 e
-            )),
-        }),
+            );
+            let _ = state
+                .db
+                .with_accounts(|repo| repo.record_error(&account_email, &error));
+            Ok(post_office_core::gmail::models::GmailConnection {
+                connected: true,
+                email: None,
+                messages_total: None,
+                threads_total: None,
+                error: Some(error),
+            })
+        }
     }
 }
 
@@ -1559,9 +1953,10 @@ pub async fn history_by_email(
     state: State<'_, AppState>,
     email_id: String,
 ) -> Result<Vec<post_office_core::db::history::HistoryEntry>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_history(|repo| repo.by_email(&email_id))
+        .with_history(|repo| repo.by_email(&account_email, &email_id))
         .map_err(|e| e.to_string())
 }
 

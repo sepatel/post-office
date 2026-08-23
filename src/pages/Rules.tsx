@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
+  configGet,
+  policyDisplayName,
   rulesList,
   ruleMetrics,
   ruleRoiMetrics,
+  type LlmRoutingPolicy,
   type RuleMetrics,
   type RuleRoiMetrics,
 } from "../lib/tauri";
@@ -14,10 +17,15 @@ interface Rule {
   description: string | null;
   priority: number;
   enabled: boolean;
+  inference_policy: string;
+}
+
+interface RuleListItem extends Rule {
+  policy_name: string;
 }
 
 export default function Rules() {
-  const [rules, setRules] = useState<Rule[]>([]);
+  const [rules, setRules] = useState<RuleListItem[]>([]);
   const [metricsByRule, setMetricsByRule] = useState<Record<number, RuleMetrics>>(
     {},
   );
@@ -30,12 +38,21 @@ export default function Rules() {
 
   async function loadRules() {
     try {
-      const [r, m, roi] = await Promise.all([
+      const [r, m, roi, config] = await Promise.all([
         rulesList() as Promise<Rule[]>,
         ruleMetrics(),
         ruleRoiMetrics(),
+        configGet() as Promise<{ llm_routing_policies: LlmRoutingPolicy[] }>,
       ]);
-      setRules(r);
+      setRules(
+        r.map((rule) => ({
+          ...rule,
+          policy_name: policyDisplayName(
+            rule.inference_policy,
+            config.llm_routing_policies ?? [],
+          ),
+        })),
+      );
       setMetricsByRule(
         m.reduce<Record<number, RuleMetrics>>((acc, metric) => {
           acc[metric.rule_id] = metric;
@@ -84,7 +101,7 @@ export default function Rules() {
             className="bg-white dark:bg-gray-800 rounded-lg p-4 border border-gray-200 dark:border-gray-700 flex justify-between items-center cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors"
           >
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <span
                   className={`w-2 h-2 rounded-full ${
                     rule.enabled ? "bg-green-500" : "bg-gray-400"
@@ -93,6 +110,9 @@ export default function Rules() {
                 <span className="font-medium">{rule.name}</span>
                 <span className="text-xs text-gray-400 dark:text-gray-500">
                   Priority: {rule.priority}
+                </span>
+                <span className="rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">
+                  Policy: {rule.policy_name}
                 </span>
               </div>
               <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">

@@ -115,11 +115,22 @@ pub async fn replay_history(
     let processed_messages = if ids.is_empty() {
         0
     } else {
-        run_for_message_ids(db, state, gmail, llm, config, &ids, on_progress).await?
+        run_for_message_ids(
+            db,
+            account_email,
+            state,
+            gmail,
+            llm,
+            config,
+            &ids,
+            on_progress,
+        )
+        .await?
     };
 
     if let Err(error) =
-        process_pending_inference_jobs(db, state, gmail, llm, config, on_progress).await
+        process_pending_inference_jobs(db, account_email, state, gmail, llm, config, on_progress)
+            .await
     {
         tracing::warn!(
             "Queued inference worker failed during sync replay: {}",

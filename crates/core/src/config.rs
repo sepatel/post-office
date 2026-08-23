@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
     pub llm_timeout_secs: u64,
+    pub llm_context_window_tokens: u32,
+    pub llm_legacy_name: String,
     pub llm_legacy_quality_tier: String,
     pub llm_legacy_privacy_status: String,
     pub llm_legacy_enabled: bool,
@@ -46,6 +48,8 @@ impl Default for AppConfig {
             llm_temperature: 0.3,
             llm_max_tokens: 1024,
             llm_timeout_secs: 30,
+            llm_context_window_tokens: 8_192,
+            llm_legacy_name: "Current endpoint".into(),
             llm_legacy_quality_tier: "balanced".into(),
             llm_legacy_privacy_status: "unknown".into(),
             llm_legacy_enabled: true,
@@ -80,7 +84,11 @@ impl AppConfig {
         };
 
         Self {
-            gmail_account: repo.get("gmail.account").ok().flatten(),
+            gmail_account: repo
+                .get("gmail.account")
+                .ok()
+                .flatten()
+                .filter(|account| !account.trim().is_empty()),
             google_client_id: get("google.client_id", ""),
             llm_base_url: get("llm.base_url", &Self::default().llm_base_url),
             llm_api_key: get("llm.api_key", &Self::default().llm_api_key),
@@ -88,6 +96,10 @@ impl AppConfig {
             llm_temperature: get("llm.temperature", "0.3").parse().unwrap_or(0.3),
             llm_max_tokens: get("llm.max_tokens", "1024").parse().unwrap_or(1024),
             llm_timeout_secs: get("llm.timeout_secs", "30").parse().unwrap_or(30),
+            llm_context_window_tokens: get("llm.context_window_tokens", "8192")
+                .parse()
+                .unwrap_or(8_192),
+            llm_legacy_name: get("llm.legacy_name", "Current endpoint"),
             llm_legacy_quality_tier: get("llm.legacy_quality_tier", "balanced"),
             llm_legacy_privacy_status: get("llm.legacy_privacy_status", "unknown"),
             llm_legacy_enabled: get("llm.legacy_enabled", "true").parse().unwrap_or(true),
@@ -120,9 +132,7 @@ impl AppConfig {
     pub fn save(&self, repo: &ConfigRepository) -> rusqlite::Result<()> {
         let set = |key: &str, value: &str| -> rusqlite::Result<()> { repo.set(key, value) };
 
-        if let Some(ref account) = self.gmail_account {
-            set("gmail.account", account)?;
-        }
+        set("gmail.account", self.gmail_account.as_deref().unwrap_or(""))?;
         set("google.client_id", &self.google_client_id)?;
         set("llm.base_url", &self.llm_base_url)?;
         set("llm.api_key", &self.llm_api_key)?;
@@ -130,6 +140,11 @@ impl AppConfig {
         set("llm.temperature", &self.llm_temperature.to_string())?;
         set("llm.max_tokens", &self.llm_max_tokens.to_string())?;
         set("llm.timeout_secs", &self.llm_timeout_secs.to_string())?;
+        set(
+            "llm.context_window_tokens",
+            &self.llm_context_window_tokens.to_string(),
+        )?;
+        set("llm.legacy_name", &self.llm_legacy_name)?;
         set("llm.legacy_quality_tier", &self.llm_legacy_quality_tier)?;
         set("llm.legacy_privacy_status", &self.llm_legacy_privacy_status)?;
         set("llm.legacy_enabled", &self.llm_legacy_enabled.to_string())?;
@@ -206,6 +221,7 @@ mod tests {
                 input_cost_per_million_usd: 1.0,
                 output_cost_per_million_usd: 2.0,
                 timeout_secs: 45,
+                context_window_tokens: 8_192,
                 enabled: true,
             }],
             llm_routing_policies: vec![LlmRoutingPolicy {
@@ -218,6 +234,7 @@ mod tests {
             }],
             llm_default_policy: "travel".into(),
             llm_timeout_secs: 45,
+            llm_legacy_name: "Local agent".into(),
             llm_legacy_quality_tier: "strong".into(),
             llm_legacy_privacy_status: "local".into(),
             llm_legacy_enabled: true,
@@ -229,6 +246,7 @@ mod tests {
 
         assert_eq!(loaded.llm_default_policy, "travel");
         assert_eq!(loaded.llm_timeout_secs, 45);
+        assert_eq!(loaded.llm_legacy_name, "Local agent");
         assert_eq!(loaded.llm_legacy_quality_tier, "strong");
         assert_eq!(loaded.llm_legacy_privacy_status, "local");
         assert_eq!(loaded.llm_providers[0].model, "example/cheap");

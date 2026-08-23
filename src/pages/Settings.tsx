@@ -3,9 +3,10 @@ import type { ReactNode } from "react";
 import {
   configGet,
   configSet,
+  accountsRemove,
+  accountsReorder,
+  accountsSetPaused,
   gmailAuthenticate,
-  gmailConnectionStatus,
-  type GmailConnection,
 } from "../lib/tauri";
 import { useGate } from "../lib/gate";
 import { useToast } from "../lib/toast";
@@ -26,7 +27,7 @@ interface Config extends InferenceConfig {
 type SettingsTab = "inference" | "mailbox";
 
 export default function Settings() {
-  const { connection, setConnection } = useGate();
+  const { connection, accounts, activeEmail, refreshAccounts } = useGate();
   const toast = useToast();
   const [config, setConfig] = useState<Config | null>(null);
   const [tab, setTab] = useState<SettingsTab>("inference");
@@ -41,17 +42,9 @@ export default function Settings() {
     try {
       const next = (await configGet()) as Config;
       setConfig(next);
-      await reloadConnection();
+      await refreshAccounts();
     } catch (error) {
       console.error("Failed to load config:", error);
-    }
-  }
-
-  async function reloadConnection() {
-    try {
-      setConnection((await gmailConnectionStatus()) as GmailConnection);
-    } catch {
-      // Keep the last known connection state visible.
     }
   }
 
@@ -72,8 +65,8 @@ export default function Settings() {
     setConnectError(null);
     try {
       const email = (await gmailAuthenticate()) as string;
-      await reloadConnection();
-      toast.success(`Connected to ${email}`);
+      await refreshAccounts();
+      toast.success(`Connected ${email}`);
       await loadConfig();
     } catch (error) {
       const message = typeof error === "string" ? error : String(error);
@@ -85,18 +78,41 @@ export default function Settings() {
   }
 
   async function disconnectGmail() {
+    if (!activeEmail) return;
+    if (!confirm(`Remove ${activeEmail}? Its local rules, history, and saved Gmail credentials will be deleted.`)) return;
+    await removeAccount(activeEmail);
+  }
+
+  async function removeAccount(email: string) {
     try {
-      await configSet("gmail.account", "");
-      setConnection({
-        connected: false,
-        email: null,
-        messagesTotal: null,
-        threadsTotal: null,
-        error: null,
-      });
+      await accountsRemove(email);
+      await refreshAccounts();
+      toast.success(`Removed ${email}`);
       await loadConfig();
     } catch (error) {
       toast.error(`Could not disconnect Gmail: ${String(error)}`);
+    }
+  }
+
+  async function toggleAccountPause(email: string, paused: boolean) {
+    try {
+      await accountsSetPaused(email, !paused);
+      await refreshAccounts();
+    } catch (error) {
+      toast.error(`Could not update account: ${String(error)}`);
+    }
+  }
+
+  async function moveAccount(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= accounts.length) return;
+    const ordered = accounts.map((account) => account.email);
+    [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+    try {
+      await accountsReorder(ordered);
+      await refreshAccounts();
+    } catch (error) {
+      toast.error(`Could not reorder accounts: ${String(error)}`);
     }
   }
 
@@ -105,7 +121,7 @@ export default function Settings() {
   }
 
   const needsReconnect = Boolean(connection?.connected && connection?.error);
-  const showConnectButton = !connection?.connected || needsReconnect;
+  const showConnectButton = true;
 
   return (
     <div className="max-w-6xl">
@@ -164,26 +180,80 @@ export default function Settings() {
                     disabled={connecting}
                     className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
                   >
-                    {connecting
-                      ? "Waiting for browser…"
-                      : needsReconnect
-                        ? "Reconnect Gmail"
-                        : "Connect Gmail"}
+                    {connecting ? "Waiting for browser…" : needsReconnect ? "Reconnect Gmail" : "Add Gmail account"}
                   </button>
                 )}
-                {connection?.connected && (
+                  {activeEmail && (
                   <button
                     type="button"
                     onClick={disconnectGmail}
                     className="rounded-lg px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-950/30"
                   >
-                    Disconnect
+                    Remove account
                   </button>
                 )}
               </div>
               {connectError && (
                 <p className="mt-3 text-sm text-red-600 dark:text-red-400">{connectError}</p>
               )}
+            </div>
+          </section>
+
+          <section>
+            <SectionHeading eyebrow="Accounts" title="Connected Gmail accounts" />
+            <div className="overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm dark:border-gray-700 dark:bg-gray-800">
+              {accounts.length === 0 && (
+                <div className="p-5 text-sm text-gray-500 dark:text-gray-400">No Gmail accounts connected.</div>
+              )}
+              {accounts.map((account, index) => (
+                <div key={account.email} className="flex flex-wrap items-center gap-3 border-b border-gray-200 p-4 last:border-0 dark:border-gray-700">
+                  <span className={`h-2.5 w-2.5 rounded-full ${account.status === "healthy" ? "bg-emerald-500" : account.status === "paused" ? "bg-gray-400" : "bg-red-500"}`} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium text-gray-900 dark:text-gray-100">
+                      {account.email}{account.email === activeEmail ? " (active)" : ""}
+                    </div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400">
+                      {account.status === "paused" ? "Paused" : account.last_error ?? "Healthy"}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void toggleAccountPause(account.email, account.paused)}
+                    className="rounded-lg px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-700"
+                  >
+                    {account.paused ? "Resume" : "Pause"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void moveAccount(index, -1)}
+                    disabled={index === 0}
+                    className="rounded-lg px-2 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-40 dark:text-gray-200 dark:hover:bg-gray-700"
+                    aria-label={`Move ${account.email} earlier`}
+                  >
+                    Up
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void moveAccount(index, 1)}
+                    disabled={index === accounts.length - 1}
+                    className="rounded-lg px-2 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-40 dark:text-gray-200 dark:hover:bg-gray-700"
+                    aria-label={`Move ${account.email} later`}
+                  >
+                    Down
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (confirm(`Remove ${account.email}? Its local rules, history, and saved Gmail credentials will be deleted.`)) {
+                        void removeAccount(account.email);
+                      }
+                    }}
+                    className="rounded-lg px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-950/30"
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
             </div>
           </section>
 

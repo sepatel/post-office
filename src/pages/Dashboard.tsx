@@ -4,6 +4,8 @@ import {
   onBackfillProgress,
   onCycleProgress,
   onSyncProgress,
+  configGet,
+  policyDisplayName,
   processingStatus,
   processingBackfill,
   processingBackfillStop,
@@ -14,10 +16,12 @@ import {
   type BackfillResult,
   type HistoryEntry,
   type OpProgress,
+  type LlmRoutingPolicy,
   type RuleMetrics,
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import DatePicker from "../components/DatePicker";
+import { useGate } from "../lib/gate";
 
 interface ProcessingStatus {
   paused: boolean;
@@ -55,11 +59,13 @@ interface Rule {
   id: number;
   name: string;
   enabled: boolean;
+  inference_policy: string;
 }
 
 interface RulePerformance {
   ruleId: number;
   name: string;
+  policyName: string;
   checked24h: number;
   succeeded24h: number;
   successRate: number;
@@ -253,7 +259,7 @@ function EntryModal({
             {entry.llm_response && (
               <div className="mb-2">
                 <div className="text-xs uppercase tracking-wide text-gray-400 mb-1">
-                  LLM reasoning
+                  LLM response
                 </div>
                 <pre className="whitespace-pre-wrap text-xs bg-gray-50 dark:bg-gray-900 rounded p-3 overflow-auto max-h-48">
                   {entry.llm_response}
@@ -273,6 +279,7 @@ function EntryModal({
 }
 
 export default function Dashboard() {
+  const { activeEmail } = useGate();
   const navigate = useNavigate();
   const [status, setStatus] = useState<ProcessingStatus | null>(null);
   const [activity, setActivity] = useState<HistoryEntry[]>([]);
@@ -294,6 +301,7 @@ export default function Dashboard() {
 
     const unlisteners = Promise.all([
       onCycleProgress((p) => {
+        if (p.account_email && p.account_email !== activeEmail) return;
         setLiveProgress(isActiveProgress(p) ? p : null);
         if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
           window.setTimeout(() => {
@@ -309,6 +317,7 @@ export default function Dashboard() {
         }
       }),
       onBackfillProgress((p) => {
+        if (p.account_email && p.account_email !== activeEmail) return;
         setLiveProgress(isActiveProgress(p) ? p : null);
         if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
           window.setTimeout(() => {
@@ -324,6 +333,7 @@ export default function Dashboard() {
         }
       }),
       onSyncProgress((p) => {
+        if (p.account_email && p.account_email !== activeEmail) return;
         setLiveProgress(isActiveProgress(p) ? p : null);
         if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
           window.setTimeout(() => {
@@ -348,7 +358,7 @@ export default function Dashboard() {
         c();
       });
     };
-  }, []);
+  }, [activeEmail]);
 
   async function loadStatus() {
     try {
@@ -375,9 +385,10 @@ export default function Dashboard() {
 
   async function loadRulePerformance() {
     try {
-      const [rules, metrics] = await Promise.all([
+      const [rules, metrics, config] = await Promise.all([
         rulesList() as Promise<Rule[]>,
         ruleMetrics(),
+        configGet() as Promise<{ llm_routing_policies: LlmRoutingPolicy[] }>,
       ]);
 
       const metricsByRule = metrics.reduce<Record<number, RuleMetrics>>(
@@ -399,6 +410,10 @@ export default function Dashboard() {
           return {
             ruleId: rule.id,
             name: rule.name,
+            policyName: policyDisplayName(
+              rule.inference_policy,
+              config.llm_routing_policies ?? [],
+            ),
             checked24h,
             succeeded24h,
             successRate,
@@ -509,6 +524,9 @@ export default function Dashboard() {
                     </svg>
                   </div>
                 </div>
+                <div className="mt-1 truncate text-xs font-medium text-blue-700 dark:text-blue-300">
+                  Policy: {rule.policyName}
+                </div>
                 <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
                   {rule.checked24h} checked • {rule.succeeded24h} success
                 </div>
@@ -541,13 +559,14 @@ export default function Dashboard() {
               No emails processed yet
             </div>
           ) : (
-            <table className="w-full min-w-[64rem] table-fixed text-sm">
+            <table className="w-full min-w-[78rem] table-fixed text-sm">
               <colgroup>
                 <col className="w-[2.5rem]" />
                 <col className="w-[10rem]" />
                 <col className="w-[14rem]" />
                 <col />
-                <col className="w-[9rem]" />
+                <col className="w-[12rem]" />
+                <col className="w-[14rem]" />
               </colgroup>
               <thead>
                 <tr className="border-b border-gray-200 dark:border-gray-700 text-left text-gray-500 dark:text-gray-400">
@@ -557,7 +576,8 @@ export default function Dashboard() {
                   <th className="px-4 py-2 sticky top-0 z-10 bg-white dark:bg-gray-800 whitespace-nowrap">Time</th>
                   <th className="px-4 py-2 sticky top-0 z-10 bg-white dark:bg-gray-800">From</th>
                   <th className="px-4 py-2 sticky top-0 z-10 bg-white dark:bg-gray-800 min-w-[20rem]">Subject</th>
-                  <th className="px-4 py-2 sticky top-0 z-10 bg-white dark:bg-gray-800 whitespace-nowrap">Action</th>
+                  <th className="px-4 py-2 sticky top-0 z-10 bg-white dark:bg-gray-800">Rule</th>
+                  <th className="px-4 py-2 sticky top-0 z-10 bg-white dark:bg-gray-800">Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -578,6 +598,7 @@ export default function Dashboard() {
                     <td className="px-4 py-2 truncate min-w-[20rem]" title={activeLiveProgress.current_email_subject || "-"}>
                       {activeLiveProgress.current_email_subject || "-"}
                     </td>
+                    <td className="px-4 py-2 text-gray-400 dark:text-gray-500">-</td>
                     <td className="px-4 py-2 truncate" title={activeLiveProgress.detail || "Running"}>
                       Working ({activeLiveProgress.source} / {activeLiveProgress.phase})
                     </td>
@@ -603,6 +624,9 @@ export default function Dashboard() {
                     </td>
                     <td className="px-4 py-2 truncate min-w-[20rem]" title={entry.email_subject || "-"}>
                       {entry.email_subject || "-"}
+                    </td>
+                    <td className="px-4 py-2 truncate" title={entry.rule_name || "-"}>
+                      {entry.rule_name || "-"}
                     </td>
                     <td className="px-4 py-2 truncate" title={entry.action}>
                       {entry.action}

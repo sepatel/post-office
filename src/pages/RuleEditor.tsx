@@ -14,9 +14,12 @@ import {
   bulkEvaluate,
   configGet,
   gmailListLabels,
+  ruleMemoriesList,
+  ruleMemoryDelete,
   type ChatProposal,
   type GmailLabel,
   type MemoryInput,
+  type MemoryEntry,
   type RecentMessage,
   type RuleMetrics,
   type RuleRoiMetrics,
@@ -27,16 +30,15 @@ import {
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import RuleChatPanel from "../components/RuleChatPanel";
-
-interface Condition {
-  type: string;
-  operator?: string;
-  value?: string;
-  [key: string]: unknown;
-}
+import ConditionBuilder, {
+  Condition,
+  normalizeConditionLabelIds as normalizeConditionLabelIdsRecursive,
+  requireConditionLabelIds as requireConditionLabelIdsRecursive,
+} from "../components/ConditionBuilder";
 
 type ActionType =
   | "label"
+  | "remove_label"
   | "archive"
   | "trash"
   | "spam"
@@ -58,28 +60,11 @@ interface RoutingPolicy {
   allow_fallback: boolean;
 }
 
-const CONDITION_TYPES: DropdownOption[] = [
-  { value: "from", label: "From" },
-  { value: "to", label: "To" },
-  { value: "subject", label: "Subject" },
-  { value: "body", label: "Body" },
-  { value: "label", label: "Label" },
-];
 
-const CONDITION_TYPE_LABELS: Record<string, string> = CONDITION_TYPES.reduce(
-  (acc, option) => ({ ...acc, [option.value]: option.label }),
-  {} as Record<string, string>
-);
-
-const CONDITION_OPERATORS: DropdownOption[] = [
-  { value: "contains", label: "Contains" },
-  { value: "equals", label: "Equals" },
-  { value: "regex", label: "Regex" },
-  { value: "not_contains", label: "Not Contains" },
-];
 
 const ACTION_TYPES: DropdownOption[] = [
   { value: "label", label: "Add Label" },
+  { value: "remove_label", label: "Remove Label" },
   { value: "archive", label: "Archive" },
   { value: "trash", label: "Trash" },
   { value: "spam", label: "Mark as Spam" },
@@ -90,6 +75,10 @@ const ACTION_TYPES: DropdownOption[] = [
 
 function actionLabel(action: RuleAction): string {
   return ACTION_TYPES.find((o) => o.value === action.type)?.label ?? action.type;
+}
+
+function needsLabelValue(action: ActionType): boolean {
+  return action === "label" || action === "remove_label";
 }
 
 export default function RuleEditor() {
@@ -105,15 +94,18 @@ export default function RuleEditor() {
   const [priority, setPriority] = useState(0);
   const [enabled, setEnabled] = useState(true);
   const [inferencePolicy, setInferencePolicy] = useState("default");
+  const [chooseFromAllLabels, setChooseFromAllLabels] = useState(false);
+  const [continueAfterMatch, setContinueAfterMatch] = useState(false);
   const [routingPolicies, setRoutingPolicies] = useState<RoutingPolicy[]>([]);
-  const [conditionType, setConditionType] = useState("from");
-  const [conditionOperator, setConditionOperator] = useState("contains");
-  const [conditionValue, setConditionValue] = useState("");
   const [conditions, setConditions] = useState<Condition[]>([]);
 
   const [actionType, setActionType] = useState<ActionType>("label");
   const [actionValue, setActionValue] = useState("");
   const [actions, setActions] = useState<RuleAction[]>([]);
+
+  const [choiceType, setChoiceType] = useState<ActionType>("label");
+  const [choiceValue, setChoiceValue] = useState("");
+  const [choices, setChoices] = useState<RuleAction[]>([]);
 
   const [recentMessages, setRecentMessages] = useState<RecentMessage[]>([]);
   const [selectedMessageId, setSelectedMessageId] = useState("");
@@ -126,6 +118,7 @@ export default function RuleEditor() {
   const [bulkEvaluating, setBulkEvaluating] = useState(false);
   const [bulkApplyingId, setBulkApplyingId] = useState<string | null>(null);
   const [pendingMemories, setPendingMemories] = useState<MemoryInput[]>([]);
+  const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [metrics, setMetrics] = useState<RuleMetrics | null>(null);
   const [roiMetrics, setRoiMetrics] = useState<RuleRoiMetrics | null>(null);
   const [gmailLabels, setGmailLabels] = useState<GmailLabel[]>([]);
@@ -140,6 +133,47 @@ export default function RuleEditor() {
       new Map(gmailLabels.map((label) => [label.name.toLowerCase(), label.id])),
     [gmailLabels]
   );
+  const hasMenu = chooseFromAllLabels || choices.length > 0;
+
+  // The exact trap: a prompt that enumerates outcomes the model is never offered
+  // can only ever produce a match that changes nothing.
+  const promptLabels = useMemo(
+    () =>
+      gmailLabels.filter(
+        (label) => label.name.length > 2 && prompt.includes(label.name)
+      ),
+    [prompt, gmailLabels]
+  );
+
+  const unofferedLabels = useMemo(() => {
+    if (chooseFromAllLabels) return [];
+    const offered = new Set(
+      choices.filter((choice) => choice.type === "label").map((choice) => choice.value)
+    );
+    return promptLabels.filter((label) => !offered.has(label.id));
+  }, [promptLabels, chooseFromAllLabels, choices]);
+
+  function addLabelChoices(candidates: GmailLabel[]) {
+    setChoices([
+      ...choices,
+      ...candidates.map((label) => ({ type: "label" as const, value: label.id })),
+    ]);
+  }
+
+  const cannotAct = !hasMenu && actions.length === 0;
+
+  // Naming an action the menu does not offer is the one prompt instruction the
+  // model cannot carry out, since only menu entries can be chosen.
+  const unofferedActions = useMemo(() => {
+    const offered = new Set(choices.map((choice) => choice.type));
+    return ACTION_TYPES.filter(
+      (option) =>
+        !needsLabelValue(option.value as ActionType) &&
+        !offered.has(option.value as ActionType) &&
+        new RegExp(`\\b${option.value.replace("_", "[ _]?")}\\b`, "i").test(prompt)
+    ).map((option) => option.label);
+  }, [prompt, choices]);
+
   const labelOptions = useMemo<DropdownOption[]>(
     () =>
       gmailLabels.map((label) => ({
@@ -161,50 +195,53 @@ export default function RuleEditor() {
     if (isEdit) {
       loadRule();
       loadMetrics();
+      loadMemories();
     } else {
       setMetrics(null);
       setRoiMetrics(null);
+      setMemories([]);
     }
   }, [id]);
 
   useEffect(() => {
     if (gmailLabels.length === 0) return;
     setConditions((prev) => {
-      const [normalized, , changed] = normalizeConditionLabelIds(
+      const [normalized, , changed] = normalizeConditionLabelIdsRecursive(
         prev,
         labelNameById,
         labelIdByName
       );
       return changed ? normalized : prev;
     });
-    setActions((prev) => {
+    const renormalize = (prev: RuleAction[]) => {
       const [normalized, , changed] = normalizeActionLabelIds(
         prev,
         labelNameById,
         labelIdByName
       );
       return changed ? normalized : prev;
-    });
+    };
+    setActions(renormalize);
+    setChoices(renormalize);
   }, [gmailLabels, labelIdByName, labelNameById]);
 
   useEffect(() => {
-    if (conditionType !== "label") return;
-    setConditionOperator("equals");
-    if (!conditionValue && labelOptions.length > 0) {
-      setConditionValue(labelOptions[0].value);
-    }
-  }, [conditionType, conditionValue, labelOptions]);
-
-  useEffect(() => {
-    if (actionType !== "label") return;
+    if (!needsLabelValue(actionType)) return;
     if (!actionValue && labelOptions.length > 0) {
       setActionValue(labelOptions[0].value);
     }
   }, [actionType, actionValue, labelOptions]);
 
-  async function loadLabels() {
+  useEffect(() => {
+    if (!needsLabelValue(choiceType)) return;
+    if (!choiceValue && labelOptions.length > 0) {
+      setChoiceValue(labelOptions[0].value);
+    }
+  }, [choiceType, choiceValue, labelOptions]);
+
+  async function loadLabels(refresh = false) {
     try {
-      const labels = await gmailListLabels();
+      const labels = await gmailListLabels(refresh);
       setGmailLabels(
         labels
           .slice()
@@ -230,10 +267,13 @@ export default function RuleEditor() {
         priority: number;
         enabled: boolean;
         inference_policy?: string;
+        choices?: unknown[];
+        choose_from_all_labels?: boolean;
+        continue_after_match?: boolean;
       }[];
       const rule = rules.find((r) => r.id === ruleId);
       if (rule) {
-        const [normalizedConditions] = normalizeConditionLabelIds(
+        const [normalizedConditions] = normalizeConditionLabelIdsRecursive(
           rule.conditions as Condition[],
           labelNameById,
           labelIdByName
@@ -243,14 +283,22 @@ export default function RuleEditor() {
           labelNameById,
           labelIdByName
         );
+        const [normalizedChoices] = normalizeActionLabelIds(
+          (rule.choices ?? []) as RuleAction[],
+          labelNameById,
+          labelIdByName
+        );
         setName(rule.name);
         setDescription(rule.description || "");
         setPrompt(rule.prompt);
         setPriority(rule.priority);
         setEnabled(rule.enabled);
         setInferencePolicy(rule.inference_policy || "default");
+        setChooseFromAllLabels(rule.choose_from_all_labels || false);
+        setContinueAfterMatch(rule.continue_after_match || false);
         setConditions(normalizedConditions);
         setActions(normalizedActions);
+        setChoices(normalizedChoices);
         setPendingMemories([]);
       }
     } catch (e) {
@@ -284,40 +332,34 @@ export default function RuleEditor() {
     }
   }
 
-  function addCondition() {
-    const value = conditionValue.trim();
-    if (!value) return;
-    const condition =
-      conditionType === "label"
-        ? {
-            type: conditionType,
-            operator: "equals",
-            value,
-          }
-        : {
-            type: conditionType,
-            operator: conditionOperator,
-            value,
-          };
-    setConditions([...conditions, condition]);
-    if (conditionType === "label") {
-      if (labelOptions.length > 0) {
-        setConditionValue(labelOptions[0].value);
-      }
-    } else {
-      setConditionValue("");
+  async function loadMemories() {
+    if (!isEdit) return;
+    try {
+      setMemories(await ruleMemoriesList(ruleId));
+    } catch (e) {
+      console.error("Failed to load rule memories:", e);
+    }
+  }
+
+  async function deleteMemory(memoryId: number) {
+    try {
+      await ruleMemoryDelete(ruleId, memoryId);
+      setMemories((prev) => prev.filter((memory) => memory.id !== memoryId));
+      toast.success("Memory removed");
+    } catch (e) {
+      toast.error(String(e));
     }
   }
 
   function addAction() {
     const value = actionValue.trim();
-    if (actionType === "label" && !value) return;
+    if (needsLabelValue(actionType) && !value) return;
     const action: RuleAction =
-      actionType === "label"
-        ? { type: "label", value }
+      needsLabelValue(actionType)
+        ? { type: actionType, value }
         : { type: actionType };
     setActions([...actions, action]);
-    if (actionType === "label") {
+    if (needsLabelValue(actionType)) {
       if (labelOptions.length > 0) {
         setActionValue(labelOptions[0].value);
       }
@@ -326,36 +368,45 @@ export default function RuleEditor() {
     }
   }
 
+  function addChoice() {
+    const value = choiceValue.trim();
+    if (needsLabelValue(choiceType) && !value) return;
+    const choice: RuleAction =
+      needsLabelValue(choiceType) ? { type: choiceType, value } : { type: choiceType };
+    setChoices([...choices, choice]);
+    if (needsLabelValue(choiceType)) {
+      if (labelOptions.length > 0) {
+        setChoiceValue(labelOptions[0].value);
+      }
+    } else {
+      setChoiceValue("");
+    }
+  }
+
   function buildRulePayload() {
-    const normalizedConditions = conditions.map((condition) => {
-      if (condition.type !== "label") return condition;
-      const value =
-        typeof condition.value === "string"
-          ? requireLabelId(condition.value, labelNameById, labelIdByName, "condition")
-          : "";
-      return {
-        ...condition,
-        operator: "equals",
-        value,
-      };
-    });
-    const normalizedActions = actions.map((action) => {
-      if (action.type !== "label") return action;
-      return {
-        ...action,
-        value: requireLabelId(action.value, labelNameById, labelIdByName, "action"),
-      };
-    });
+    const normalizedConditions = requireConditionLabelIdsRecursive(conditions, labelNameById, labelIdByName);
+    const normalizeLabelValues = (items: RuleAction[], context: string) =>
+      items.map((item) => {
+        if (item.type !== "label" && item.type !== "remove_label") return item;
+        return {
+          ...item,
+          value: requireLabelId(item.value, labelNameById, labelIdByName, context),
+        };
+      });
 
     return {
       name,
       description: description || null,
       conditions: normalizedConditions,
       prompt,
-      actions: normalizedActions,
+      choices: normalizeLabelValues(choices, "choice"),
+      choose_from_all_labels: chooseFromAllLabels,
+      actions: normalizeLabelValues(actions, "action"),
       priority,
       enabled,
       inference_policy: inferencePolicy || "default",
+      continue_after_match: continueAfterMatch,
+      source_rule_id: isEdit ? ruleId : undefined,
     };
   }
 
@@ -368,6 +419,7 @@ export default function RuleEditor() {
           await ruleApplyProposal(ruleId, {
             prompt: null,
             actions_add: [],
+            choices_add: [],
             conditions_add: [],
             memories_add: pendingMemories,
           });
@@ -404,7 +456,7 @@ export default function RuleEditor() {
       labelNameById,
       labelIdByName
     );
-    const [normalizedConditions, conditionErrors] = normalizeConditionLabelIds(
+    const [normalizedConditions, conditionErrors] = normalizeConditionLabelIdsRecursive(
       proposal.conditions_add as Condition[],
       labelNameById,
       labelIdByName
@@ -602,104 +654,180 @@ export default function RuleEditor() {
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
             Conditions
           </label>
-          {labelsError && (
-            <p className="text-xs text-amber-700 dark:text-amber-300 mb-2">
-              Labels unavailable: {labelsError}
-            </p>
-          )}
-          <div className="flex gap-2 mb-2">
-            <Dropdown
-              value={conditionType}
-              options={CONDITION_TYPES}
-              onChange={(nextType) => {
-                setConditionType(nextType);
-                if (nextType === "label") {
-                  setConditionOperator("equals");
-                  setConditionValue(labelOptions[0]?.value ?? "");
-                } else {
-                  setConditionValue("");
-                }
-              }}
-              className="min-w-[8rem]"
+          <ConditionBuilder
+            conditions={conditions}
+            onChange={setConditions}
+            labelOptions={labelOptions}
+            labelNameById={labelNameById}
+            labelIdByName={labelIdByName}
+            labelsError={labelsError}
+            onRefreshLabels={() => void loadLabels(true)}
+          />
+        </div>
+
+        <div className="rounded border border-gray-200 dark:border-gray-700 p-3 space-y-2">
+          <label className="block text-sm text-gray-500 dark:text-gray-400">
+            Choices the LLM picks from
+          </label>
+          <p className="text-xs text-gray-400 dark:text-gray-500">
+            Leave empty to ask a plain match-or-not question. Add entries to make the rule
+            classify: the LLM answers with one of them, or NO_MATCH. A choice can be a label
+            or an action, so "file it under A, B, or bin it" is one rule.
+          </p>
+          <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+            <input
+              type="checkbox"
+              checked={chooseFromAllLabels}
+              onChange={(event) => setChooseFromAllLabels(event.target.checked)}
+              className="rounded"
             />
-            {conditionType === "label" ? (
-              <div className="min-w-[10rem] bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-2 py-1 text-sm text-gray-500 dark:text-gray-400">
-                Equals
-              </div>
-            ) : (
-              <Dropdown
-                value={conditionOperator}
-                options={CONDITION_OPERATORS}
-                onChange={setConditionOperator}
-                className="min-w-[10rem]"
-              />
-            )}
-            {conditionType === "label" ? (
-              labelOptions.length > 0 ? (
+            Offer every Gmail user label instead
+          </label>
+          {chooseFromAllLabels ? (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              Every user label is sent with each email, which grows the prompt. Prefer a
+              fixed list when the rule classifies into a known set.
+            </p>
+          ) : (
+            <>
+              <div className="flex gap-2">
                 <Dropdown
-                  value={conditionValue}
-                  options={labelOptions}
-                  onChange={setConditionValue}
-                  className="flex-1"
+                  value={choiceType}
+                  options={ACTION_TYPES}
+                  onChange={(value) => {
+                    const nextType = value as ActionType;
+                    setChoiceType(nextType);
+                    setChoiceValue(
+                      needsLabelValue(nextType) ? labelOptions[0]?.value ?? "" : ""
+                    );
+                  }}
+                  className="min-w-[10rem]"
                 />
-              ) : (
-                <div className="flex-1 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-2 py-1 text-sm text-gray-500 dark:text-gray-400">
-                  No labels available
-                </div>
-              )
-            ) : (
-              <input
-                type="text"
-                value={conditionValue}
-                onChange={(e) => setConditionValue(e.target.value)}
-                className="flex-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-2 py-1 text-sm"
-                placeholder="Value"
-              />
-            )}
-            <button
-              onClick={addCondition}
-              disabled={conditionType === "label" && labelOptions.length === 0}
-              className="bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 px-3 py-1 rounded text-sm transition-colors"
-            >
-              Add
-            </button>
-          </div>
-          <div className="space-y-1">
-            {conditions.map((c, i) => (
-              <div
-                key={i}
-                className="flex items-center gap-2 text-sm bg-gray-100 dark:bg-gray-800/50 rounded px-2 py-1"
-              >
-                <span className="text-gray-500 dark:text-gray-400">
-                  {CONDITION_TYPE_LABELS[c.type] ?? c.type}
-                </span>
-                {c.type === "label" ? (
-                  <span>is</span>
-                ) : (
-                  typeof c.operator === "string" && <span>{c.operator}</span>
-                )}
-                {typeof c.value === "string" && (
-                  <span className="text-blue-600 dark:text-blue-300">
-                    {c.type === "label"
-                      ? displayLabelRef(c.value, labelNameById, labelIdByName)
-                      : c.value}
-                  </span>
-                )}
-                {typeof c.operator !== "string" && typeof c.value !== "string" && (
-                  <span className="text-gray-400 dark:text-gray-500">complex</span>
-                )}
+                {needsLabelValue(choiceType) &&
+                  (labelOptions.length > 0 ? (
+                    <Dropdown
+                      value={choiceValue}
+                      options={labelOptions}
+                      onChange={setChoiceValue}
+                      className="flex-1"
+                    />
+                  ) : (
+                    <div className="flex-1 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-2 py-1 text-sm text-gray-500 dark:text-gray-400">
+                      No labels available
+                    </div>
+                  ))}
                 <button
-                  onClick={() =>
-                    setConditions(conditions.filter((_, idx) => idx !== i))
-                  }
-                  className="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 ml-auto"
+                  onClick={addChoice}
+                  disabled={needsLabelValue(choiceType) && labelOptions.length === 0}
+                  className="bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 px-3 py-1 rounded text-sm transition-colors"
                 >
-                  ×
+                  Add
                 </button>
               </div>
-            ))}
-          </div>
+              <div className="space-y-1">
+                {choices.map((choice, index) => (
+                  <div
+                    key={index}
+                    className="flex items-center gap-2 text-sm bg-gray-100 dark:bg-gray-800/50 rounded px-2 py-1"
+                  >
+                    <span className="text-gray-500 dark:text-gray-400">
+                      {actionLabel(choice)}
+                    </span>
+                    {needsLabelValue(choice.type) && choice.value && (
+                      <span className="text-blue-600 dark:text-blue-300">
+                        {displayLabelRef(choice.value, labelNameById, labelIdByName)}
+                      </span>
+                    )}
+                    <button
+                      onClick={() => setChoices(choices.filter((_, i) => i !== index))}
+                      className="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 ml-auto"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {unofferedLabels.length > 0 && (
+            <div className="text-xs text-amber-700 dark:text-amber-300">
+              <p>
+                The prompt names{" "}
+                {unofferedLabels.slice(0, 3).map((label) => `"${label.name}"`).join(", ")}
+                {unofferedLabels.length > 3 ? ` and ${unofferedLabels.length - 3} more` : ""},
+                but {unofferedLabels.length === 1 ? "it is" : "they are"} not on the menu, so
+                the model is never offered {unofferedLabels.length === 1 ? "it" : "them"}.
+              </p>
+              <button
+                type="button"
+                onClick={() => addLabelChoices(unofferedLabels)}
+                className="mt-1 underline hover:no-underline"
+              >
+                Add {unofferedLabels.length} choice
+                {unofferedLabels.length === 1 ? "" : "s"}
+              </button>
+            </div>
+          )}
+          {unofferedActions.length > 0 && (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              The prompt asks for {unofferedActions.join(", ")}, but{" "}
+              {unofferedActions.length === 1 ? "it is" : "they are"} not on the menu. Add{" "}
+              {unofferedActions.length === 1 ? "it" : "them"} as a choice, or the model
+              cannot pick {unofferedActions.length === 1 ? "it" : "them"}.
+            </p>
+          )}
+          {cannotAct && (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              This rule has no actions and offers no choices, so a match changes nothing
+              while still stopping lower-priority rules from running.
+            </p>
+          )}
+          <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+            <input
+              type="checkbox"
+              checked={continueAfterMatch}
+              onChange={(event) => setContinueAfterMatch(event.target.checked)}
+              className="rounded"
+            />
+            Keep checking lower-priority rules after this one matches
+          </label>
+          <p className="text-xs text-gray-400 dark:text-gray-500">
+            A match normally claims the email and stops. Enable this for a rule that should
+            act and still hand the email on, such as a classifier that only adds a label.
+          </p>
         </div>
+
+        {isEdit && (
+          <div>
+            <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
+              Learned memory
+            </label>
+            <div className="space-y-1">
+              {memories.map((memory) => (
+                <div
+                  key={memory.id}
+                  className="flex items-start gap-2 rounded bg-gray-100 dark:bg-gray-800/50 px-2 py-1 text-sm"
+                >
+                  <span className="text-xs text-gray-400 dark:text-gray-500">{memory.kind}</span>
+                  <span className="min-w-0 flex-1">{memory.text}</span>
+                  <button
+                    type="button"
+                    onClick={() => void deleteMemory(memory.id)}
+                    className="text-red-600 dark:text-red-400 hover:text-red-700"
+                    aria-label={`Remove memory: ${memory.text}`}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+              {memories.length === 0 && (
+                <p className="text-xs text-gray-400 dark:text-gray-500">
+                  Chat corrections appear here and are included with this rule's context.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
 
         <div>
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
@@ -753,7 +881,7 @@ export default function RuleEditor() {
               onChange={(v) => {
                 const nextType = v as ActionType;
                 setActionType(nextType);
-                if (nextType === "label") {
+                if (needsLabelValue(nextType)) {
                   setActionValue(labelOptions[0]?.value ?? "");
                 } else {
                   setActionValue("");
@@ -761,7 +889,7 @@ export default function RuleEditor() {
               }}
               className="min-w-[10rem]"
             />
-            {actionType === "label" && (
+            {needsLabelValue(actionType) && (
               <>
                 {labelOptions.length > 0 ? (
                   <Dropdown
@@ -779,7 +907,7 @@ export default function RuleEditor() {
             )}
             <button
               onClick={addAction}
-              disabled={actionType === "label" && labelOptions.length === 0}
+              disabled={needsLabelValue(actionType) && labelOptions.length === 0}
               className="bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 px-3 py-1 rounded text-sm transition-colors"
             >
               Add
@@ -794,7 +922,7 @@ export default function RuleEditor() {
                 <span className="text-gray-500 dark:text-gray-400">
                   {actionLabel(a)}
                 </span>
-                {a.type === "label" && a.value && (
+                {needsLabelValue(a.type) && a.value && (
                   <span className="text-blue-600 dark:text-blue-300">
                     {displayLabelRef(a.value, labelNameById, labelIdByName)}
                   </span>
@@ -811,8 +939,8 @@ export default function RuleEditor() {
             ))}
           </div>
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Actions run automatically when conditions match. When none are set,
-            the LLM prompt below is used instead to decide the action.
+            Actions are the fixed recipe that runs on any match, on top of whatever the
+            model chose above.
           </p>
         </div>
 
@@ -825,7 +953,11 @@ export default function RuleEditor() {
             onChange={(e) => setPrompt(e.target.value)}
             rows={6}
             className="w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-3 py-2 text-sm font-mono"
-            placeholder="The classifier prompt. Reply APPLY to run configured actions. TRASH or SPAM apply directly. Other explicit actions (like LABEL: Invoices) run alongside configured actions. SKIP does nothing."
+            placeholder={
+              hasMenu
+                ? "Describe when each choice applies. The model answers with one choice or NO_MATCH; the actions below run on any match."
+                : "Describe exactly when this rule matches. Matching applies the actions below."
+            }
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
             Tip: use chat to propose edits, apply them to this draft, then test
@@ -875,7 +1007,7 @@ export default function RuleEditor() {
             </button>
             <button
               onClick={handleApply}
-              disabled={!selectedMessageId || applying || (testResult?.matched === false)}
+              disabled={!selectedMessageId || applying || testResult?.matched === false || testResult?.indeterminate}
               className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-3 py-1 rounded text-sm transition-colors"
             >
               {applying ? "Applying…" : "Apply to this message"}
@@ -887,15 +1019,21 @@ export default function RuleEditor() {
               <div className="mb-1">
                 <span
                   className={
-                    testResult.matched
+                    testResult.indeterminate
+                      ? "text-red-600 dark:text-red-400 font-medium"
+                      : testResult.matched
                       ? "text-green-600 dark:text-green-400 font-medium"
                       : "text-gray-500 dark:text-gray-400 font-medium"
                   }
                 >
-                  {testResult.matched ? "Conditions matched" : "No match"}
+                    {testResult.indeterminate
+                      ? "Invalid LLM decision"
+                      : testResult.matched
+                        ? "Matched"
+                        : "No match"}
                 </span>
               </div>
-              {testResult.matched && (
+              {testResult.matched && !testResult.indeterminate && (
                 <div className="mb-1">
                   <span className="text-gray-500 dark:text-gray-400">
                     Would apply:{" "}
@@ -921,10 +1059,60 @@ export default function RuleEditor() {
                   {testResult.reasoning}
                 </div>
               )}
+              {testResult.diagnostic && (
+                <div
+                  className={
+                    testResult.indeterminate
+                      ? "mt-2 text-xs text-red-600 dark:text-red-400"
+                      : "mt-2 text-xs text-amber-700 dark:text-amber-300"
+                  }
+                >
+                  {testResult.diagnostic}
+                </div>
+              )}
               {testResult.llm_response && (
                 <pre className="mt-2 whitespace-pre-wrap text-xs text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-900 rounded p-2 overflow-auto max-h-40">
                   {testResult.llm_response}
                 </pre>
+              )}
+              {!testResult.matched && !testResult.indeterminate && (
+                <div className="mt-2 border-t border-gray-200 dark:border-gray-700 pt-2">
+                  <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">
+                    Then falls through to
+                  </div>
+                  {testResult.fallthrough.length === 0 ? (
+                    <p className="text-xs text-gray-400 dark:text-gray-500">
+                      No lower-priority rule applies to this email, so nothing would happen.
+                      {isEdit ? "" : " Save the rule first to see the chain."}
+                    </p>
+                  ) : (
+                    <ol className="space-y-1">
+                      {testResult.fallthrough.map((step) => (
+                        <li key={step.rule_id} className="text-xs flex gap-2">
+                          <span className="text-gray-500 dark:text-gray-400 truncate max-w-[12rem]">
+                            {step.rule_name}
+                          </span>
+                          {step.indeterminate ? (
+                            <span className="text-red-600 dark:text-red-400">
+                              {step.diagnostic || "invalid LLM decision"}
+                            </span>
+                          ) : step.matched ? (
+                            <span className="text-green-600 dark:text-green-400">
+                              {step.continued ? "acts and continues" : "claims it"}
+                              {step.actions.length > 0
+                                ? `: ${step.actions
+                                    .map((a) => renderActionDisplay(a, labelNameById, labelIdByName))
+                                    .join(", ")}`
+                                : " with no actions"}
+                            </span>
+                          ) : (
+                            <span className="text-gray-400 dark:text-gray-500">no match</span>
+                          )}
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
               )}
             </div>
           )}
@@ -993,7 +1181,11 @@ export default function RuleEditor() {
                           {msg ? `${msg.from} — ${msg.subject || "(no subject)"}` : v.email_id}
                         </div>
                         <div className="text-xs">
-                          {v.matched ? (
+                          {v.indeterminate ? (
+                            <span className="text-red-600 dark:text-red-400">
+                              {v.diagnostic || "invalid LLM decision"}
+                            </span>
+                          ) : v.matched ? (
                             v.actions.length > 0 ? (
                               <span className="text-blue-600 dark:text-blue-300">
                                 {v.actions
@@ -1013,9 +1205,14 @@ export default function RuleEditor() {
                             </span>
                           )}
                         </div>
-                        {batchExplanation(v.llm_response) && (
+                        {v.reason && (
                           <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                            {batchExplanation(v.llm_response)}
+                            {v.reason}
+                          </div>
+                        )}
+                        {!v.indeterminate && v.diagnostic && (
+                          <div className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                            {v.diagnostic}
                           </div>
                         )}
                       </div>
@@ -1130,7 +1327,7 @@ function normalizeActionLabelIds(
   const unknown: string[] = [];
 
   const normalized = actions.map((action) => {
-    if (action.type !== "label") return action;
+    if (action.type !== "label" && action.type !== "remove_label") return action;
     const resolved = resolveLabelId(action.value, labelNameById, labelIdByName);
     if (!resolved) {
       if (action.value) unknown.push(action.value.trim());
@@ -1146,52 +1343,18 @@ function normalizeActionLabelIds(
   return [normalized, unknown, changed];
 }
 
-function normalizeConditionLabelIds(
-  conditions: Condition[],
-  labelNameById: Map<string, string>,
-  labelIdByName: Map<string, string>
-): [Condition[], string[], boolean] {
-  let changed = false;
-  const unknown: string[] = [];
-
-  const normalized = conditions.map((condition) => {
-    if (condition.type !== "label") return condition;
-    const currentValue =
-      typeof condition.value === "string" ? condition.value : "";
-    const resolved = resolveLabelId(currentValue, labelNameById, labelIdByName);
-    if (!resolved) {
-      if (currentValue) unknown.push(currentValue.trim());
-      return condition;
-    }
-
-    const hasChanged = condition.value !== resolved || condition.operator !== "equals";
-    if (!hasChanged) return condition;
-    changed = true;
-    return {
-      ...condition,
-      operator: "equals",
-      value: resolved,
-    };
-  });
-
-  return [normalized, unknown, changed];
-}
-
 function renderActionDisplay(
   action: { kind: string; detail: string | null; display: string },
   labelNameById: Map<string, string>,
   labelIdByName: Map<string, string>
 ): string {
-  if (action.kind !== "label" || !action.detail) {
+  if ((action.kind !== "label" && action.kind !== "remove_label") || !action.detail) {
     return action.display;
   }
   const labelName = displayLabelRef(action.detail, labelNameById, labelIdByName);
-  return `Add label "${labelName}"`;
-}
-
-function batchExplanation(response: string): string | null {
-  const [, explanation] = response.split("|", 2);
-  return explanation?.trim() || null;
+  return action.kind === "remove_label"
+    ? `Remove label "${labelName}"`
+    : `Add label "${labelName}"`;
 }
 
 function MetricCard({

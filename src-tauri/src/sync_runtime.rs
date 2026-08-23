@@ -13,14 +13,17 @@ use tauri::Emitter;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::commands::load_gmail_auth;
+use crate::ProcessingStates;
 
 #[derive(Debug, Clone)]
 pub enum SyncTrigger {
     Startup,
     Sweep,
     Manual,
-    Relay { event_key: String },
+    Relay {
+        account_email: String,
+        event_key: String,
+    },
 }
 
 impl SyncTrigger {
@@ -51,10 +54,17 @@ struct RelayHello<'a> {
     auth_token: &'a str,
 }
 
+#[derive(Clone, Serialize)]
+struct AccountProgress {
+    account_email: String,
+    #[serde(flatten)]
+    progress: OpProgress,
+}
+
 pub fn spawn(
     app: tauri::AppHandle,
     db: Arc<Database>,
-    state: Arc<Mutex<ProcessingState>>,
+    states: ProcessingStates,
     config: Arc<Mutex<AppConfig>>,
 ) -> mpsc::UnboundedSender<SyncTrigger> {
     let (tx, mut rx) = mpsc::unbounded_channel::<SyncTrigger>();
@@ -62,7 +72,7 @@ pub fn spawn(
     let loop_tx = tx.clone();
     let app_loop = app.clone();
     let db_loop = db.clone();
-    let state_loop = state.clone();
+    let states_loop = states.clone();
     let config_loop = config.clone();
 
     tauri::async_runtime::spawn(async move {
@@ -82,113 +92,173 @@ pub fn spawn(
                 continue;
             }
 
-            let account_email = match cfg.gmail_account.clone() {
-                Some(v) => v,
-                None => continue,
+            let (account_emails, relay_event_key) = match &trigger {
+                SyncTrigger::Relay {
+                    account_email,
+                    event_key,
+                } => (vec![account_email.clone()], Some(event_key.clone())),
+                _ => (
+                    db_loop
+                        .with_accounts(|repo| repo.list())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|account| !account.paused)
+                        .map(|account| account.email)
+                        .collect::<Vec<_>>(),
+                    None,
+                ),
             };
 
-            let auth = match load_gmail_auth(&app_loop, &cfg) {
-                Ok(auth) => auth,
-                Err(e) => {
-                    let _ = db_loop
-                        .with_sync_state(|repo| repo.set_sync_error(&account_email, Some(&e)));
+            for account_email in account_emails {
+                if db_loop
+                    .with_accounts(|repo| repo.get(&account_email))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|account| account.paused)
+                {
                     continue;
                 }
-            };
-
-            let llm = InferenceRouter::from_config(&cfg).with_database(db_loop.as_ref().clone());
-            let mut gmail = post_office_core::gmail::GmailClient::new(auth);
-
-            if let Err(e) = maybe_refresh_watch(&db_loop, &mut gmail, &account_email, &cfg).await {
-                let _ = db_loop.with_sync_state(|repo| {
-                    repo.set_sync_error(&account_email, Some(&e.to_string()))
-                });
-            }
-
-            {
-                let mut s = state_loop.lock().await;
-                s.active_phase = "sync-fetching".into();
-                s.current_progress = Some(OpProgress {
-                    source: "sync".into(),
-                    phase: "sync-fetching".into(),
-                    processed: 0,
-                    total: None,
-                    detail: Some("Checking Gmail history".into()),
-                    current_email_id: None,
-                    current_email_from: None,
-                    current_email_subject: None,
-                    current_email_sent_at: None,
-                });
-            }
-
-            let emit = app_loop.clone();
-            match replay_history(
-                &db_loop,
-                &state_loop,
-                &mut gmail,
-                &llm,
-                &cfg,
-                &account_email,
-                trigger.as_str(),
-                &|progress: OpProgress| {
-                    let _ = emit.emit("sync-progress", &progress);
-                },
-            )
-            .await
-            {
-                Ok(result) => {
-                    let _ = app_loop.emit("sync-cycle", &result);
-                    mark_last_successful(&db_loop, &state_loop, Utc::now()).await;
-                    {
-                        let mut s = state_loop.lock().await;
-                        s.current_progress = None;
-                        s.active_phase = "idle".into();
-                    }
-                    let _ = app_loop.emit(
-                        "sync-progress",
-                        OpProgress {
-                            source: "sync".into(),
-                            phase: "idle".into(),
-                            processed: 0,
-                            total: None,
-                            detail: None,
-                            current_email_id: None,
-                            current_email_from: None,
-                            current_email_subject: None,
-                            current_email_sent_at: None,
-                        },
-                    );
-                    if let SyncTrigger::Relay { event_key } = trigger {
-                        let _ = db_loop
-                            .with_sync_state(|repo| repo.mark_event_status(&event_key, "applied"));
-                    }
+                let state_loop = processing_state_for(&states_loop, &db_loop, &account_email);
+                if state_loop
+                    .lock()
+                    .await
+                    .stop_requested
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    continue;
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let _ = db_loop
-                        .with_sync_state(|repo| repo.set_sync_error(&account_email, Some(&msg)));
-                    {
-                        let mut s = state_loop.lock().await;
-                        s.current_progress = None;
-                        s.active_phase = "error".into();
-                    }
-                    let _ = app_loop.emit(
-                        "sync-progress",
-                        OpProgress {
-                            source: "sync".into(),
-                            phase: "error".into(),
-                            processed: 0,
-                            total: None,
-                            detail: Some(msg),
-                            current_email_id: None,
-                            current_email_from: None,
-                            current_email_subject: None,
-                            current_email_sent_at: None,
-                        },
-                    );
-                    if let SyncTrigger::Relay { event_key } = trigger {
+
+                let auth = match crate::commands::load_gmail_auth_for_account(
+                    &app_loop,
+                    &cfg,
+                    &account_email,
+                ) {
+                    Ok(auth) => auth,
+                    Err(e) => {
                         let _ = db_loop
-                            .with_sync_state(|repo| repo.mark_event_status(&event_key, "error"));
+                            .with_sync_state(|repo| repo.set_sync_error(&account_email, Some(&e)));
+                        let _ = db_loop.with_accounts(|repo| repo.record_error(&account_email, &e));
+                        continue;
+                    }
+                };
+
+                let llm =
+                    InferenceRouter::from_config(&cfg).with_database(db_loop.as_ref().clone());
+                let mut gmail = post_office_core::gmail::GmailClient::new(auth);
+
+                if let Err(e) =
+                    maybe_refresh_watch(&db_loop, &mut gmail, &account_email, &cfg).await
+                {
+                    let _ = db_loop.with_sync_state(|repo| {
+                        repo.set_sync_error(&account_email, Some(&e.to_string()))
+                    });
+                }
+
+                {
+                    let mut s = state_loop.lock().await;
+                    s.active_phase = "sync-fetching".into();
+                    s.current_progress = Some(OpProgress {
+                        source: "sync".into(),
+                        phase: "sync-fetching".into(),
+                        processed: 0,
+                        total: None,
+                        detail: Some("Checking Gmail history".into()),
+                        current_email_id: None,
+                        current_email_from: None,
+                        current_email_subject: None,
+                        current_email_sent_at: None,
+                    });
+                }
+
+                let emit = app_loop.clone();
+                let progress_account = account_email.clone();
+                match replay_history(
+                    &db_loop,
+                    &state_loop,
+                    &mut gmail,
+                    &llm,
+                    &cfg,
+                    &account_email,
+                    trigger.as_str(),
+                    &|progress: OpProgress| {
+                        let _ = emit.emit(
+                            "sync-progress",
+                            AccountProgress {
+                                account_email: progress_account.clone(),
+                                progress,
+                            },
+                        );
+                    },
+                )
+                .await
+                {
+                    Ok(result) => {
+                        let _ = app_loop.emit("sync-cycle", &result);
+                        mark_last_successful(&db_loop, &state_loop, &account_email, Utc::now())
+                            .await;
+                        let _ = db_loop.with_accounts(|repo| repo.record_success(&account_email));
+                        {
+                            let mut s = state_loop.lock().await;
+                            s.current_progress = None;
+                            s.active_phase = "idle".into();
+                        }
+                        let _ = app_loop.emit(
+                            "sync-progress",
+                            AccountProgress {
+                                account_email: account_email.clone(),
+                                progress: OpProgress {
+                                    source: "sync".into(),
+                                    phase: "idle".into(),
+                                    processed: 0,
+                                    total: None,
+                                    detail: None,
+                                    current_email_id: None,
+                                    current_email_from: None,
+                                    current_email_subject: None,
+                                    current_email_sent_at: None,
+                                },
+                            },
+                        );
+                        if let Some(event_key) = relay_event_key.as_deref() {
+                            let _ = db_loop.with_sync_state(|repo| {
+                                repo.mark_event_status(&account_email, event_key, "applied")
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let _ = db_loop.with_sync_state(|repo| {
+                            repo.set_sync_error(&account_email, Some(&msg))
+                        });
+                        let _ =
+                            db_loop.with_accounts(|repo| repo.record_error(&account_email, &msg));
+                        {
+                            let mut s = state_loop.lock().await;
+                            s.current_progress = None;
+                            s.active_phase = "error".into();
+                        }
+                        let _ = app_loop.emit(
+                            "sync-progress",
+                            AccountProgress {
+                                account_email: account_email.clone(),
+                                progress: OpProgress {
+                                    source: "sync".into(),
+                                    phase: "error".into(),
+                                    processed: 0,
+                                    total: None,
+                                    detail: Some(msg),
+                                    current_email_id: None,
+                                    current_email_from: None,
+                                    current_email_subject: None,
+                                    current_email_sent_at: None,
+                                },
+                            },
+                        );
+                        if let Some(event_key) = relay_event_key.as_deref() {
+                            let _ = db_loop.with_sync_state(|repo| {
+                                repo.mark_event_status(&account_email, event_key, "error")
+                            });
+                        }
                     }
                 }
             }
@@ -197,6 +267,22 @@ pub fn spawn(
 
     spawn_relay_listener(app, db, config, tx.clone());
     tx
+}
+
+fn processing_state_for(
+    states: &ProcessingStates,
+    db: &Database,
+    account_email: &str,
+) -> Arc<Mutex<ProcessingState>> {
+    let mut states = states.lock().unwrap();
+    states
+        .entry(account_email.to_string())
+        .or_insert_with(|| {
+            let mut state = ProcessingState::new();
+            post_office_core::processing::hydrate_processing_state(db, &mut state, account_email);
+            Arc::new(Mutex::new(state))
+        })
+        .clone()
 }
 
 fn spawn_relay_listener(
@@ -266,7 +352,10 @@ fn spawn_relay_listener(
                                         .to_string();
                                     let _ =
                                         queue_notification(&db, &account, &event_key, history_id);
-                                    let _ = trigger_tx.send(SyncTrigger::Relay { event_key });
+                                    let _ = trigger_tx.send(SyncTrigger::Relay {
+                                        account_email: account,
+                                        event_key,
+                                    });
                                 }
                             }
                             "RESYNC_REQUIRED" => {

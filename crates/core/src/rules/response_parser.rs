@@ -8,6 +8,7 @@ impl From<&Action> for ParsedAction {
     fn from(action: &Action) -> Self {
         match action {
             Action::Label { value } => ParsedAction::Label(value.clone()),
+            Action::RemoveLabel { value } => ParsedAction::RemoveLabel(value.clone()),
             Action::Archive => ParsedAction::Archive,
             Action::Trash => ParsedAction::Trash,
             Action::Spam => ParsedAction::Spam,
@@ -15,32 +16,6 @@ impl From<&Action> for ParsedAction {
             Action::MarkUnread => ParsedAction::MarkUnread,
             Action::Star => ParsedAction::Star,
         }
-    }
-}
-
-pub fn parse_llm_response(response: &str) -> Option<ParsedAction> {
-    let first_line = response
-        .trim()
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())?;
-
-    ParsedAction::from_str(first_line).ok()
-}
-
-/// Extracts the brief explanation (line 2+) the model appends after the
-/// decision token. Empty when the model returned only the token.
-pub fn extract_reasoning(response: &str) -> String {
-    let lines: Vec<&str> = response
-        .trim()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-
-    match lines.split_first() {
-        Some((_, rest)) if !rest.is_empty() => rest.join(" "),
-        _ => String::new(),
     }
 }
 
@@ -52,8 +27,8 @@ pub enum ParsedAction {
     MarkRead,
     MarkUnread,
     Star,
-    Apply,
     Label(String),
+    RemoveLabel(String),
 }
 
 impl FromStr for ParsedAction {
@@ -80,17 +55,17 @@ impl FromStr for ParsedAction {
         if s.eq_ignore_ascii_case("STAR") {
             return Ok(ParsedAction::Star);
         }
-        if s.eq_ignore_ascii_case("APPLY") {
-            return Ok(ParsedAction::Apply);
-        }
-        if s.eq_ignore_ascii_case("SKIP") {
-            return Err(ParseError::Skip);
-        }
 
         s.strip_prefix("LABEL:")
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
             .map(|name| ParsedAction::Label(name.to_string()))
+            .or_else(|| {
+                s.strip_prefix("REMOVE_LABEL:")
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(|name| ParsedAction::RemoveLabel(name.to_string()))
+            })
             .ok_or(ParseError::InvalidFormat)
     }
 }
@@ -99,7 +74,4 @@ impl FromStr for ParsedAction {
 pub enum ParseError {
     #[error("LLM response does not match expected format")]
     InvalidFormat,
-
-    #[error("LLM responded with SKIP")]
-    Skip,
 }

@@ -146,3 +146,11 @@ pub fn load_tokens(account: &str) -> Result<Option<TokenStore>, GmailError> {
         Err(e) => Err(e.into()),
     }
 }
+
+pub fn delete_tokens(account: &str) -> Result<(), GmailError> {
+    let entry = Entry::new(SERVICE_NAME, account)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}

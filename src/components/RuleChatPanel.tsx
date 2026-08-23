@@ -199,9 +199,13 @@ export default function RuleChatPanel({
 function summarizeProposal(p: ChatProposal): string[] {
   const lines: string[] = [];
   if (p.prompt) lines.push("Rewrite prompt");
-  for (const a of p.actions_add) {
+  for (const a of p.actions_add ?? []) {
     const t = (a as { type: string; value?: string }).value;
     lines.push(`Add action: ${t ?? (a as { type: string }).type}`);
+  }
+  for (const c of p.choices_add ?? []) {
+    const t = (c as { type: string; value?: string }).value;
+    lines.push(`Add choice: ${t ?? (c as { type: string }).type}`);
   }
   for (const c of p.conditions_add) {
     const cc = c as { type: string; operator?: string; value?: string };
@@ -216,7 +220,8 @@ function summarizeProposal(p: ChatProposal): string[] {
 function hasChanges(p: ChatProposal): boolean {
   return (
     p.prompt !== null ||
-    p.actions_add.length > 0 ||
+    (p.actions_add ?? []).length > 0 ||
+    (p.choices_add ?? []).length > 0 ||
     p.conditions_add.length > 0 ||
     p.memories_add.length > 0
   );
