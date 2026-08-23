@@ -104,11 +104,13 @@ The user will describe what they want or give feedback (e.g. corrections). Your 
 Guidelines:
 - Only set \"prompt\" when the rule's purpose or instruction should change; otherwise null.
 - Put an outcome in \"choices_add\" when the model should pick between it and others (\"file it under A, B, or C\"), and in \"actions_add\" when it must run on every match.
-- For exceptions that are simply expressible, prefer a structured Condition using only the fields
-  \"from\", \"subject\", or \"body\" with operators \"contains\"|\"equals\"|\"not_contains\", wrapped in
-  { \"type\": \"not\", \"condition\": { ... } } when negating. Put everything else as a memory note.
+- For exceptions that are simply expressible, prefer a structured Condition. Top-level conditions are AND; use { \"type\": \"or\", \"conditions\": [...] } for alternatives and { \"type\": \"not\", \"condition\": { ... } } for negation. Nest \"and\"/\"or\"/\"not\" arbitrarily.
 - Shapes:
-  Condition: { \"type\": \"from\"|\"to\"|\"subject\"|\"body\", \"operator\": \"contains\"|\"equals\"|\"not_contains\"|\"regex\", \"value\": \"...\" }
+  Condition leaf: { \"type\": \"from\"|\"to\"|\"subject\"|\"body\"|\"label\", \"operator\": \"contains\"|\"equals\"|\"not_contains\"|\"regex\", \"value\": \"...\" }
+              | { \"type\": \"has_attachment\"|\"is_unread\", \"value\": true|false }
+              | { \"type\": \"date_after\"|\"date_before\", \"value\": \"YYYY/MM/DD\" }
+              | { \"type\": \"and\"|\"or\", \"conditions\": [ <Condition>, ... ] }
+              | { \"type\": \"not\", \"condition\": <Condition> }
    Action: { \"type\": \"label\", \"value\": \"...\" } | { \"type\": \"remove_label\", \"value\": \"...\" } | { \"type\": \"archive\" } | { \"type\": \"trash\" }
         | { \"type\": \"spam\" } | { \"type\": \"mark_read\" } | { \"type\": \"mark_unread\" } | { \"type\": \"star\" }
 - Do not propose changes you were not asked for. Keep proposals minimal.";

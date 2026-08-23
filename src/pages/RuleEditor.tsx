@@ -30,13 +30,11 @@ import {
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import RuleChatPanel from "../components/RuleChatPanel";
-
-interface Condition {
-  type: string;
-  operator?: string;
-  value?: string;
-  [key: string]: unknown;
-}
+import ConditionBuilder, {
+  Condition,
+  normalizeConditionLabelIds as normalizeConditionLabelIdsRecursive,
+  requireConditionLabelIds as requireConditionLabelIdsRecursive,
+} from "../components/ConditionBuilder";
 
 type ActionType =
   | "label"
@@ -62,25 +60,7 @@ interface RoutingPolicy {
   allow_fallback: boolean;
 }
 
-const CONDITION_TYPES: DropdownOption[] = [
-  { value: "from", label: "From" },
-  { value: "to", label: "To" },
-  { value: "subject", label: "Subject" },
-  { value: "body", label: "Body" },
-  { value: "label", label: "Label" },
-];
 
-const CONDITION_TYPE_LABELS: Record<string, string> = CONDITION_TYPES.reduce(
-  (acc, option) => ({ ...acc, [option.value]: option.label }),
-  {} as Record<string, string>
-);
-
-const CONDITION_OPERATORS: DropdownOption[] = [
-  { value: "contains", label: "Contains" },
-  { value: "equals", label: "Equals" },
-  { value: "regex", label: "Regex" },
-  { value: "not_contains", label: "Not Contains" },
-];
 
 const ACTION_TYPES: DropdownOption[] = [
   { value: "label", label: "Add Label" },
@@ -117,9 +97,6 @@ export default function RuleEditor() {
   const [chooseFromAllLabels, setChooseFromAllLabels] = useState(false);
   const [continueAfterMatch, setContinueAfterMatch] = useState(false);
   const [routingPolicies, setRoutingPolicies] = useState<RoutingPolicy[]>([]);
-  const [conditionType, setConditionType] = useState("from");
-  const [conditionOperator, setConditionOperator] = useState("contains");
-  const [conditionValue, setConditionValue] = useState("");
   const [conditions, setConditions] = useState<Condition[]>([]);
 
   const [actionType, setActionType] = useState<ActionType>("label");
@@ -229,7 +206,7 @@ export default function RuleEditor() {
   useEffect(() => {
     if (gmailLabels.length === 0) return;
     setConditions((prev) => {
-      const [normalized, , changed] = normalizeConditionLabelIds(
+      const [normalized, , changed] = normalizeConditionLabelIdsRecursive(
         prev,
         labelNameById,
         labelIdByName
@@ -247,14 +224,6 @@ export default function RuleEditor() {
     setActions(renormalize);
     setChoices(renormalize);
   }, [gmailLabels, labelIdByName, labelNameById]);
-
-  useEffect(() => {
-    if (conditionType !== "label") return;
-    setConditionOperator("equals");
-    if (!conditionValue && labelOptions.length > 0) {
-      setConditionValue(labelOptions[0].value);
-    }
-  }, [conditionType, conditionValue, labelOptions]);
 
   useEffect(() => {
     if (!needsLabelValue(actionType)) return;
@@ -304,7 +273,7 @@ export default function RuleEditor() {
       }[];
       const rule = rules.find((r) => r.id === ruleId);
       if (rule) {
-        const [normalizedConditions] = normalizeConditionLabelIds(
+        const [normalizedConditions] = normalizeConditionLabelIdsRecursive(
           rule.conditions as Condition[],
           labelNameById,
           labelIdByName
@@ -382,31 +351,6 @@ export default function RuleEditor() {
     }
   }
 
-  function addCondition() {
-    const value = conditionValue.trim();
-    if (!value) return;
-    const condition =
-      conditionType === "label"
-        ? {
-            type: conditionType,
-            operator: "equals",
-            value,
-          }
-        : {
-            type: conditionType,
-            operator: conditionOperator,
-            value,
-          };
-    setConditions([...conditions, condition]);
-    if (conditionType === "label") {
-      if (labelOptions.length > 0) {
-        setConditionValue(labelOptions[0].value);
-      }
-    } else {
-      setConditionValue("");
-    }
-  }
-
   function addAction() {
     const value = actionValue.trim();
     if (needsLabelValue(actionType) && !value) return;
@@ -440,18 +384,7 @@ export default function RuleEditor() {
   }
 
   function buildRulePayload() {
-    const normalizedConditions = conditions.map((condition) => {
-      if (condition.type !== "label") return condition;
-      const value =
-        typeof condition.value === "string"
-          ? requireLabelId(condition.value, labelNameById, labelIdByName, "condition")
-          : "";
-      return {
-        ...condition,
-        operator: "equals",
-        value,
-      };
-    });
+    const normalizedConditions = requireConditionLabelIdsRecursive(conditions, labelNameById, labelIdByName);
     const normalizeLabelValues = (items: RuleAction[], context: string) =>
       items.map((item) => {
         if (item.type !== "label" && item.type !== "remove_label") return item;
@@ -523,7 +456,7 @@ export default function RuleEditor() {
       labelNameById,
       labelIdByName
     );
-    const [normalizedConditions, conditionErrors] = normalizeConditionLabelIds(
+    const [normalizedConditions, conditionErrors] = normalizeConditionLabelIdsRecursive(
       proposal.conditions_add as Condition[],
       labelNameById,
       labelIdByName
@@ -721,112 +654,15 @@ export default function RuleEditor() {
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
             Conditions
           </label>
-          <div className="flex items-center gap-2 mb-2">
-            {labelsError && (
-              <p className="text-xs text-amber-700 dark:text-amber-300">
-                Labels unavailable: {labelsError}
-              </p>
-            )}
-            <button
-              type="button"
-              onClick={() => void loadLabels(true)}
-              className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 ml-auto"
-            >
-              Refresh labels
-            </button>
-          </div>
-          <div className="flex gap-2 mb-2">
-            <Dropdown
-              value={conditionType}
-              options={CONDITION_TYPES}
-              onChange={(nextType) => {
-                setConditionType(nextType);
-                if (nextType === "label") {
-                  setConditionOperator("equals");
-                  setConditionValue(labelOptions[0]?.value ?? "");
-                } else {
-                  setConditionValue("");
-                }
-              }}
-              className="min-w-[8rem]"
-            />
-            {conditionType === "label" ? (
-              <div className="min-w-[10rem] bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-2 py-1 text-sm text-gray-500 dark:text-gray-400">
-                Equals
-              </div>
-            ) : (
-              <Dropdown
-                value={conditionOperator}
-                options={CONDITION_OPERATORS}
-                onChange={setConditionOperator}
-                className="min-w-[10rem]"
-              />
-            )}
-            {conditionType === "label" ? (
-              labelOptions.length > 0 ? (
-                <Dropdown
-                  value={conditionValue}
-                  options={labelOptions}
-                  onChange={setConditionValue}
-                  className="flex-1"
-                />
-              ) : (
-                <div className="flex-1 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-2 py-1 text-sm text-gray-500 dark:text-gray-400">
-                  No labels available
-                </div>
-              )
-            ) : (
-              <input
-                type="text"
-                value={conditionValue}
-                onChange={(e) => setConditionValue(e.target.value)}
-                className="flex-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-2 py-1 text-sm"
-                placeholder="Value"
-              />
-            )}
-            <button
-              onClick={addCondition}
-              disabled={conditionType === "label" && labelOptions.length === 0}
-              className="bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 px-3 py-1 rounded text-sm transition-colors"
-            >
-              Add
-            </button>
-          </div>
-          <div className="space-y-1">
-            {conditions.map((c, i) => (
-              <div
-                key={i}
-                className="flex items-center gap-2 text-sm bg-gray-100 dark:bg-gray-800/50 rounded px-2 py-1"
-              >
-                <span className="text-gray-500 dark:text-gray-400">
-                  {CONDITION_TYPE_LABELS[c.type] ?? c.type}
-                </span>
-                {c.type === "label" ? (
-                  <span>is</span>
-                ) : (
-                  typeof c.operator === "string" && <span>{c.operator}</span>
-                )}
-                {typeof c.value === "string" && (
-                  <span className="text-blue-600 dark:text-blue-300">
-                    {c.type === "label"
-                      ? displayLabelRef(c.value, labelNameById, labelIdByName)
-                      : c.value}
-                  </span>
-                )}
-                {typeof c.operator !== "string" && typeof c.value !== "string" && (
-                  <span className="text-gray-400 dark:text-gray-500">complex</span>
-                )}
-                <button
-                  onClick={() =>
-                    setConditions(conditions.filter((_, idx) => idx !== i))
-                  }
-                  className="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 ml-auto"
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-          </div>
+          <ConditionBuilder
+            conditions={conditions}
+            onChange={setConditions}
+            labelOptions={labelOptions}
+            labelNameById={labelNameById}
+            labelIdByName={labelIdByName}
+            labelsError={labelsError}
+            onRefreshLabels={() => void loadLabels(true)}
+          />
         </div>
 
         <div className="rounded border border-gray-200 dark:border-gray-700 p-3 space-y-2">
@@ -1502,37 +1338,6 @@ function normalizeActionLabelIds(
       return { ...action, value: resolved };
     }
     return action;
-  });
-
-  return [normalized, unknown, changed];
-}
-
-function normalizeConditionLabelIds(
-  conditions: Condition[],
-  labelNameById: Map<string, string>,
-  labelIdByName: Map<string, string>
-): [Condition[], string[], boolean] {
-  let changed = false;
-  const unknown: string[] = [];
-
-  const normalized = conditions.map((condition) => {
-    if (condition.type !== "label") return condition;
-    const currentValue =
-      typeof condition.value === "string" ? condition.value : "";
-    const resolved = resolveLabelId(currentValue, labelNameById, labelIdByName);
-    if (!resolved) {
-      if (currentValue) unknown.push(currentValue.trim());
-      return condition;
-    }
-
-    const hasChanged = condition.value !== resolved || condition.operator !== "equals";
-    if (!hasChanged) return condition;
-    changed = true;
-    return {
-      ...condition,
-      operator: "equals",
-      value: resolved,
-    };
   });
 
   return [normalized, unknown, changed];
