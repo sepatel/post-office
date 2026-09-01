@@ -6,6 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use post_office_core::config::AppConfig;
 use post_office_core::db::Database;
 use post_office_core::llm::InferenceRouter;
+use post_office_core::llm::InferenceRuntime;
 use post_office_core::processing::{mark_last_successful, OpProgress, ProcessingState};
 use post_office_core::sync::{queue_notification, replay_history, start_watch};
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,7 @@ pub fn spawn(
     db: Arc<Database>,
     states: ProcessingStates,
     config: Arc<Mutex<AppConfig>>,
+    inference_runtime: InferenceRuntime,
 ) -> mpsc::UnboundedSender<SyncTrigger> {
     let (tx, mut rx) = mpsc::unbounded_channel::<SyncTrigger>();
 
@@ -74,6 +76,7 @@ pub fn spawn(
     let db_loop = db.clone();
     let states_loop = states.clone();
     let config_loop = config.clone();
+    let inference_runtime_loop = inference_runtime.clone();
 
     tauri::async_runtime::spawn(async move {
         let _ = loop_tx.send(SyncTrigger::Startup);
@@ -143,7 +146,8 @@ pub fn spawn(
                 };
 
                 let llm =
-                    InferenceRouter::from_config(&cfg).with_database(db_loop.as_ref().clone());
+                    InferenceRouter::from_config_with_runtime(&cfg, inference_runtime_loop.clone())
+                        .with_database(db_loop.as_ref().clone());
                 let mut gmail = post_office_core::gmail::GmailClient::new(auth);
 
                 if let Err(e) =

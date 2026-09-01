@@ -23,6 +23,10 @@ export interface ProviderProfile {
   output_cost_per_million_usd: number;
   timeout_secs: number;
   context_window_tokens: number;
+  max_concurrent_requests: number;
+  max_emails_per_request: number;
+  decision_reasoning_effort: string;
+  chat_reasoning_effort: string;
   enabled: boolean;
 }
 
@@ -43,6 +47,10 @@ export interface InferenceConfig {
   llm_output_cost_per_million_usd: number;
   llm_timeout_secs: number;
   llm_context_window_tokens: number;
+  llm_legacy_max_concurrent_requests: number;
+  llm_legacy_max_emails_per_request: number;
+  llm_legacy_decision_reasoning_effort: string;
+  llm_legacy_chat_reasoning_effort: string;
   llm_legacy_name: string;
   llm_legacy_quality_tier: string;
   llm_legacy_privacy_status: string;
@@ -71,6 +79,17 @@ const REQUIREMENT_OPTIONS: DropdownOption[] = [
   { value: "local_or_zdr", label: "Local or ZDR" },
   { value: "zdr_only", label: "ZDR only" },
   { value: "local_only", label: "Local only" },
+];
+
+const REASONING_OPTIONS: DropdownOption[] = [
+  { value: "off", label: "Off" },
+  { value: "server_default", label: "Server default" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra high" },
+  { value: "max", label: "Maximum" },
 ];
 
 const DEFAULT_POLICY: RoutingPolicy = {
@@ -282,6 +301,10 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
         output_cost_per_million_usd: legacy.output_cost_per_million_usd,
         timeout_secs: legacy.timeout_secs,
         context_window_tokens: legacy.context_window_tokens,
+        legacy_max_concurrent_requests: legacy.max_concurrent_requests,
+        legacy_max_emails_per_request: legacy.max_emails_per_request,
+        legacy_decision_reasoning_effort: legacy.decision_reasoning_effort,
+        legacy_chat_reasoning_effort: legacy.chat_reasoning_effort,
         legacy_name: legacy.name,
         legacy_quality_tier: legacy.quality_tier,
         legacy_privacy_status: legacy.privacy_status,
@@ -301,6 +324,10 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
         llm_output_cost_per_million_usd: legacy.output_cost_per_million_usd,
         llm_timeout_secs: legacy.timeout_secs,
         llm_context_window_tokens: legacy.context_window_tokens,
+        llm_legacy_max_concurrent_requests: legacy.max_concurrent_requests,
+        llm_legacy_max_emails_per_request: legacy.max_emails_per_request,
+        llm_legacy_decision_reasoning_effort: legacy.decision_reasoning_effort,
+        llm_legacy_chat_reasoning_effort: legacy.chat_reasoning_effort,
         llm_legacy_name: legacy.name,
         llm_legacy_quality_tier: legacy.quality_tier,
         llm_legacy_privacy_status: legacy.privacy_status,
@@ -326,7 +353,7 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
     } catch (error) {
       setTestResults({
         ...testResults,
-        [provider.id]: { ok: false, model: "", error: String(error) },
+        [provider.id]: { ok: false, model: "", error: String(error), duration_ms: null, completion_tokens: null },
       });
     } finally {
       setTestingProviderId(null);
@@ -439,11 +466,13 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
                     <span>{formatCost(provider)}</span>
                     <span>{provider.timeout_secs}s timeout</span>
                     <span>{formatTokens(provider.context_window_tokens)} context</span>
+                    <span>{provider.max_concurrent_requests} in flight / {provider.max_emails_per_request} emails</span>
+                    <span>decisions: {reasoningLabel(provider.decision_reasoning_effort)}</span>
                     <span>{provider.id === "legacy" ? "Compatibility endpoint" : `Key: ${provider.api_key_ref || provider.id}`}</span>
                   </div>
                   {result && (
                     <div className={`mt-3 text-xs ${result.ok ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>
-                      {result.ok ? `Connected • ${result.model || provider.model}` : result.error}
+                      {result.ok ? `Connected • ${result.model || provider.model}${result.duration_ms != null ? ` • ${(result.duration_ms / 1000).toFixed(1)}s` : ""}${result.completion_tokens != null ? ` • ${result.completion_tokens} output tokens` : ""}` : result.error}
                     </div>
                   )}
                 </button>
@@ -712,6 +741,28 @@ function ProviderForm({
         </Field>
       </div>
       <div className="rounded-xl bg-gray-50 p-3 dark:bg-gray-900/60">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-gray-500 dark:text-gray-400">Performance preset</span>
+          <button type="button" onClick={() => set({ max_concurrent_requests: 1, max_emails_per_request: 3, decision_reasoning_effort: "off", chat_reasoning_effort: "server_default" })} className="rounded-full border border-gray-300 px-3 py-1 text-xs font-medium text-gray-700 hover:bg-white dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800">Local machine</button>
+          <button type="button" onClick={() => set({ max_concurrent_requests: 4, max_emails_per_request: 6, decision_reasoning_effort: "off", chat_reasoning_effort: "server_default" })} className="rounded-full border border-gray-300 px-3 py-1 text-xs font-medium text-gray-700 hover:bg-white dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800">Hosted API</button>
+        </div>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field label="Requests in flight">
+            <input type="number" min="1" max="10" value={draft.max_concurrent_requests} onChange={(e) => set({ max_concurrent_requests: Math.max(1, Number(e.target.value)) })} className={inputClass} />
+          </Field>
+          <Field label="Emails per decision request">
+            <input type="number" min="1" max="10" value={draft.max_emails_per_request} onChange={(e) => set({ max_emails_per_request: Math.max(1, Number(e.target.value)) })} className={inputClass} />
+          </Field>
+          <Field label="Decision thinking">
+            <Dropdown value={draft.decision_reasoning_effort} options={REASONING_OPTIONS} onChange={(value) => set({ decision_reasoning_effort: value })} />
+          </Field>
+          <Field label="Rule-chat thinking">
+            <Dropdown value={draft.chat_reasoning_effort} options={REASONING_OPTIONS} onChange={(value) => set({ chat_reasoning_effort: value })} />
+          </Field>
+        </div>
+        <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">The app shares this endpoint's in-flight limit across rules and accounts. Local concurrency above one requires llama.cpp slots and KV-cache headroom.</p>
+      </div>
+      <div className="rounded-xl bg-gray-50 p-3 dark:bg-gray-900/60">
         <Field label="API key">
           <input
             type="password"
@@ -734,7 +785,7 @@ function ProviderForm({
       {testResult && (
         <p className={`text-sm ${testResult.ok ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>
           {testResult.ok
-            ? `Connected to ${testResult.model || draft.model}`
+            ? `Connected to ${testResult.model || draft.model}${testResult.duration_ms != null ? ` in ${(testResult.duration_ms / 1000).toFixed(1)}s` : ""}${testResult.completion_tokens != null ? ` (${testResult.completion_tokens} output tokens)` : ""}`
             : testResult.error}
         </p>
       )}
@@ -887,6 +938,10 @@ function newProvider(): ProviderProfile {
     output_cost_per_million_usd: 0,
     timeout_secs: 30,
     context_window_tokens: 8192,
+    max_concurrent_requests: 4,
+    max_emails_per_request: 6,
+    decision_reasoning_effort: "off",
+    chat_reasoning_effort: "server_default",
     enabled: true,
   };
 }
@@ -927,6 +982,10 @@ function withLegacyProvider(config: InferenceConfig): ProviderProfile[] {
       output_cost_per_million_usd: config.llm_output_cost_per_million_usd,
       timeout_secs: config.llm_timeout_secs,
       context_window_tokens: config.llm_context_window_tokens,
+      max_concurrent_requests: config.llm_legacy_max_concurrent_requests,
+      max_emails_per_request: config.llm_legacy_max_emails_per_request,
+      decision_reasoning_effort: config.llm_legacy_decision_reasoning_effort,
+      chat_reasoning_effort: config.llm_legacy_chat_reasoning_effort,
       enabled: config.llm_legacy_enabled,
     },
     ...config.llm_providers.filter((provider) => provider.id !== "legacy"),
@@ -956,6 +1015,10 @@ function formatCost(provider: ProviderProfile): string {
 
 function formatTokens(tokens: number): string {
   return tokens >= 1000 ? `${tokens / 1000}k` : `${tokens}`;
+}
+
+function reasoningLabel(value: string): string {
+  return REASONING_OPTIONS.find((option) => option.value === value)?.label ?? value;
 }
 
 function activeRateLimit(status: LlmProviderStatus | undefined): Date | null {

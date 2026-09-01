@@ -50,6 +50,7 @@ pub fn ensure_polling_started(
     let db_clone = Arc::new(state.db.clone());
     let state_clone = state.processing_state_for(&account_email);
     let config_clone = state.config.clone();
+    let inference_runtime = state.inference_runtime.clone();
     let config_for_auth = config.clone();
     let pollers_started = state.pollers_started.clone();
     tauri::async_runtime::spawn(async move {
@@ -63,6 +64,7 @@ pub fn ensure_polling_started(
                     state_clone,
                     gmail,
                     config_clone,
+                    inference_runtime,
                     account_email.clone(),
                     move |progress| {
                         let _ = emit_handle.emit(
@@ -544,6 +546,10 @@ pub struct LlmConfigUpdate {
     pub output_cost_per_million_usd: f64,
     pub timeout_secs: u64,
     pub context_window_tokens: u32,
+    pub legacy_max_concurrent_requests: u8,
+    pub legacy_max_emails_per_request: u8,
+    pub legacy_decision_reasoning_effort: post_office_core::llm::ReasoningEffort,
+    pub legacy_chat_reasoning_effort: post_office_core::llm::ReasoningEffort,
     pub legacy_name: String,
     pub legacy_quality_tier: String,
     pub legacy_privacy_status: String,
@@ -566,6 +572,10 @@ pub async fn llm_config_set(
     config.llm_output_cost_per_million_usd = update.output_cost_per_million_usd;
     config.llm_timeout_secs = update.timeout_secs;
     config.llm_context_window_tokens = update.context_window_tokens;
+    config.llm_legacy_max_concurrent_requests = update.legacy_max_concurrent_requests;
+    config.llm_legacy_max_emails_per_request = update.legacy_max_emails_per_request;
+    config.llm_legacy_decision_reasoning_effort = update.legacy_decision_reasoning_effort;
+    config.llm_legacy_chat_reasoning_effort = update.legacy_chat_reasoning_effort;
     config.llm_legacy_name = update.legacy_name;
     config.llm_legacy_quality_tier = update.legacy_quality_tier;
     config.llm_legacy_privacy_status = update.legacy_privacy_status;
@@ -675,6 +685,15 @@ pub async fn rules_delete(state: State<'_, AppState>, id: i64) -> Result<(), Str
 }
 
 #[tauri::command]
+pub async fn rules_reorder(state: State<'_, AppState>, ids: Vec<i64>) -> Result<(), String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    state
+        .db
+        .with_rules(|repo| repo.reorder(&account_email, &ids))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn rule_chat_history(
     state: State<'_, AppState>,
     rule_id: i64,
@@ -735,7 +754,8 @@ pub async fn rule_chat_send(
     let account_email = active_account(&*state.config.lock().await)?;
     let llm = {
         let config = state.config.lock().await;
-        InferenceRouter::from_config(&config).with_database(state.db.clone())
+        InferenceRouter::from_config_with_runtime(&config, state.inference_runtime.clone())
+            .with_database(state.db.clone())
     };
 
     chat_with_rule(&state.db, &llm, &account_email, rule_id, &message)
@@ -803,7 +823,9 @@ pub async fn rules_test(
         let config = state.config.lock().await;
         let account_email = active_account(&config)?;
         let auth = load_gmail_auth(&app, &config)?;
-        let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
+        let llm =
+            InferenceRouter::from_config_with_runtime(&config, state.inference_runtime.clone())
+                .with_database(state.db.clone());
         (account_email, auth, llm)
     };
 
@@ -888,7 +910,9 @@ pub async fn bulk_evaluate(
         let config = state.config.lock().await;
         let account_email = active_account(&config)?;
         let auth = load_gmail_auth(&app, &config)?;
-        let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
+        let llm =
+            InferenceRouter::from_config_with_runtime(&config, state.inference_runtime.clone())
+                .with_database(state.db.clone());
         (account_email, auth, llm)
     };
 
@@ -939,7 +963,9 @@ pub async fn rules_apply(
         let config = state.config.lock().await;
         let account_email = active_account(&config)?;
         let auth = load_gmail_auth(&app, &config)?;
-        let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
+        let llm =
+            InferenceRouter::from_config_with_runtime(&config, state.inference_runtime.clone())
+                .with_database(state.db.clone());
         (account_email, auth, llm)
     };
 
@@ -1051,6 +1077,31 @@ pub async fn rule_roi_metrics(
 }
 
 #[tauri::command]
+pub async fn rule_request_metrics(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::llm_requests::RuleRequestMetrics>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    state
+        .db
+        .with_llm_requests(|repo| repo.rule_metrics(&account_email))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rule_activity(
+    state: State<'_, AppState>,
+    rule_id: i64,
+    page: u32,
+    per_page: u32,
+) -> Result<Vec<post_office_core::db::history::HistoryEntry>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    state
+        .db
+        .with_history(|repo| repo.by_rule(&account_email, rule_id, page, per_page))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn history_search(
     state: State<'_, AppState>,
     query: String,
@@ -1076,12 +1127,45 @@ pub async fn inference_jobs_list(
 }
 
 #[tauri::command]
-pub async fn inference_job_retry(state: State<'_, AppState>, job_id: i64) -> Result<bool, String> {
+pub async fn rule_inference_jobs(
+    state: State<'_, AppState>,
+    rule_id: i64,
+    page: u32,
+    per_page: u32,
+) -> Result<Vec<post_office_core::db::inference::InferenceJob>, String> {
     let account_email = active_account(&*state.config.lock().await)?;
     state
         .db
-        .with_inference(|repo| repo.retry(&account_email, job_id))
+        .with_inference(|repo| repo.list_for_rule(&account_email, rule_id, page, per_page))
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn inference_job_attempts(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> Result<Vec<post_office_core::db::inference::InferenceAttempt>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    state
+        .db
+        .with_inference(|repo| repo.attempts(&account_email, job_id))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn inference_job_retry(state: State<'_, AppState>, job_id: i64) -> Result<bool, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    let queued = state
+        .db
+        .with_inference(|repo| repo.retry(&account_email, job_id))
+        .map_err(|e| e.to_string())?;
+    if queued {
+        state
+            .sync_trigger
+            .send(SyncTrigger::Manual)
+            .map_err(|_| "Inference worker is unavailable".to_string())?;
+    }
+    Ok(queued)
 }
 
 #[tauri::command]
@@ -1209,7 +1293,8 @@ pub async fn sync_replay_now(
         .clone()
         .ok_or_else(|| "No Gmail account configured".to_string())?;
     let auth = load_gmail_auth(&app, &cfg)?;
-    let llm = InferenceRouter::from_config(&cfg).with_database(state.db.clone());
+    let llm = InferenceRouter::from_config_with_runtime(&cfg, state.inference_runtime.clone())
+        .with_database(state.db.clone());
     let mut gmail = GmailClient::new(auth);
 
     let db = Arc::new(state.db.clone());
@@ -1367,7 +1452,9 @@ pub async fn processing_backfill(
         let config = state.config.lock().await;
         let account_email = active_account(&config)?;
         let auth = load_gmail_auth(&app, &config)?;
-        let llm = InferenceRouter::from_config(&config).with_database(state.db.clone());
+        let llm =
+            InferenceRouter::from_config_with_runtime(&config, state.inference_runtime.clone())
+                .with_database(state.db.clone());
         (account_email, auth, llm)
     };
 
@@ -1523,11 +1610,15 @@ pub async fn llm_test(
             ok: true,
             model: resp.model,
             error: None,
+            duration_ms: Some(resp.duration_ms),
+            completion_tokens: resp.completion_tokens,
         }),
         Err(e) => Ok(LlmTestResult {
             ok: false,
             model: String::new(),
             error: Some(e.user_message()),
+            duration_ms: None,
+            completion_tokens: None,
         }),
     }
 }
@@ -1539,10 +1630,15 @@ pub struct LlmProviderTestProfile {
     pub model: String,
     pub api_key_ref: String,
     pub timeout_secs: u64,
+    #[serde(default = "default_provider_concurrency")]
+    pub max_concurrent_requests: u8,
+    #[serde(default)]
+    pub decision_reasoning_effort: post_office_core::llm::ReasoningEffort,
 }
 
 #[tauri::command]
 pub async fn llm_provider_test(
+    state: State<'_, AppState>,
     provider: LlmProviderTestProfile,
     api_key: Option<String>,
 ) -> Result<LlmTestResult, String> {
@@ -1564,18 +1660,40 @@ pub async fn llm_provider_test(
         provider.timeout_secs,
         Some(provider.id),
     );
-    match client.test_connection().await {
+    let _permit = state
+        .inference_runtime
+        .acquire(
+            &provider
+                .base_url
+                .trim()
+                .trim_end_matches('/')
+                .to_ascii_lowercase(),
+            provider.max_concurrent_requests as usize,
+        )
+        .await;
+    match client
+        .test_connection_with_reasoning(provider.decision_reasoning_effort.request_value())
+        .await
+    {
         Ok(response) => Ok(LlmTestResult {
             ok: true,
             model: response.model,
             error: None,
+            duration_ms: Some(response.duration_ms),
+            completion_tokens: response.completion_tokens,
         }),
         Err(error) => Ok(LlmTestResult {
             ok: false,
             model: String::new(),
             error: Some(error.user_message()),
+            duration_ms: None,
+            completion_tokens: None,
         }),
     }
+}
+
+fn default_provider_concurrency() -> u8 {
+    1
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1583,6 +1701,8 @@ pub struct LlmTestResult {
     pub ok: bool,
     pub model: String,
     pub error: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub completion_tokens: Option<u32>,
 }
 
 /// Lists the model ids an OpenAI-compatible endpoint exposes. Returns an error
