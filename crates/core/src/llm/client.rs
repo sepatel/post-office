@@ -1,5 +1,6 @@
 use async_openai::{config::OpenAIConfig, Client};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{LlmError, ProcessRequest, ProcessResponse};
@@ -67,6 +68,12 @@ impl LlmClient {
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+        if let Some(reasoning_effort) = request.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort);
+            if request.litellm_reasoning_passthrough {
+                body["allowed_openai_params"] = json!(["reasoning_effort"]);
+            }
+        }
 
         let response: Value = self.client.chat().create_byot(body).await?;
 
@@ -86,6 +93,12 @@ impl LlmClient {
         let tokens_used = response["usage"]["total_tokens"].as_u64().map(|t| t as u32);
 
         let model_used = response["model"].as_str().unwrap_or(&model).to_string();
+        let request_key = response["id"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!("local-{}", REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+            });
 
         Ok(ProcessResponse {
             content,
@@ -95,6 +108,7 @@ impl LlmClient {
             completion_tokens,
             tokens_used,
             duration_ms,
+            request_key,
         })
     }
 
@@ -111,14 +125,33 @@ impl LlmClient {
     /// id when the server aliases it). Surfaces endpoint/auth/model problems
     /// early instead of failing silently during a rule test or apply.
     pub async fn test_connection(&self) -> Result<ProcessResponse, LlmError> {
-        self.process(ProcessRequest {
+        self.test_connection_with_reasoning(None).await
+    }
+
+    pub async fn test_connection_with_reasoning(
+        &self,
+        reasoning_effort: Option<&str>,
+    ) -> Result<ProcessResponse, LlmError> {
+        let mut request = ProcessRequest {
             system_prompt: Some("Reply with the single word OK.".into()),
             user_prompt: "Test.".into(),
             model: None,
             temperature: Some(0.0),
             max_tokens: Some(5),
-        })
-        .await
+            kind: super::ProcessKind::Health,
+            reasoning_effort: reasoning_effort.map(str::to_string),
+            litellm_reasoning_passthrough: false,
+        };
+        match self.process(request.clone()).await {
+            Err(error)
+                if request.reasoning_effort.is_some()
+                    && error.requires_litellm_reasoning_passthrough() =>
+            {
+                request.litellm_reasoning_passthrough = true;
+                self.process(request).await
+            }
+            response => response,
+        }
     }
 
     /// Chat that expects a JSON object back. Used by the rule-tuning chat, where
@@ -154,6 +187,8 @@ impl LlmClient {
         serde_json::from_str(&content).map_err(|e| LlmError::ParseError(e.to_string()))
     }
 }
+
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn strip_code_fence(content: &str) -> String {
     let trimmed = content.trim();

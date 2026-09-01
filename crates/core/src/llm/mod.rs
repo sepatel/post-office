@@ -1,9 +1,13 @@
 pub mod client;
 pub mod credentials;
 pub mod router;
+pub mod runtime;
 
 pub use client::LlmClient;
-pub use router::{InferenceRouter, LlmProviderProfile, LlmRoutingPolicy, PrivacyRequirement};
+pub use router::{
+    InferenceRouter, LlmProviderProfile, LlmRoutingPolicy, PrivacyRequirement, ReasoningEffort,
+};
+pub use runtime::InferenceRuntime;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -44,6 +48,20 @@ impl LlmError {
             None => format!("LLM API error: {message}"),
         }
     }
+
+    pub fn requires_litellm_reasoning_passthrough(&self) -> bool {
+        self.user_message()
+            .contains("litellm.UnsupportedParamsError")
+            && self.user_message().contains("reasoning_effort")
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub enum ProcessKind {
+    #[default]
+    Decision,
+    Chat,
+    Health,
 }
 
 #[derive(Clone, Default)]
@@ -53,6 +71,9 @@ pub struct ProcessRequest {
     pub model: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub kind: ProcessKind,
+    pub reasoning_effort: Option<String>,
+    pub litellm_reasoning_passthrough: bool,
 }
 
 impl ProcessRequest {
@@ -63,6 +84,9 @@ impl ProcessRequest {
             model: None,
             temperature: None,
             max_tokens: None,
+            kind: ProcessKind::Decision,
+            reasoning_effort: None,
+            litellm_reasoning_passthrough: false,
         }
     }
 }
@@ -75,6 +99,7 @@ pub struct ProcessResponse {
     pub completion_tokens: Option<u32>,
     pub tokens_used: Option<u32>,
     pub duration_ms: u64,
+    pub request_key: String,
 }
 
 #[cfg(test)]
@@ -94,5 +119,17 @@ mod tests {
             error.user_message(),
             "LLM API error: 404: No eligible endpoints"
         );
+    }
+
+    #[test]
+    fn recognizes_litellm_reasoning_rejection() {
+        let content = r#"{"error":{"message":"litellm.UnsupportedParamsError: openai does not support parameters: ['reasoning_effort']","code":400}}"#;
+        let decode_error = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let error = LlmError::Api(async_openai::error::OpenAIError::JSONDeserialize(
+            decode_error,
+            content.into(),
+        ));
+
+        assert!(error.requires_litellm_reasoning_passthrough());
     }
 }

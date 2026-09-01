@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::config::AppConfig;
 use crate::db::history::NewHistoryEntry;
-use crate::db::llm_usage::NewLlmUsageEntry;
+use crate::db::llm_requests::NewLlmRequest;
 use crate::db::Database;
 use crate::gmail::models::{Message, MessageRef};
 use crate::rules::engine::{no_action_reason, resolve_rule, Outcome, Resolved};
@@ -34,7 +34,7 @@ pub struct OpProgress {
     pub current_email_sent_at: Option<String>,
 }
 use crate::gmail::GmailClient;
-use crate::llm::InferenceRouter;
+use crate::llm::{InferenceRouter, InferenceRuntime};
 use crate::rules::actions::execute_actions;
 use crate::rules::models::Rule;
 use crate::rules::response_parser::ParsedAction;
@@ -255,6 +255,7 @@ pub async fn run_processing_loop(
     state: Arc<Mutex<ProcessingState>>,
     mut gmail: GmailClient,
     config: Arc<Mutex<AppConfig>>,
+    inference_runtime: InferenceRuntime,
     account_email: String,
     on_progress: impl Fn(OpProgress),
 ) {
@@ -305,7 +306,8 @@ pub async fn run_processing_loop(
         }
 
         let floor = resolve_floor(&db, &account_email);
-        let llm = InferenceRouter::from_config(&cfg).with_database(db.as_ref().clone());
+        let llm = InferenceRouter::from_config_with_runtime(&cfg, inference_runtime.clone())
+            .with_database(db.as_ref().clone());
         let stop_requested = state.lock().await.stop_requested.clone();
         match run_pipeline(
             &db,
@@ -484,6 +486,7 @@ async fn process_inference_job(
     let resolved = resolve_rule(llm, &rule, &email, &memories, &labels)
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+    record_llm_request(db, account_email, &rule, &resolved, "retry");
     match resolved.outcome {
         // A retried email still has to reach lower-priority rules, otherwise a
         // transient failure on one rule silently exempts it from all the others.
@@ -519,7 +522,7 @@ async fn process_inference_job(
     }
 
     if resolved.actions.is_empty() {
-        let history_id = insert_history_entry(
+        insert_history_entry(
             db,
             account_email,
             NewHistoryEntry {
@@ -542,29 +545,6 @@ async fn process_inference_job(
                 policy_id: Some(rule.inference_policy.clone()),
             },
         );
-        if let Some(model) = resolved.llm_model.as_ref() {
-            insert_llm_usage_entry(
-                db,
-                account_email,
-                NewLlmUsageEntry {
-                    history_id,
-                    email_id: email.id.clone(),
-                    rule_id: rule.id,
-                    model: Some(model.clone()),
-                    prompt_tokens: resolved.prompt_tokens.map(|value| value as i64),
-                    completion_tokens: resolved.completion_tokens.map(|value| value as i64),
-                    total_tokens: resolved.total_tokens.map(|value| value as i64),
-                    duration_ms: resolved.llm_duration_ms.map(|value| value as i64),
-                    estimated_cost_usd: estimate_llm_cost(
-                        config,
-                        resolved.prompt_tokens,
-                        resolved.completion_tokens,
-                        resolved.total_tokens,
-                    ),
-                    source: "retry".into(),
-                },
-            );
-        }
         retry_fallthrough(
             db,
             account_email,
@@ -591,7 +571,7 @@ async fn process_inference_job(
         .map(|action| history_action_label(action, &labels))
         .collect::<Vec<_>>()
         .join(", ");
-    let history_id = insert_history_entry(
+    insert_history_entry(
         db,
         account_email,
         NewHistoryEntry {
@@ -610,30 +590,6 @@ async fn process_inference_job(
             policy_id: Some(rule.inference_policy.clone()),
         },
     );
-    if let Some(model) = resolved.llm_model.as_ref() {
-        insert_llm_usage_entry(
-            db,
-            account_email,
-            NewLlmUsageEntry {
-                history_id,
-                email_id: email.id.clone(),
-                rule_id: rule.id,
-                model: Some(model.clone()),
-                prompt_tokens: resolved.prompt_tokens.map(|value| value as i64),
-                completion_tokens: resolved.completion_tokens.map(|value| value as i64),
-                total_tokens: resolved.total_tokens.map(|value| value as i64),
-                duration_ms: resolved.llm_duration_ms.map(|value| value as i64),
-                estimated_cost_usd: estimate_llm_cost(
-                    config,
-                    resolved.prompt_tokens,
-                    resolved.completion_tokens,
-                    resolved.total_tokens,
-                ),
-                source: "retry".into(),
-            },
-        );
-    }
-
     if let Some(error) = error {
         return Err(error.into());
     }
@@ -710,29 +666,40 @@ fn insert_history_entry(
     }
 }
 
-fn insert_llm_usage_entry(db: &Arc<Database>, account_email: &str, entry: NewLlmUsageEntry) {
-    if let Err(e) = db.with_llm_usage(|repo| repo.insert(account_email, &entry)) {
-        tracing::error!("Failed to insert llm usage entry: {}", e);
+fn record_llm_request(
+    db: &Arc<Database>,
+    account_email: &str,
+    rule: &Rule,
+    resolved: &Resolved,
+    source: &str,
+) {
+    let (Some(request_key), Some(model), Some(duration_ms)) = (
+        resolved.llm_request_key.as_deref(),
+        resolved.llm_model.as_deref(),
+        resolved.llm_duration_ms,
+    ) else {
+        return;
+    };
+    let request = NewLlmRequest {
+        rule_id: rule.id,
+        request_key: format!(
+            "{}:{request_key}",
+            resolved.llm_provider.as_deref().unwrap_or("unknown")
+        ),
+        source: source.to_string(),
+        kind: "decision".into(),
+        provider_id: resolved.llm_provider.clone(),
+        model: model.to_string(),
+        policy_id: Some(rule.inference_policy.clone()),
+        email_count: resolved.llm_request_email_count.unwrap_or(1) as i64,
+        prompt_tokens: resolved.prompt_tokens.map(|value| value as i64),
+        completion_tokens: resolved.completion_tokens.map(|value| value as i64),
+        total_tokens: resolved.total_tokens.map(|value| value as i64),
+        duration_ms: duration_ms as i64,
+    };
+    if let Err(error) = db.with_llm_requests(|repo| repo.insert(account_email, &request)) {
+        tracing::error!("Failed to record LLM request: {}", error);
     }
-}
-
-fn estimate_llm_cost(
-    config: &AppConfig,
-    prompt_tokens: Option<u32>,
-    completion_tokens: Option<u32>,
-    total_tokens: Option<u32>,
-) -> Option<f64> {
-    if let (Some(prompt), Some(completion)) = (prompt_tokens, completion_tokens) {
-        return Some(
-            (prompt as f64 * config.llm_input_cost_per_million_usd / 1_000_000.0)
-                + (completion as f64 * config.llm_output_cost_per_million_usd / 1_000_000.0),
-        );
-    }
-
-    let total = total_tokens? as f64;
-    let blended_rate =
-        (config.llm_input_cost_per_million_usd + config.llm_output_cost_per_million_usd) / 2.0;
-    Some(total * blended_rate / 1_000_000.0)
 }
 
 /// Run one query against a selected rule set.
@@ -1212,13 +1179,6 @@ async fn process_message_refs(
         };
 
         for (item, resolved) in emails.iter().zip(batch.resolved.iter()) {
-            let llm_cost = estimate_llm_cost(
-                config,
-                resolved.prompt_tokens,
-                resolved.completion_tokens,
-                resolved.total_tokens,
-            );
-
             if resolved.outcome != Outcome::Matched || resolved.actions.is_empty() {
                 let (action, status, error) = match resolved.outcome {
                     Outcome::NoMatch => (
@@ -1254,7 +1214,7 @@ async fn process_message_refs(
                         )),
                     ),
                 };
-                let history_id = insert_history_entry(
+                insert_history_entry(
                     db,
                     account_email,
                     NewHistoryEntry {
@@ -1274,24 +1234,7 @@ async fn process_message_refs(
                     },
                 );
 
-                if resolved.llm_model.is_some() {
-                    insert_llm_usage_entry(
-                        db,
-                        account_email,
-                        NewLlmUsageEntry {
-                            history_id,
-                            email_id: item.email.id.clone(),
-                            rule_id: rule.id,
-                            model: resolved.llm_model.clone(),
-                            prompt_tokens: resolved.prompt_tokens.map(|v| v as i64),
-                            completion_tokens: resolved.completion_tokens.map(|v| v as i64),
-                            total_tokens: resolved.total_tokens.map(|v| v as i64),
-                            duration_ms: resolved.llm_duration_ms.map(|v| v as i64),
-                            estimated_cost_usd: llm_cost,
-                            source: source.as_str().to_string(),
-                        },
-                    );
-                }
+                record_llm_request(db, account_email, &rule, resolved, source.as_str());
                 if continues_past(&rule, resolved.outcome) {
                     process_fallthrough(
                         db,
@@ -1323,7 +1266,7 @@ async fn process_message_refs(
                     .join(", ");
                 let status = if error.is_none() { "success" } else { "error" };
 
-                let history_id = insert_history_entry(
+                insert_history_entry(
                     db,
                     account_email,
                     NewHistoryEntry {
@@ -1343,24 +1286,7 @@ async fn process_message_refs(
                     },
                 );
 
-                if resolved.llm_model.is_some() {
-                    insert_llm_usage_entry(
-                        db,
-                        account_email,
-                        NewLlmUsageEntry {
-                            history_id,
-                            email_id: item.email.id.clone(),
-                            rule_id: rule.id,
-                            model: resolved.llm_model.clone(),
-                            prompt_tokens: resolved.prompt_tokens.map(|v| v as i64),
-                            completion_tokens: resolved.completion_tokens.map(|v| v as i64),
-                            total_tokens: resolved.total_tokens.map(|v| v as i64),
-                            duration_ms: resolved.llm_duration_ms.map(|v| v as i64),
-                            estimated_cost_usd: llm_cost,
-                            source: source.as_str().to_string(),
-                        },
-                    );
-                }
+                record_llm_request(db, account_email, &rule, resolved, source.as_str());
 
                 if continues_past(&rule, Outcome::Matched) {
                     process_fallthrough(
@@ -1633,7 +1559,7 @@ fn fallthrough_summary(rules: &[Rule], current_rule_id: i64, considered: usize) 
 fn record_fallthrough(
     db: &Arc<Database>,
     account_email: &str,
-    config: &AppConfig,
+    _config: &AppConfig,
     source: PipelineSource,
     email: &Message,
     email_from: Option<&str>,
@@ -1644,7 +1570,7 @@ fn record_fallthrough(
     status: &str,
     error: Option<String>,
 ) {
-    let history_id = insert_history_entry(
+    insert_history_entry(
         db,
         account_email,
         NewHistoryEntry {
@@ -1664,33 +1590,9 @@ fn record_fallthrough(
             policy_id: Some(rule.inference_policy.clone()),
         },
     );
-    let Some(resolved) = resolved else {
-        return;
-    };
-    let Some(model) = resolved.llm_model.clone() else {
-        return;
-    };
-    insert_llm_usage_entry(
-        db,
-        account_email,
-        NewLlmUsageEntry {
-            history_id,
-            email_id: email.id.clone(),
-            rule_id: rule.id,
-            model: Some(model),
-            prompt_tokens: resolved.prompt_tokens.map(|value| value as i64),
-            completion_tokens: resolved.completion_tokens.map(|value| value as i64),
-            total_tokens: resolved.total_tokens.map(|value| value as i64),
-            duration_ms: resolved.llm_duration_ms.map(|value| value as i64),
-            estimated_cost_usd: estimate_llm_cost(
-                config,
-                resolved.prompt_tokens,
-                resolved.completion_tokens,
-                resolved.total_tokens,
-            ),
-            source: source.as_str().into(),
-        },
-    );
+    if let Some(resolved) = resolved {
+        record_llm_request(db, account_email, rule, resolved, source.as_str());
+    }
 }
 
 /// One-off backfill over `[after, before]` applying only `rule_ids`.

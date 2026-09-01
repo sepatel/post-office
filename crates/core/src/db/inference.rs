@@ -95,6 +95,59 @@ impl<'a> InferenceRepository<'a> {
         rows.collect()
     }
 
+    pub fn list_for_rule(
+        &self,
+        account_email: &str,
+        rule_id: i64,
+        page: u32,
+        per_page: u32,
+    ) -> Result<Vec<InferenceJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, email_id, rule_id, source, status, attempt_count,
+                    next_attempt_at, lease_until, last_error, created_at, updated_at
+               FROM inference_jobs
+              WHERE account_email = ?1 AND rule_id = ?2 AND status <> 'succeeded'
+              ORDER BY updated_at DESC, id DESC
+              LIMIT ?3 OFFSET ?4",
+        )?;
+        let jobs = stmt
+            .query_map(
+                params![
+                    account_email,
+                    rule_id,
+                    per_page,
+                    page.saturating_mul(per_page)
+                ],
+                map_job,
+            )?
+            .collect();
+        jobs
+    }
+
+    pub fn attempts(&self, account_email: &str, job_id: i64) -> Result<Vec<InferenceAttempt>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.job_id, a.provider_id, a.model, a.status, a.error, a.created_at
+               FROM inference_attempts a
+               JOIN inference_jobs j ON j.id = a.job_id
+              WHERE j.account_email = ?1 AND a.job_id = ?2
+              ORDER BY a.created_at DESC, a.id DESC",
+        )?;
+        let attempts = stmt
+            .query_map(params![account_email, job_id], |row| {
+                Ok(InferenceAttempt {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    provider_id: row.get(2)?,
+                    model: row.get(3)?,
+                    status: row.get(4)?,
+                    error: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect();
+        attempts
+    }
+
     pub fn record_attempt(
         &self,
         job_id: i64,
@@ -166,7 +219,7 @@ impl<'a> InferenceRepository<'a> {
         let changed = self.conn.execute(
             "UPDATE inference_jobs
              SET status = 'pending', next_attempt_at = datetime('now'), lease_until = NULL,
-                 last_error = NULL, updated_at = datetime('now')
+                  attempt_count = 0, last_error = NULL, updated_at = datetime('now')
               WHERE id = ?1 AND account_email = ?2
                 AND status IN ('retrying', 'dead_letter', 'blocked', 'skipped')",
             params![job_id, account_email],
@@ -204,4 +257,15 @@ pub struct InferenceJob {
     pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InferenceAttempt {
+    pub id: i64,
+    pub job_id: i64,
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: String,
 }
