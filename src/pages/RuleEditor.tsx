@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   rulesCreate,
   rulesUpdate,
@@ -7,7 +7,7 @@ import {
   rulesList,
   ruleApplyProposal,
   ruleMetrics,
-  ruleRoiMetrics,
+  ruleRequestMetrics,
   gmailRecentMessages,
   rulesTest,
   rulesApply,
@@ -22,7 +22,7 @@ import {
   type MemoryEntry,
   type RecentMessage,
   type RuleMetrics,
-  type RuleRoiMetrics,
+  type RuleRequestMetrics,
   type TestResult,
   type ApplyResult,
   type BulkVerdict,
@@ -30,6 +30,7 @@ import {
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import RuleChatPanel from "../components/RuleChatPanel";
+import RuleActivity from "../components/RuleActivity";
 import ConditionBuilder, {
   Condition,
   normalizeConditionLabelIds as normalizeConditionLabelIdsRecursive,
@@ -45,6 +46,8 @@ type ActionType =
   | "mark_read"
   | "mark_unread"
   | "star";
+
+type RuleTab = "build" | "test" | "activity" | "learn";
 
 interface RuleAction {
   type: ActionType;
@@ -84,6 +87,7 @@ function needsLabelValue(action: ActionType): boolean {
 export default function RuleEditor() {
   const { id } = useParams();
   const ruleId = Number(id ?? 0);
+  const location = useLocation();
   const navigate = useNavigate();
   const isEdit = Boolean(id);
   const toast = useToast();
@@ -120,9 +124,11 @@ export default function RuleEditor() {
   const [pendingMemories, setPendingMemories] = useState<MemoryInput[]>([]);
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [metrics, setMetrics] = useState<RuleMetrics | null>(null);
-  const [roiMetrics, setRoiMetrics] = useState<RuleRoiMetrics | null>(null);
+  const [requestMetrics, setRequestMetrics] = useState<RuleRequestMetrics | null>(null);
   const [gmailLabels, setGmailLabels] = useState<GmailLabel[]>([]);
   const [labelsError, setLabelsError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<RuleTab>("build");
+  const [decisionMode, setDecisionMode] = useState<"automatic" | "match" | "classify">("automatic");
 
   const labelNameById = useMemo(
     () => new Map(gmailLabels.map((label) => [label.id, label.name])),
@@ -198,10 +204,14 @@ export default function RuleEditor() {
       loadMemories();
     } else {
       setMetrics(null);
-      setRoiMetrics(null);
+      setRequestMetrics(null);
       setMemories([]);
     }
   }, [id]);
+
+  useEffect(() => {
+    setActiveTab(location.pathname.endsWith("/chat") ? "learn" : "build");
+  }, [location.pathname]);
 
   useEffect(() => {
     if (gmailLabels.length === 0) return;
@@ -291,6 +301,13 @@ export default function RuleEditor() {
         setName(rule.name);
         setDescription(rule.description || "");
         setPrompt(rule.prompt);
+        setDecisionMode(
+          rule.choose_from_all_labels || (rule.choices?.length ?? 0) > 0
+            ? "classify"
+            : rule.prompt.trim()
+              ? "match"
+              : "automatic"
+        );
         setPriority(rule.priority);
         setEnabled(rule.enabled);
         setInferencePolicy(rule.inference_policy || "default");
@@ -324,9 +341,9 @@ export default function RuleEditor() {
   async function loadMetrics() {
     if (!isEdit) return;
     try {
-      const [all, roi] = await Promise.all([ruleMetrics(), ruleRoiMetrics()]);
+      const [all, requests] = await Promise.all([ruleMetrics(), ruleRequestMetrics()]);
       setMetrics(all.find((m) => m.rule_id === ruleId) ?? null);
-      setRoiMetrics(roi.find((m) => m.rule_id === ruleId) ?? null);
+      setRequestMetrics(requests.find((m) => m.rule_id === ruleId) ?? null);
     } catch (e) {
       console.error("Failed to load rule metrics:", e);
     }
@@ -384,6 +401,15 @@ export default function RuleEditor() {
   }
 
   function buildRulePayload() {
+    if (decisionMode === "automatic" && actions.length === 0) {
+      throw new Error("An automatic rule needs at least one action.");
+    }
+    if (decisionMode === "match" && !prompt.trim()) {
+      throw new Error("Add a decision instruction before testing or saving this rule.");
+    }
+    if (decisionMode === "classify" && !hasMenu) {
+      throw new Error("Add at least one outcome before testing or saving this rule.");
+    }
     const normalizedConditions = requireConditionLabelIdsRecursive(conditions, labelNameById, labelIdByName);
     const normalizeLabelValues = (items: RuleAction[], context: string) =>
       items.map((item) => {
@@ -456,14 +482,19 @@ export default function RuleEditor() {
       labelNameById,
       labelIdByName
     );
+    const [normalizedChoices, choiceErrors] = normalizeActionLabelIds(
+      proposal.choices_add as RuleAction[],
+      labelNameById,
+      labelIdByName
+    );
     const [normalizedConditions, conditionErrors] = normalizeConditionLabelIdsRecursive(
       proposal.conditions_add as Condition[],
       labelNameById,
       labelIdByName
     );
-    if (actionErrors.length > 0 || conditionErrors.length > 0) {
+    if (actionErrors.length > 0 || choiceErrors.length > 0 || conditionErrors.length > 0) {
       throw new Error(
-        [...actionErrors, ...conditionErrors]
+        [...actionErrors, ...choiceErrors, ...conditionErrors]
           .map((v) => `Unknown label: ${v}`)
           .join("; ")
       );
@@ -474,6 +505,9 @@ export default function RuleEditor() {
     }
     if (normalizedActions.length > 0) {
       setActions((prev) => [...prev, ...normalizedActions]);
+    }
+    if (normalizedChoices.length > 0) {
+      setChoices((prev) => [...prev, ...normalizedChoices]);
     }
     if (normalizedConditions.length > 0) {
       setConditions((prev) => [...prev, ...normalizedConditions]);
@@ -569,43 +603,73 @@ export default function RuleEditor() {
     }
   }
 
-  return (
-    <div className="h-full min-h-0 xl:grid xl:grid-cols-[minmax(0,2fr)_minmax(0,1.15fr)] gap-6">
-      <div className="min-w-0">
-        <h2 className="text-2xl font-bold mb-4">
-          {isEdit ? "Edit Rule" : "New Rule"}
-        </h2>
+  function selectDecisionMode(mode: "automatic" | "match" | "classify") {
+    setDecisionMode(mode);
+    if (mode === "automatic") {
+      setPrompt("");
+      setChoices([]);
+      setChooseFromAllLabels(false);
+      return;
+    }
+    if (mode === "match") {
+      setChoices([]);
+      setChooseFromAllLabels(false);
+      if (!prompt.trim()) setPrompt("Decide whether this email matches the rule.");
+      return;
+    }
+    if (!prompt.trim()) setPrompt("Classify this email into the best matching outcome.");
+  }
 
-        {isEdit && (
+  return (
+    <div className="mx-auto max-w-6xl">
+      <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-blue-600 dark:text-blue-300">Rule workspace</p>
+          <h2 className="mt-1 text-3xl font-semibold tracking-tight">{isEdit ? name || "Untitled rule" : "New rule"}</h2>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">Build the decision, validate it against real mail, then follow every outcome.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={handleSave} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-blue-700">{isEdit ? "Save changes" : "Create rule"}</button>
+          <button onClick={() => navigate("/rules")} className="rounded-lg px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800">Cancel</button>
+        </div>
+      </header>
+
+      <nav className="mb-6 flex max-w-2xl gap-1 rounded-xl border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
+        {(["build", "test", "activity", "learn"] as RuleTab[]).map((tab) => (
+          <button key={tab} type="button" onClick={() => setActiveTab(tab)} disabled={!isEdit && tab !== "build" && tab !== "test"} className={`flex-1 rounded-lg px-3 py-2 text-sm font-medium capitalize transition-colors ${activeTab === tab ? "bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-white" : "text-gray-500 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-40 dark:text-gray-400 dark:hover:text-white"}`}>{tab}</button>
+        ))}
+      </nav>
+
+        {isEdit && activeTab === "activity" && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
             <MetricCard
               label="Last 24h"
               checked={metrics?.checked_24h ?? 0}
               succeeded={metrics?.succeeded_24h ?? 0}
-              llmCalls={metrics?.llm_calls_24h ?? 0}
-              llmChecks={roiMetrics?.llm_checks_24h ?? 0}
-              estimatedCostUsd={roiMetrics?.estimated_cost_24h_usd ?? 0}
-              avgDurationMs={roiMetrics?.avg_duration_24h_ms ?? 0}
+              requests={requestMetrics?.requests_24h ?? 0}
+              emails={requestMetrics?.emails_24h ?? 0}
+              totalTokens={requestMetrics?.total_tokens_24h ?? 0}
+              avgDurationMs={requestMetrics?.avg_duration_24h_ms ?? 0}
             />
             <MetricCard
               label="Last 7d"
               checked={metrics?.checked_7d ?? 0}
               succeeded={metrics?.succeeded_7d ?? 0}
-              llmCalls={metrics?.llm_calls_7d ?? 0}
-              llmChecks={roiMetrics?.llm_checks_7d ?? 0}
-              estimatedCostUsd={roiMetrics?.estimated_cost_7d_usd ?? 0}
-              avgDurationMs={roiMetrics?.avg_duration_7d_ms ?? 0}
+              requests={requestMetrics?.requests_7d ?? 0}
+              emails={requestMetrics?.emails_7d ?? 0}
+              totalTokens={requestMetrics?.total_tokens_7d ?? 0}
+              avgDurationMs={requestMetrics?.avg_duration_7d_ms ?? 0}
             />
           </div>
         )}
 
-        {pendingMemories.length > 0 && (
+        {activeTab === "build" && pendingMemories.length > 0 && (
           <div className="mb-4 text-xs text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded px-3 py-2">
             {pendingMemories.length} memory note{pendingMemories.length === 1 ? "" : "s"} pending save.
           </div>
         )}
 
-        <div className="space-y-4">
+        {activeTab === "build" && <div className="space-y-4">
         <div>
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">Name</label>
           <input
@@ -650,6 +714,23 @@ export default function RuleEditor() {
           <label className="text-sm text-gray-500 dark:text-gray-400">Enabled</label>
         </div>
 
+        <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-400 dark:text-gray-500">Decide</p>
+          <h3 className="mt-1 text-lg font-semibold">How should this rule make a decision?</h3>
+          <div className="mt-4 grid grid-cols-1 gap-2 md:grid-cols-3">
+            {([
+              ["automatic", "Always act", "Use conditions only. No LLM call."],
+              ["match", "Match or skip", "Ask the LLM whether the rule applies."],
+              ["classify", "Classify outcome", "Ask the LLM to select an outcome."],
+            ] as const).map(([mode, label, detail]) => (
+              <button key={mode} type="button" onClick={() => selectDecisionMode(mode)} className={`rounded-xl border bg-white p-3 text-left text-gray-900 transition-colors dark:bg-gray-900/60 dark:text-gray-100 ${decisionMode === mode ? "border-blue-400 bg-blue-50 dark:border-blue-700 dark:bg-blue-950/30" : "border-gray-200 hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-700"}`}>
+                <span className="block text-sm font-medium">{label}</span>
+                <span className="mt-1 block text-xs text-gray-500 dark:text-gray-400">{detail}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+
         <div>
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
             Conditions
@@ -665,14 +746,13 @@ export default function RuleEditor() {
           />
         </div>
 
-        <div className="rounded border border-gray-200 dark:border-gray-700 p-3 space-y-2">
+        {decisionMode === "classify" && <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800 space-y-2">
           <label className="block text-sm text-gray-500 dark:text-gray-400">
-            Choices the LLM picks from
+            Outcome choices
           </label>
           <p className="text-xs text-gray-400 dark:text-gray-500">
-            Leave empty to ask a plain match-or-not question. Add entries to make the rule
-            classify: the LLM answers with one of them, or NO_MATCH. A choice can be a label
-            or an action, so "file it under A, B, or bin it" is one rule.
+            The model selects one of these outcomes or NO_MATCH. An outcome may be a label or
+            an action, so one rule can file email under A, B, or trash it.
           </p>
           <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
             <input
@@ -782,20 +862,16 @@ export default function RuleEditor() {
               while still stopping lower-priority rules from running.
             </p>
           )}
-          <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
-            <input
-              type="checkbox"
-              checked={continueAfterMatch}
-              onChange={(event) => setContinueAfterMatch(event.target.checked)}
-              className="rounded"
-            />
-            Keep checking lower-priority rules after this one matches
+        </div>}
+
+        <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-400 dark:text-gray-500">Pipeline</p>
+          <label className="mt-3 flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+            <input type="checkbox" checked={continueAfterMatch} onChange={(event) => setContinueAfterMatch(event.target.checked)} className="rounded" />
+            Continue to lower-priority rules after this one matches
           </label>
-          <p className="text-xs text-gray-400 dark:text-gray-500">
-            A match normally claims the email and stops. Enable this for a rule that should
-            act and still hand the email on, such as a classifier that only adds a label.
-          </p>
-        </div>
+          <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">A match normally claims an email. Continue only when another rule should also get a chance to act.</p>
+        </section>
 
         {isEdit && (
           <div>
@@ -829,7 +905,7 @@ export default function RuleEditor() {
           </div>
         )}
 
-        <div>
+        {decisionMode !== "automatic" && <div>
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
             Inference policy
           </label>
@@ -868,11 +944,11 @@ export default function RuleEditor() {
                 : ""}
             </div>
           )}
-        </div>
+        </div>}
 
         <div>
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
-            Actions
+            Then always apply
           </label>
           <div className="flex gap-2 mb-2">
             <Dropdown
@@ -939,14 +1015,13 @@ export default function RuleEditor() {
             ))}
           </div>
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Actions are the fixed recipe that runs on any match, on top of whatever the
-            model chose above.
+            These actions run for every match, in addition to a selected outcome.
           </p>
         </div>
 
-        <div>
+        {decisionMode !== "automatic" && <div>
           <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
-            LLM Prompt (optional)
+            Decision instruction
           </label>
           <textarea
             value={prompt}
@@ -960,12 +1035,13 @@ export default function RuleEditor() {
             }
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Tip: use chat to propose edits, apply them to this draft, then test
-            before saving.
+            Explain the decision criteria. The response format is fixed by Post Office.
           </p>
-        </div>
+        </div>}
 
-        <div className="border-t border-gray-200 dark:border-gray-700 pt-4">
+        </div>}
+
+        {activeTab === "test" && <div className="border-t border-gray-200 dark:border-gray-700 pt-4">
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-200">
               Test this rule
@@ -1229,46 +1305,19 @@ export default function RuleEditor() {
               </div>
             )}
           </div>
-        </div>
+        </div>}
 
-        <div className="flex gap-3 pt-4">
-          <button
-            onClick={handleSave}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
-          >
-            {isEdit ? "Update" : "Create"}
-          </button>
-          <button
-            onClick={() => navigate("/rules")}
-            className="bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium transition-colors"
-          >
-            Cancel
-          </button>
-          {isEdit && (
-            <button
-              onClick={handleDelete}
-              className="ml-auto bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
-            >
-              Delete rule
-            </button>
-          )}
-        </div>
-      </div>
-      </div>
+        {activeTab === "activity" && isEdit && <RuleActivity ruleId={ruleId} />}
 
-      <div className="min-w-0 h-[32rem] xl:h-[calc(100vh-9rem)]">
-        {isEdit ? (
-          <RuleChatPanel
-            ruleId={ruleId}
-            ruleName={name || "Untitled rule"}
-            onApplyProposal={applyChatProposalToDraft}
-          />
-        ) : (
-          <div className="h-full flex items-center justify-center text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-6 text-center">
-            Save this rule first, then tune it with chat from the right panel.
+        {activeTab === "learn" && (
+          isEdit ? <div className="h-[38rem]"><RuleChatPanel ruleId={ruleId} ruleName={name || "Untitled rule"} onApplyProposal={applyChatProposalToDraft} /></div> : <div className="rounded-2xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400">Save the rule before tuning it with chat.</div>
+        )}
+
+        {activeTab === "build" && isEdit && (
+          <div className="mt-8 border-t border-gray-200 pt-5 dark:border-gray-700">
+            <button onClick={handleDelete} className="rounded-lg px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-950/30">Delete rule</button>
           </div>
         )}
-      </div>
     </div>
   );
 }
@@ -1361,24 +1410,21 @@ function MetricCard({
   label,
   checked,
   succeeded,
-  llmCalls,
-  llmChecks,
-  estimatedCostUsd,
+  requests,
+  emails,
+  totalTokens,
   avgDurationMs,
 }: {
   label: string;
   checked: number;
   succeeded: number;
-  llmCalls: number;
-  llmChecks: number;
-  estimatedCostUsd: number;
+  requests: number;
+  emails: number;
+  totalTokens: number;
   avgDurationMs: number;
 }) {
   const successRate = ratePercent(succeeded, checked);
-  const llmRate = ratePercent(llmCalls, checked);
-  const showLlmCalls = llmCalls > 0 && llmCalls !== checked;
   const avgDurationSeconds = avgDurationMs / 1000;
-  const totalCost = formatUsdUp(estimatedCostUsd);
 
   return (
     <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2">
@@ -1389,14 +1435,14 @@ function MetricCard({
       <div className={`text-xs mt-1 ${successRateTone(successRate)}`}>
         {successRate}% success
       </div>
-      {showLlmCalls && (
+      {requests > 0 && (
         <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-          {llmCalls} LLM calls ({llmRate}%)
+          {requests} request{requests === 1 ? "" : "s"} · {emails} email{emails === 1 ? "" : "s"}
         </div>
       )}
-      {llmChecks > 0 && (
+      {requests > 0 && (
         <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-          {avgDurationSeconds.toFixed(1)} s/check • ${totalCost} total
+          {avgDurationSeconds.toFixed(1)} s/request · {totalTokens.toLocaleString()} tokens
         </div>
       )}
     </div>
@@ -1412,8 +1458,4 @@ function successRateTone(rate: number): string {
   if (rate >= 80) return "text-green-600 dark:text-green-400";
   if (rate >= 50) return "text-yellow-600 dark:text-yellow-400";
   return "text-red-600 dark:text-red-400";
-}
-
-function formatUsdUp(value: number): string {
-  return (Math.ceil(value * 100) / 100).toFixed(2);
 }

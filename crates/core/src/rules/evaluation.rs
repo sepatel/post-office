@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures_util::stream::{self, StreamExt};
+
 use crate::gmail::models::{Label, Message};
-use crate::llm::{InferenceRouter, ProcessRequest};
+use crate::llm::{InferenceRouter, ProcessKind, ProcessRequest};
 use crate::rules::engine::{
     choice_catalog, display_action, effective_actions, email_parts, estimated_tokens, memory_block,
     parse_row, ActionDisplay, Choice, Outcome, Resolved, Row, RuleError,
@@ -10,8 +12,6 @@ use crate::rules::matcher;
 use crate::rules::models::Rule;
 use crate::rules::prompts::decision_prompt;
 use crate::rules::response_parser::ParsedAction;
-
-const MAX_BATCH_SIZE: usize = 10;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BulkVerdict {
@@ -28,6 +28,11 @@ pub struct BulkVerdict {
 pub struct BulkRuleResolution {
     pub resolved: Vec<Resolved>,
     pub stopped: bool,
+}
+
+struct ChunkResolution {
+    resolved: Vec<Resolved>,
+    stopped: bool,
 }
 
 pub async fn bulk_resolve_for_rule(
@@ -62,48 +67,97 @@ pub async fn bulk_resolve_for_rule(
     }
 
     let system_prompt = decision_prompt(&menu, has_instruction);
+    let max_batch_size = llm.max_emails_per_request(&rule.inference_policy);
+    let reserved_completion_tokens = llm.decision_max_tokens(max_batch_size);
     let budget = llm
-        .input_token_budget(&rule.inference_policy)
+        .input_token_budget(&rule.inference_policy, reserved_completion_tokens)
         .saturating_sub(estimated_tokens(&system_prompt));
-    let chunks = batch_chunks(rule, emails, memories, budget)?;
+    let chunks = batch_chunks(rule, emails, memories, budget, max_batch_size)?;
     let mut resolved = Vec::with_capacity(emails.len());
-
-    for chunk in chunks {
-        if cancel_requested
-            .map(|flag| flag.load(Ordering::Relaxed))
-            .unwrap_or(false)
-        {
-            return Ok(BulkRuleResolution {
-                resolved,
-                stopped: true,
-            });
-        }
-
-        let user_prompt = build_batch_prompt(rule, &chunk, memories, budget)?;
-        let response = llm
-            .process(
-                &rule.inference_policy,
-                ProcessRequest {
-                    system_prompt: Some(system_prompt.clone()),
-                    user_prompt,
-                    model: None,
-                    temperature: None,
-                    max_tokens: Some(llm.max_tokens()),
-                },
+    let chunks = stream::iter(chunks)
+        .map(|chunk| {
+            resolve_chunk(
+                llm,
+                rule,
+                chunk,
+                memories,
+                &menu,
+                &system_prompt,
+                budget,
+                cancel_requested,
             )
-            .await?;
-        resolved.extend(match parse_rows(&response.content, chunk.len(), &menu) {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|row| from_row(rule, row, &response))
-                .collect(),
-            Err(diagnostic) => (0..chunk.len())
-                .map(|_| unparsed(response.content.trim().to_string(), &diagnostic, &response))
-                .collect::<Vec<_>>(),
-        });
+        })
+        .buffered(llm.max_concurrent_requests(&rule.inference_policy))
+        .collect::<Vec<_>>()
+        .await;
+    let mut stopped = false;
+    for chunk in chunks {
+        let chunk = chunk?;
+        stopped |= chunk.stopped;
+        resolved.extend(chunk.resolved);
     }
 
-    Ok(BulkRuleResolution {
+    Ok(BulkRuleResolution { resolved, stopped })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "A chunk needs the full rule decision context and cancellation state."
+)]
+async fn resolve_chunk(
+    llm: &InferenceRouter,
+    rule: &Rule,
+    chunk: Vec<Message>,
+    memories: &[String],
+    menu: &[Choice],
+    system_prompt: &str,
+    budget: usize,
+    cancel_requested: Option<&AtomicBool>,
+) -> Result<ChunkResolution, RuleError> {
+    if cancel_requested
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(false)
+    {
+        return Ok(ChunkResolution {
+            resolved: vec![],
+            stopped: true,
+        });
+    }
+    let message_refs = chunk.iter().collect::<Vec<_>>();
+    let user_prompt = build_batch_prompt(rule, &message_refs, memories, budget)?;
+    let response = llm
+        .process(
+            &rule.inference_policy,
+            ProcessRequest {
+                system_prompt: Some(system_prompt.to_string()),
+                user_prompt,
+                model: None,
+                temperature: None,
+                max_tokens: Some(llm.decision_max_tokens(chunk.len())),
+                kind: ProcessKind::Decision,
+                reasoning_effort: None,
+                litellm_reasoning_passthrough: false,
+            },
+        )
+        .await;
+    let resolved = match response {
+        Ok(response) => {
+            let content = strip_thinking_prefix(&response.content);
+            match parse_rows(content, chunk.len(), menu) {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| from_row(rule, row, &response, chunk.len()))
+                    .collect(),
+                Err(diagnostic) => (0..chunk.len())
+                    .map(|_| unparsed(content.to_string(), &diagnostic, &response, chunk.len()))
+                    .collect(),
+            }
+        }
+        Err(error) => (0..chunk.len())
+            .map(|_| unavailable(&error.to_string()))
+            .collect(),
+    };
+    Ok(ChunkResolution {
         resolved,
         stopped: false,
     })
@@ -154,7 +208,12 @@ pub async fn bulk_evaluate(
     Ok(verdicts)
 }
 
-fn from_row(rule: &Rule, row: Row, response: &crate::llm::ProcessResponse) -> Resolved {
+fn from_row(
+    rule: &Rule,
+    row: Row,
+    response: &crate::llm::ProcessResponse,
+    email_count: usize,
+) -> Resolved {
     let (outcome, actions) = if row.matched {
         (Outcome::Matched, effective_actions(rule, &row.chosen))
     } else {
@@ -166,7 +225,7 @@ fn from_row(rule: &Rule, row: Row, response: &crate::llm::ProcessResponse) -> Re
         llm_response: row.text,
         reason: row.reason,
         diagnostic: row.note,
-        ..metrics(response)
+        ..metrics(response, email_count)
     }
 }
 
@@ -174,16 +233,36 @@ fn unparsed(
     llm_response: String,
     diagnostic: &str,
     response: &crate::llm::ProcessResponse,
+    email_count: usize,
 ) -> Resolved {
     Resolved {
         outcome: Outcome::Unparsed,
         llm_response,
         diagnostic: Some(diagnostic.to_string()),
-        ..metrics(response)
+        ..metrics(response, email_count)
     }
 }
 
-fn metrics(response: &crate::llm::ProcessResponse) -> Resolved {
+fn unavailable(diagnostic: &str) -> Resolved {
+    Resolved {
+        outcome: Outcome::Unparsed,
+        actions: vec![],
+        llm_response: String::new(),
+        reason: String::new(),
+        llm_model: None,
+        llm_provider: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        llm_duration_ms: None,
+        llm_request_key: None,
+        llm_request_email_count: None,
+        llm_unavailable: true,
+        diagnostic: Some(diagnostic.to_string()),
+    }
+}
+
+fn metrics(response: &crate::llm::ProcessResponse, email_count: usize) -> Resolved {
     Resolved {
         outcome: Outcome::Unparsed,
         actions: vec![],
@@ -195,6 +274,9 @@ fn metrics(response: &crate::llm::ProcessResponse) -> Resolved {
         completion_tokens: response.completion_tokens,
         total_tokens: response.tokens_used,
         llm_duration_ms: Some(response.duration_ms),
+        llm_request_key: Some(response.request_key.clone()),
+        llm_request_email_count: Some(email_count as u32),
+        llm_unavailable: false,
         diagnostic: None,
     }
 }
@@ -225,12 +307,30 @@ fn parse_rows(response: &str, count: usize, menu: &[Choice]) -> Result<Vec<Row>,
     ))
 }
 
-fn batch_chunks<'a>(
+fn strip_thinking_prefix(content: &str) -> &str {
+    let content = content.trim();
+    for tag in ["think", "thinking"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        if let Some(after_open) = content.strip_prefix(&open) {
+            if let Some(after_close) = after_open.strip_prefix(&close) {
+                return after_close.trim();
+            }
+            if let Some(end) = after_open.find(&close) {
+                return after_open[end + close.len()..].trim();
+            }
+        }
+    }
+    content
+}
+
+fn batch_chunks(
     rule: &Rule,
-    emails: &'a [Message],
+    emails: &[Message],
     memories: &[String],
     budget: usize,
-) -> Result<Vec<Vec<&'a Message>>, RuleError> {
+    max_batch_size: usize,
+) -> Result<Vec<Vec<Message>>, RuleError> {
     let base = batch_prefix(rule, memories);
     if estimated_tokens(&base) >= budget {
         return Err(RuleError::PromptTooLarge);
@@ -241,14 +341,14 @@ fn batch_chunks<'a>(
     for email in emails {
         let email_tokens = estimated_tokens(&render_email(email));
         if !current.is_empty()
-            && (current.len() == MAX_BATCH_SIZE || current_tokens + email_tokens > budget)
+            && (current.len() == max_batch_size || current_tokens + email_tokens > budget)
         {
             chunks.push(current);
             current = Vec::new();
             current_tokens = estimated_tokens(&base);
         }
         current_tokens += email_tokens;
-        current.push(email);
+        current.push(email.clone());
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -424,5 +524,17 @@ mod tests {
         let error = parse_rows("I could not decide", 1, &menu()).expect_err("should refuse");
 
         assert!(error.contains("choice or NO_MATCH"));
+    }
+
+    #[test]
+    fn removes_thinking_before_reading_decisions() {
+        assert_eq!(
+            strip_thinking_prefix("<think>considered the message</think>\n1: NO_MATCH | unrelated"),
+            "1: NO_MATCH | unrelated"
+        );
+        assert_eq!(
+            strip_thinking_prefix("1: MATCH | direct"),
+            "1: MATCH | direct"
+        );
     }
 }

@@ -65,6 +65,10 @@ export interface LlmConfigUpdate {
   output_cost_per_million_usd: number;
   timeout_secs: number;
   context_window_tokens: number;
+  legacy_max_concurrent_requests: number;
+  legacy_max_emails_per_request: number;
+  legacy_decision_reasoning_effort: string;
+  legacy_chat_reasoning_effort: string;
   legacy_name: string;
   legacy_quality_tier: string;
   legacy_privacy_status: string;
@@ -114,6 +118,10 @@ export async function rulesDelete(id: number) {
   return invoke("rules_delete", { id });
 }
 
+export async function rulesReorder(ids: number[]): Promise<void> {
+  return invoke("rules_reorder", { ids });
+}
+
 export interface RuleMetrics {
   rule_id: number;
   checked_24h: number;
@@ -148,6 +156,26 @@ export interface RuleRoiMetrics {
 
 export async function ruleRoiMetrics(): Promise<RuleRoiMetrics[]> {
   return invoke("rule_roi_metrics");
+}
+
+export interface RuleRequestMetrics {
+  rule_id: number;
+  requests_24h: number;
+  emails_24h: number;
+  prompt_tokens_24h: number;
+  completion_tokens_24h: number;
+  total_tokens_24h: number;
+  avg_duration_24h_ms: number;
+  requests_7d: number;
+  emails_7d: number;
+  prompt_tokens_7d: number;
+  completion_tokens_7d: number;
+  total_tokens_7d: number;
+  avg_duration_7d_ms: number;
+}
+
+export async function ruleRequestMetrics(): Promise<RuleRequestMetrics[]> {
+  return invoke("rule_request_metrics");
 }
 
 export interface ChatMessage {
@@ -321,6 +349,36 @@ export async function inferenceJobsList(
   return invoke("inference_jobs_list", { page, perPage });
 }
 
+export async function ruleActivity(
+  ruleId: number,
+  page: number,
+  perPage: number,
+): Promise<HistoryEntry[]> {
+  return invoke("rule_activity", { ruleId, page, perPage });
+}
+
+export async function ruleInferenceJobs(
+  ruleId: number,
+  page: number,
+  perPage: number,
+): Promise<InferenceJob[]> {
+  return invoke("rule_inference_jobs", { ruleId, page, perPage });
+}
+
+export interface InferenceAttempt {
+  id: number;
+  job_id: number;
+  provider_id: string | null;
+  model: string | null;
+  status: string;
+  error: string | null;
+  created_at: string;
+}
+
+export async function inferenceJobAttempts(jobId: number): Promise<InferenceAttempt[]> {
+  return invoke("inference_job_attempts", { jobId });
+}
+
 export async function inferenceJobRetry(jobId: number): Promise<boolean> {
   return invoke("inference_job_retry", { jobId });
 }
@@ -444,6 +502,8 @@ export interface LlmTestResult {
   ok: boolean;
   model: string;
   error: string | null;
+  duration_ms: number | null;
+  completion_tokens: number | null;
 }
 
 export interface LlmProviderTestProfile {
@@ -452,6 +512,8 @@ export interface LlmProviderTestProfile {
   model: string;
   api_key_ref: string;
   timeout_secs: number;
+  max_concurrent_requests: number;
+  decision_reasoning_effort: string;
 }
 
 export async function llmTest(

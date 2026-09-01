@@ -86,11 +86,19 @@ pub async fn resolve_rule(
         None,
     )
     .await?;
-    Ok(batch
+    let resolved = batch
         .resolved
         .into_iter()
         .next()
-        .unwrap_or_else(Resolved::declined))
+        .unwrap_or_else(Resolved::declined);
+    if resolved.llm_unavailable {
+        return Err(RuleError::Llm(crate::llm::LlmError::Routing(
+            resolved
+                .diagnostic
+                .unwrap_or_else(|| "No provider completed the decision".into()),
+        )));
+    }
+    Ok(resolved)
 }
 
 pub async fn test_rule(
@@ -145,6 +153,9 @@ pub struct Resolved {
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
     pub llm_duration_ms: Option<u64>,
+    pub llm_request_key: Option<String>,
+    pub llm_request_email_count: Option<u32>,
+    pub llm_unavailable: bool,
     /// A non-fatal deviation from the response contract, kept so it surfaces in
     /// the UI without blocking the decision.
     pub diagnostic: Option<String>,
@@ -168,6 +179,9 @@ impl Resolved {
             completion_tokens: None,
             total_tokens: None,
             llm_duration_ms: None,
+            llm_request_key: None,
+            llm_request_email_count: None,
+            llm_unavailable: false,
             diagnostic: None,
         }
     }

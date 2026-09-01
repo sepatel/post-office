@@ -1,4 +1,5 @@
 use post_office_core::config::AppConfig;
+use post_office_core::llm::InferenceRuntime;
 use post_office_core::processing::ProcessingState;
 use std::sync::Arc;
 use tauri::tray::TrayIcon;
@@ -17,6 +18,7 @@ pub struct AppState {
     pub db: post_office_core::db::Database,
     pub processing_states: ProcessingStates,
     pub config: Arc<Mutex<AppConfig>>,
+    pub inference_runtime: InferenceRuntime,
     pub sync_trigger: mpsc::UnboundedSender<sync_runtime::SyncTrigger>,
     pub pollers_started: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub tray: Arc<std::sync::Mutex<Option<TrayIcon>>>,
@@ -68,6 +70,7 @@ fn main() {
 
             let config = db.with_config(|repo| AppConfig::load(&repo));
             let config_arc = Arc::new(Mutex::new(config.clone()));
+            let inference_runtime = InferenceRuntime::default();
             let processing_states =
                 Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let sync_trigger = sync_runtime::spawn(
@@ -75,12 +78,14 @@ fn main() {
                 Arc::new(db.clone()),
                 processing_states.clone(),
                 config_arc.clone(),
+                inference_runtime.clone(),
             );
 
             let app_state = AppState {
                 db,
                 processing_states,
                 config: config_arc.clone(),
+                inference_runtime,
                 sync_trigger,
                 pollers_started: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
                 tray: Arc::new(std::sync::Mutex::new(None)),
@@ -124,6 +129,7 @@ fn main() {
             commands::rules_create,
             commands::rules_update,
             commands::rules_delete,
+            commands::rules_reorder,
             commands::rule_memories_list,
             commands::rule_memory_delete,
             commands::rule_chat_history,
@@ -136,8 +142,12 @@ fn main() {
             commands::history_list,
             commands::rules_metrics,
             commands::rule_roi_metrics,
+            commands::rule_request_metrics,
+            commands::rule_activity,
             commands::history_search,
             commands::inference_jobs_list,
+            commands::rule_inference_jobs,
+            commands::inference_job_attempts,
             commands::inference_job_retry,
             commands::processing_status,
             commands::processing_pause,

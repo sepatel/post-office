@@ -81,6 +81,17 @@ impl<'a> RuleRepository<'a> {
         rules
     }
 
+    pub fn reorder(&self, account_email: &str, ids: &[i64]) -> Result<()> {
+        for (priority, id) in ids.iter().enumerate() {
+            self.conn.execute(
+                "UPDATE rules SET priority = ?1, updated_at = datetime('now')
+                  WHERE id = ?2 AND account_email = ?3",
+                params![priority as i32, id, account_email],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn create(&self, account_email: &str, rule: &CreateRuleRequest) -> Result<Rule> {
         self.conn.execute(
             "INSERT INTO rules (account_email, name, description, conditions, prompt, choices,

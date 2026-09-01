@@ -5,11 +5,40 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{LlmClient, LlmError, ProcessRequest, ProcessResponse};
+use super::{InferenceRuntime, LlmClient, LlmError, ProcessKind, ProcessRequest, ProcessResponse};
 use crate::db::Database;
 
 const MAX_RETRIES_PER_PROVIDER: usize = 2;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    #[default]
+    Off,
+    ServerDefault,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn request_value(self) -> Option<&'static str> {
+        match self {
+            Self::Off => Some("none"),
+            Self::ServerDefault => None,
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Xhigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmProviderProfile {
@@ -31,6 +60,14 @@ pub struct LlmProviderProfile {
     pub timeout_secs: u64,
     #[serde(default = "default_context_window_tokens")]
     pub context_window_tokens: u32,
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: u8,
+    #[serde(default = "default_max_emails_per_request")]
+    pub max_emails_per_request: u8,
+    #[serde(default)]
+    pub decision_reasoning_effort: ReasoningEffort,
+    #[serde(default = "default_chat_reasoning_effort")]
+    pub chat_reasoning_effort: ReasoningEffort,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -63,6 +100,8 @@ struct ProviderClient {
     profile: LlmProviderProfile,
     client: Option<LlmClient>,
     init_error: Option<String>,
+    endpoint: String,
+    effective_max_concurrent_requests: usize,
 }
 
 #[derive(Clone)]
@@ -72,10 +111,18 @@ pub struct InferenceRouter {
     default_policy: String,
     max_tokens: u32,
     database: Option<Database>,
+    runtime: InferenceRuntime,
 }
 
 impl InferenceRouter {
     pub fn from_config(config: &crate::config::AppConfig) -> Self {
+        Self::from_config_with_runtime(config, InferenceRuntime::default())
+    }
+
+    pub fn from_config_with_runtime(
+        config: &crate::config::AppConfig,
+        runtime: InferenceRuntime,
+    ) -> Self {
         let mut profiles = config.llm_providers.clone();
         if !profiles.iter().any(|profile| profile.id == "legacy") {
             profiles.push(legacy_profile(config));
@@ -91,6 +138,19 @@ impl InferenceRouter {
                 }
             })
             .collect::<HashMap<_, _>>();
+
+        let endpoint_limits = profiles.values().filter(|profile| profile.enabled).fold(
+            HashMap::<String, usize>::new(),
+            |mut limits, profile| {
+                let endpoint = endpoint_key(&profile.base_url);
+                let limit = profile.max_concurrent_requests.max(1) as usize;
+                limits
+                    .entry(endpoint)
+                    .and_modify(|existing| *existing = (*existing).min(limit))
+                    .or_insert(limit);
+                limits
+            },
+        );
 
         let policies = if config.llm_routing_policies.is_empty() {
             let default_policy = LlmRoutingPolicy {
@@ -114,6 +174,7 @@ impl InferenceRouter {
         let providers = profiles
             .into_values()
             .map(|profile| {
+                let endpoint = endpoint_key(&profile.base_url);
                 let key_ref = if profile.id == "legacy" {
                     "legacy".to_string()
                 } else if profile.api_key_ref.trim().is_empty() {
@@ -151,6 +212,11 @@ impl InferenceRouter {
                         profile,
                         client,
                         init_error,
+                        endpoint: endpoint.clone(),
+                        effective_max_concurrent_requests: endpoint_limits
+                            .get(&endpoint)
+                            .copied()
+                            .unwrap_or(1),
                     },
                 )
             })
@@ -166,6 +232,7 @@ impl InferenceRouter {
             },
             max_tokens: config.llm_max_tokens,
             database: None,
+            runtime,
         }
     }
 
@@ -206,7 +273,39 @@ impl InferenceRouter {
 
             let retries = attempts_per_candidate(&policy);
             for attempt in 0..retries {
-                match client.process(request.clone()).await {
+                let mut request = request.clone();
+                request.reasoning_effort = reasoning_effort_for(&provider.profile, request.kind)
+                    .request_value()
+                    .map(str::to_string);
+                request.litellm_reasoning_passthrough = request.reasoning_effort.is_some()
+                    && self.runtime.requires_reasoning_passthrough(
+                        &provider.endpoint,
+                        &provider.profile.model,
+                    );
+                let _permit = self
+                    .runtime
+                    .acquire(
+                        &provider.endpoint,
+                        provider.effective_max_concurrent_requests,
+                    )
+                    .await;
+                let response = client.process(request.clone()).await;
+                let response = match response {
+                    Err(error)
+                        if request.reasoning_effort.is_some()
+                            && !request.litellm_reasoning_passthrough
+                            && error.requires_litellm_reasoning_passthrough() =>
+                    {
+                        self.runtime.enable_reasoning_passthrough(
+                            &provider.endpoint,
+                            &provider.profile.model,
+                        );
+                        request.litellm_reasoning_passthrough = true;
+                        client.process(request).await
+                    }
+                    response => response,
+                };
+                match response {
                     Ok(response) => {
                         self.clear_rate_limit(&provider.profile.id);
                         return Ok(response);
@@ -264,6 +363,9 @@ impl InferenceRouter {
                     model: None,
                     temperature: Some(0.3),
                     max_tokens: None,
+                    kind: ProcessKind::Chat,
+                    reasoning_effort: None,
+                    litellm_reasoning_passthrough: false,
                 },
             )
             .await?;
@@ -281,7 +383,7 @@ impl InferenceRouter {
         self.max_tokens
     }
 
-    pub fn input_token_budget(&self, policy_id: &str) -> usize {
+    pub fn input_token_budget(&self, policy_id: &str, reserved_completion_tokens: u32) -> usize {
         let policy = self.policy(policy_id);
         let (candidates, _) = self.candidates(&policy);
         let context_window = candidates
@@ -289,7 +391,22 @@ impl InferenceRouter {
             .map(|provider| provider.profile.context_window_tokens as usize)
             .min()
             .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS as usize);
-        context_window.saturating_sub(self.max_tokens as usize)
+        context_window.saturating_sub(reserved_completion_tokens as usize)
+    }
+
+    pub fn max_emails_per_request(&self, policy_id: &str) -> usize {
+        self.policy_limit(policy_id, |profile| profile.max_emails_per_request as usize)
+    }
+
+    pub fn max_concurrent_requests(&self, policy_id: &str) -> usize {
+        self.policy_limit(policy_id, |profile| {
+            profile.max_concurrent_requests as usize
+        })
+    }
+
+    pub fn decision_max_tokens(&self, count: usize) -> u32 {
+        let requested = (count as u32).saturating_mul(48).max(64);
+        requested.min(self.max_tokens.max(64))
     }
 
     fn policy(&self, policy_id: &str) -> LlmRoutingPolicy {
@@ -305,6 +422,16 @@ impl InferenceRouter {
                 privacy_requirement: PrivacyRequirement::Any,
                 allow_fallback: true,
             })
+    }
+
+    fn policy_limit(&self, policy_id: &str, value: impl Fn(&LlmProviderProfile) -> usize) -> usize {
+        let policy = self.policy(policy_id);
+        let (candidates, _) = self.candidates(&policy);
+        candidates
+            .into_iter()
+            .map(|candidate| value(&candidate.profile).max(1))
+            .min()
+            .unwrap_or(1)
     }
 
     fn candidates(&self, policy: &LlmRoutingPolicy) -> (Vec<&ProviderClient>, Vec<String>) {
@@ -411,6 +538,10 @@ fn legacy_profile(config: &crate::config::AppConfig) -> LlmProviderProfile {
         output_cost_per_million_usd: config.llm_output_cost_per_million_usd,
         timeout_secs: config.llm_timeout_secs,
         context_window_tokens: config.llm_context_window_tokens,
+        max_concurrent_requests: config.llm_legacy_max_concurrent_requests,
+        max_emails_per_request: config.llm_legacy_max_emails_per_request,
+        decision_reasoning_effort: config.llm_legacy_decision_reasoning_effort,
+        chat_reasoning_effort: config.llm_legacy_chat_reasoning_effort,
         enabled: config.llm_legacy_enabled,
     }
 }
@@ -565,8 +696,31 @@ fn default_context_window_tokens() -> u32 {
     DEFAULT_CONTEXT_WINDOW_TOKENS
 }
 
+fn default_max_concurrent_requests() -> u8 {
+    1
+}
+
+fn default_max_emails_per_request() -> u8 {
+    3
+}
+
+fn default_chat_reasoning_effort() -> ReasoningEffort {
+    ReasoningEffort::ServerDefault
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn endpoint_key(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn reasoning_effort_for(profile: &LlmProviderProfile, kind: ProcessKind) -> ReasoningEffort {
+    match kind {
+        ProcessKind::Decision | ProcessKind::Health => profile.decision_reasoning_effort,
+        ProcessKind::Chat => profile.chat_reasoning_effort,
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +750,13 @@ mod tests {
         assert!(quality_at_least("strong", "balanced"));
         assert!(quality_at_least("balanced", "cheap"));
         assert!(!quality_at_least("cheap", "strong"));
+    }
+
+    #[test]
+    fn reasoning_effort_uses_none_to_disable_thinking() {
+        assert_eq!(ReasoningEffort::Off.request_value(), Some("none"));
+        assert_eq!(ReasoningEffort::ServerDefault.request_value(), None);
+        assert_eq!(ReasoningEffort::Low.request_value(), Some("low"));
     }
 
     #[test]

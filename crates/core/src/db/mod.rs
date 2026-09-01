@@ -8,6 +8,7 @@ pub mod history;
 pub mod inference;
 pub mod labels;
 pub mod llm_provider_status;
+pub mod llm_requests;
 pub mod llm_usage;
 pub mod rule_chat;
 pub mod rule_memory;
@@ -109,6 +110,11 @@ impl Database {
                 .execute_batch(include_str!("../../../../migrations/014_rule_choices.sql"))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (14)", [])?;
         }
+        if !migration_applied(&transaction, 15)? {
+            transaction
+                .execute_batch(include_str!("../../../../migrations/015_llm_requests.sql"))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (15)", [])?;
+        }
         transaction.commit()
     }
 
@@ -172,6 +178,14 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let repo = llm_usage::LlmUsageRepository::new(&conn);
         f(repo)
+    }
+
+    pub fn with_llm_requests<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(llm_requests::LlmRequestRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        f(llm_requests::LlmRequestRepository::new(&conn))
     }
 
     pub fn with_inference<F, R>(&self, f: F) -> R
