@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::llm::ReasoningEffort;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub id: i64,
@@ -21,6 +23,10 @@ pub struct Rule {
     pub parent_id: Option<i64>,
     #[serde(default = "default_inference_policy")]
     pub inference_policy: String,
+    #[serde(default = "default_decision_reasoning_effort")]
+    pub decision_reasoning_effort: ReasoningEffort,
+    #[serde(default)]
+    pub decision_max_tokens: Option<u32>,
     /// Keep evaluating lower-priority rules after this one matches and acts.
     #[serde(default)]
     pub continue_after_match: bool,
@@ -28,6 +34,10 @@ pub struct Rule {
 
 fn default_inference_policy() -> String {
     "default".into()
+}
+
+fn default_decision_reasoning_effort() -> ReasoningEffort {
+    ReasoningEffort::ServerDefault
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1704,6 +1704,8 @@ mod tests {
             enabled: true,
             parent_id: None,
             inference_policy: "default".into(),
+            decision_reasoning_effort: crate::llm::ReasoningEffort::ServerDefault,
+            decision_max_tokens: None,
             continue_after_match,
         }
     }
