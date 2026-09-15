@@ -124,6 +124,22 @@ export async function rulesReorder(ids: number[]): Promise<void> {
   return invoke("rules_reorder", { ids });
 }
 
+export interface BackupImportResult {
+  imported_rules: number;
+  imported_memories: number;
+  merged_providers: number;
+  merged_policies: number;
+  warnings: string[];
+}
+
+export async function backupExport(): Promise<unknown> {
+  return invoke("backup_export");
+}
+
+export async function backupImport(payload: string): Promise<BackupImportResult> {
+  return invoke("backup_import", { payload });
+}
+
 export interface RuleMetrics {
   rule_id: number;
   checked_24h: number;

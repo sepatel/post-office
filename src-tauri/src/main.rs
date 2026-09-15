@@ -145,6 +145,8 @@ fn main() {
             commands::rules_update,
             commands::rules_delete,
             commands::rules_reorder,
+            commands::backup_export,
+            commands::backup_import,
             commands::rule_memories_list,
             commands::rule_memory_delete,
             commands::rule_chat_history,
