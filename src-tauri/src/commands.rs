@@ -718,6 +718,48 @@ pub async fn rules_reorder(state: State<'_, AppState>, ids: Vec<i64>) -> Result<
         .map_err(|e| e.to_string())
 }
 
+// Portable backup for moving to a different computer: rules plus their
+// memories and the non-secret LLM provider/routing configuration. Secret keys
+// stay in the OS keyring and Gmail auth is per-machine, so both are excluded
+// and must be reconnected on the new computer.
+#[tauri::command]
+pub async fn backup_export(
+    state: State<'_, AppState>,
+) -> Result<post_office_core::backup::BackupDoc, String> {
+    let config = state.config.lock().await.clone();
+    let account_email = active_account(&config)?;
+    post_office_core::backup::build_export(&state.db, &account_email, &config)
+}
+
+#[tauri::command]
+pub async fn backup_import(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    payload: String,
+) -> Result<post_office_core::backup::ImportResult, String> {
+    let doc = post_office_core::backup::parse_backup(&payload)?;
+    let account_email = active_account(&*state.config.lock().await)?;
+    // Best-effort live labels so label references resolve by name when ids
+    // differ on the new machine; falls back to the cached labels offline.
+    let live_labels = match account_labels(&app, &state, &account_email).await {
+        Ok(labels) => labels,
+        Err(_) => state
+            .db
+            .with_labels(|repo| repo.get(&account_email))
+            .map_err(|e| e.to_string())?
+            .map(|cached| cached.labels)
+            .unwrap_or_default(),
+    };
+    let mut config = state.config.lock().await;
+    post_office_core::backup::apply_import(
+        &state.db,
+        &account_email,
+        &mut config,
+        doc,
+        &live_labels,
+    )
+}
+
 #[tauri::command]
 pub async fn rule_chat_history(
     state: State<'_, AppState>,

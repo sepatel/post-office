@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
+  backupExport,
+  backupImport,
   configGet,
   inferenceJobsList,
   policyDisplayName,
@@ -36,6 +38,13 @@ export default function Rules() {
   const [metricsByRule, setMetricsByRule] = useState<Record<number, RuleMetrics>>({});
   const [requestsByRule, setRequestsByRule] = useState<Record<number, RuleRequestMetrics>>({});
   const [attentionByRule, setAttentionByRule] = useState<Record<number, number>>({});
+  const [backupStatus, setBackupStatus] = useState<{
+    kind: "success" | "error";
+    text: string;
+    warnings?: string[];
+  } | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -82,6 +91,53 @@ export default function Rules() {
     }
   }
 
+  async function exportBackup() {
+    setBackupBusy(true);
+    try {
+      const doc = await backupExport();
+      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `post-office-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setBackupStatus({
+        kind: "success",
+        text: "Backup downloaded. It includes rules, memories, and LLM providers/policies — secret keys must be re-entered on the new computer.",
+      });
+    } catch (error) {
+      console.error("Failed to export backup:", error);
+      setBackupStatus({ kind: "error", text: `Export failed: ${error}` });
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
+  async function importBackupFile(file: File) {
+    setBackupBusy(true);
+    try {
+      const payload = await file.text();
+      const result = await backupImport(payload);
+      await loadRules();
+      const parts = [`${result.imported_rules} rule${result.imported_rules === 1 ? "" : "s"}`];
+      if (result.imported_memories > 0) parts.push(`${result.imported_memories} memories`);
+      if (result.merged_providers > 0 || result.merged_policies > 0) {
+        parts.push(`${result.merged_providers} providers, ${result.merged_policies} policies`);
+      }
+      setBackupStatus({
+        kind: "success",
+        text: `Imported ${parts.join(" · ")} as copies after your existing rules.`,
+        warnings: result.warnings.length > 0 ? result.warnings : undefined,
+      });
+    } catch (error) {
+      console.error("Failed to import backup:", error);
+      setBackupStatus({ kind: "error", text: `Import failed: ${error}` });
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
   return (
     <div className="mx-auto max-w-6xl">
       <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
@@ -90,8 +146,66 @@ export default function Rules() {
           <h2 className="mt-1 text-3xl font-semibold tracking-tight">Rules</h2>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">Rules run in this order. A match normally claims the email unless it explicitly continues.</p>
         </div>
-        <button onClick={() => navigate("/rules/new")} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-blue-700">New rule</button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void exportBackup()}
+            disabled={backupBusy}
+            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
+          >
+            Export backup
+          </button>
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={backupBusy}
+            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
+          >
+            Import backup
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) void importBackupFile(file);
+            }}
+          />
+          <button onClick={() => navigate("/rules/new")} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-blue-700">New rule</button>
+        </div>
       </header>
+
+      {backupStatus && (
+        <div
+          className={`mb-4 rounded-xl border p-4 text-sm ${
+            backupStatus.kind === "success"
+              ? "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-100"
+              : "border-red-200 bg-red-50 text-red-900 dark:border-red-900 dark:bg-red-950/40 dark:text-red-100"
+          }`}
+        >
+          <div className="flex items-start justify-between gap-4">
+            <p>{backupStatus.text}</p>
+            <button
+              type="button"
+              onClick={() => setBackupStatus(null)}
+              className="shrink-0 rounded px-1.5 text-xs opacity-70 hover:opacity-100"
+              aria-label="Dismiss backup status"
+            >
+              Dismiss
+            </button>
+          </div>
+          {backupStatus.warnings && (
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-xs opacity-90">
+              {backupStatus.warnings.map((warning, index) => (
+                <li key={index}>{warning}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {rules.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-gray-300 p-12 text-center dark:border-gray-700">
