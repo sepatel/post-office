@@ -1,6 +1,8 @@
 use post_office_core::config::AppConfig;
 use post_office_core::llm::InferenceRuntime;
 use post_office_core::processing::ProcessingState;
+use post_office_core::rules::engine::PipelineDryRunProgress;
+use serde::Serialize;
 use std::sync::Arc;
 use tauri::tray::TrayIcon;
 use tauri::Manager;
@@ -13,10 +15,20 @@ mod tray;
 
 pub type ProcessingStates =
     Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<Mutex<ProcessingState>>>>>;
+pub type PipelineDryRunStatuses =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, PipelineDryRunStatus>>>;
+
+#[derive(Clone, Serialize)]
+pub struct PipelineDryRunStatus {
+    pub phase: String,
+    pub total_rules: u32,
+    pub progress: Option<PipelineDryRunProgress>,
+}
 
 pub struct AppState {
     pub db: post_office_core::db::Database,
     pub processing_states: ProcessingStates,
+    pub pipeline_dry_run_statuses: PipelineDryRunStatuses,
     pub config: Arc<Mutex<AppConfig>>,
     pub inference_runtime: InferenceRuntime,
     pub sync_trigger: mpsc::UnboundedSender<sync_runtime::SyncTrigger>,
@@ -84,6 +96,9 @@ fn main() {
             let app_state = AppState {
                 db,
                 processing_states,
+                pipeline_dry_run_statuses: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
                 config: config_arc.clone(),
                 inference_runtime,
                 sync_trigger,
@@ -159,6 +174,8 @@ fn main() {
             commands::gmail_list_labels,
             commands::gmail_connection_status,
             commands::history_by_email,
+            commands::pipeline_dry_run,
+            commands::pipeline_dry_run_status,
             commands::sync_status,
             commands::sync_replay_now,
             commands::sync_watch_start,
@@ -170,6 +187,14 @@ fn main() {
             commands::llm_provider_set_api_key,
             commands::llm_provider_status_list,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                app.state::<AppState>().inference_runtime.cancel_all();
+            }
+        });
 }

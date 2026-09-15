@@ -21,6 +21,7 @@ import {
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import DatePicker from "../components/DatePicker";
+import PipelineDryRunDialog from "../components/PipelineDryRunDialog";
 import { useGate } from "../lib/gate";
 
 interface ProcessingStatus {
@@ -168,6 +169,7 @@ function EntryModal({
   onClose: () => void;
 }) {
   const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
+  const [dryRunOpen, setDryRunOpen] = useState(false);
 
   useEffect(() => {
     historyByEmail(emailId)
@@ -186,12 +188,21 @@ function EntryModal({
       >
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-lg font-semibold">Processing detail</h3>
-          <button
-            onClick={onClose}
-            className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
-          >
-            Close
-          </button>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setDryRunOpen(true)}
+              className="rounded-lg px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/40"
+            >
+              Run full dry run
+            </button>
+            <button
+              onClick={onClose}
+              className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+            >
+              Close
+            </button>
+          </div>
         </div>
         {entries === null && (
           <div className="text-sm text-gray-400">Loading…</div>
@@ -274,6 +285,9 @@ function EntryModal({
           </div>
         ))}
       </div>
+      {dryRunOpen && (
+        <PipelineDryRunDialog emailId={emailId} onClose={() => setDryRunOpen(false)} />
+      )}
     </div>
   );
 }

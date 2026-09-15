@@ -12,14 +12,17 @@ use post_office_core::processing::{
 use post_office_core::rules::actions::execute_actions;
 use post_office_core::rules::chat::{apply_proposal, chat_with_rule, ChatProposal, ChatTurn};
 use post_office_core::rules::engine::{
-    display_action, rules_after, ActionDisplay, FallthroughStep, Outcome, TestResult,
+    display_action, dry_run_pipeline, rules_after, ActionDisplay, FallthroughStep, Outcome,
+    PipelineDryRun, PipelineDryRunProgress, TestResult,
 };
 use post_office_core::rules::evaluation::BulkVerdict;
 use post_office_core::rules::models::{Action, Condition, Rule};
 use post_office_core::sync::{replay_history, start_watch, stop_watch, ReplayResult};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
@@ -30,7 +33,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::sync_runtime::SyncTrigger;
 use crate::tray;
-use crate::AppState;
+use crate::{AppState, PipelineDryRunStatus};
 
 pub fn ensure_polling_started(
     app: tauri::AppHandle,
@@ -102,6 +105,10 @@ pub struct RuleCreateRequest {
     pub enabled: bool,
     #[serde(default = "default_policy")]
     pub inference_policy: String,
+    #[serde(default = "default_decision_reasoning_effort")]
+    pub decision_reasoning_effort: post_office_core::llm::ReasoningEffort,
+    #[serde(default)]
+    pub decision_max_tokens: Option<u32>,
     #[serde(default)]
     pub continue_after_match: bool,
     #[serde(default)]
@@ -123,6 +130,10 @@ pub struct RuleUpdateRequest {
     pub enabled: bool,
     #[serde(default = "default_policy")]
     pub inference_policy: String,
+    #[serde(default = "default_decision_reasoning_effort")]
+    pub decision_reasoning_effort: post_office_core::llm::ReasoningEffort,
+    #[serde(default)]
+    pub decision_max_tokens: Option<u32>,
     #[serde(default)]
     pub continue_after_match: bool,
     #[serde(default)]
@@ -131,6 +142,10 @@ pub struct RuleUpdateRequest {
 
 fn default_policy() -> String {
     "default".into()
+}
+
+fn default_decision_reasoning_effort() -> post_office_core::llm::ReasoningEffort {
+    post_office_core::llm::ReasoningEffort::ServerDefault
 }
 
 #[derive(Debug, Serialize)]
@@ -167,6 +182,8 @@ fn build_rule_model(rule: &RuleCreateRequest) -> Rule {
         } else {
             rule.inference_policy.clone()
         },
+        decision_reasoning_effort: rule.decision_reasoning_effort,
+        decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
     }
 }
@@ -464,6 +481,9 @@ pub async fn accounts_set_paused(
         .await
         .paused
         .store(paused, std::sync::atomic::Ordering::Relaxed);
+    if paused {
+        state.inference_runtime.cancel_all();
+    }
 
     let config = state.config.lock().await.clone();
     if !paused && !config.sync_enabled {
@@ -505,6 +525,7 @@ pub async fn accounts_remove(
             .stop_requested
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    state.inference_runtime.cancel_all();
     while state.pollers_started.lock().unwrap().contains(&email) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -548,7 +569,7 @@ pub struct LlmConfigUpdate {
     pub context_window_tokens: u32,
     pub legacy_max_concurrent_requests: u8,
     pub legacy_max_emails_per_request: u8,
-    pub legacy_decision_reasoning_effort: post_office_core::llm::ReasoningEffort,
+    pub legacy_output_tokens_per_second: f64,
     pub legacy_chat_reasoning_effort: post_office_core::llm::ReasoningEffort,
     pub legacy_name: String,
     pub legacy_quality_tier: String,
@@ -574,7 +595,7 @@ pub async fn llm_config_set(
     config.llm_context_window_tokens = update.context_window_tokens;
     config.llm_legacy_max_concurrent_requests = update.legacy_max_concurrent_requests;
     config.llm_legacy_max_emails_per_request = update.legacy_max_emails_per_request;
-    config.llm_legacy_decision_reasoning_effort = update.legacy_decision_reasoning_effort;
+    config.llm_legacy_output_tokens_per_second = update.legacy_output_tokens_per_second;
     config.llm_legacy_chat_reasoning_effort = update.legacy_chat_reasoning_effort;
     config.llm_legacy_name = update.legacy_name;
     config.llm_legacy_quality_tier = update.legacy_quality_tier;
@@ -629,6 +650,8 @@ pub async fn rules_create(
         } else {
             rule.inference_policy
         },
+        decision_reasoning_effort: rule.decision_reasoning_effort,
+        decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
     };
     state
@@ -667,6 +690,8 @@ pub async fn rules_update(
         } else {
             rule.inference_policy
         },
+        decision_reasoning_effort: rule.decision_reasoning_effort,
+        decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
     };
     state
@@ -1218,6 +1243,7 @@ pub async fn processing_pause(state: State<'_, AppState>) -> Result<(), String> 
     let processing_state = state.processing_state_for(&account_email);
     let ps = processing_state.lock().await;
     ps.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+    state.inference_runtime.cancel_all();
     Ok(())
 }
 
@@ -1568,6 +1594,7 @@ pub async fn processing_backfill_stop(state: State<'_, AppState>) -> Result<bool
     if running {
         ps.backfill_cancel_requested
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        state.inference_runtime.cancel_all();
     }
     Ok(running)
 }
@@ -1632,8 +1659,6 @@ pub struct LlmProviderTestProfile {
     pub timeout_secs: u64,
     #[serde(default = "default_provider_concurrency")]
     pub max_concurrent_requests: u8,
-    #[serde(default)]
-    pub decision_reasoning_effort: post_office_core::llm::ReasoningEffort,
 }
 
 #[tauri::command]
@@ -1671,10 +1696,7 @@ pub async fn llm_provider_test(
             provider.max_concurrent_requests as usize,
         )
         .await;
-    match client
-        .test_connection_with_reasoning(provider.decision_reasoning_effort.request_value())
-        .await
-    {
+    match client.test_connection().await {
         Ok(response) => Ok(LlmTestResult {
             ok: true,
             model: response.model,
@@ -2078,6 +2100,96 @@ pub async fn history_by_email(
         .db
         .with_history(|repo| repo.by_email(&account_email, &email_id))
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn pipeline_dry_run(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    email_id: String,
+    run_id: String,
+) -> Result<PipelineDryRun, String> {
+    let statuses = state.pipeline_dry_run_statuses.clone();
+    let update_progress =
+        |phase: &str, total_rules: u32, progress: Option<PipelineDryRunProgress>| {
+            statuses.lock().unwrap().insert(
+                run_id.clone(),
+                PipelineDryRunStatus {
+                    phase: phase.into(),
+                    total_rules,
+                    progress,
+                },
+            );
+        };
+    update_progress("loading_credentials", 0, None);
+    let result = async {
+        let config = state.config.lock().await.clone();
+        let account_email = active_account(&config)?;
+        let auth_app = app.clone();
+        let auth_config = config.clone();
+        let auth = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || load_gmail_auth(&auth_app, &auth_config)),
+        )
+        .await
+        .map_err(|_| "Timed out loading Gmail credentials after 30 seconds. Check that your OS keyring is available.")?
+        .map_err(|error| format!("Could not load Gmail credentials: {error}"))??;
+        let llm = InferenceRouter::from_config_with_runtime(&config, state.inference_runtime.clone())
+            .with_database(state.db.clone());
+        let mut gmail = GmailClient::new(auth);
+        update_progress("loading_message", 0, None);
+        let email = tokio::time::timeout(Duration::from_secs(30), gmail.get_message(&email_id))
+            .await
+            .map_err(|_| "Timed out loading the Gmail message after 30 seconds. Gmail may be rate limited; try again shortly.")?
+            .map_err(|error| error.to_string())?;
+        update_progress("loading_labels", 0, None);
+        let labels = tokio::time::timeout(
+            Duration::from_secs(30),
+            post_office_core::gmail::cached_labels(&state.db, &mut gmail, &account_email),
+        )
+        .await
+        .map_err(|_| "Timed out loading Gmail labels after 30 seconds. Gmail may be rate limited; try again shortly.")?
+        .map_err(|error| error.to_string())?;
+        update_progress("loading_rules", 0, None);
+        let rules = state
+            .db
+            .with_rules(|repo| repo.get_enabled_rules(&account_email))
+            .map_err(|error| error.to_string())?;
+        let total_rules = rules.len() as u32;
+        update_progress("evaluating", total_rules, None);
+        let memories_by_rule = rules
+            .iter()
+            .map(|rule| (rule.id, rule_memories(&state, rule.id)))
+            .collect::<HashMap<_, _>>();
+
+        Ok(dry_run_pipeline(
+            &llm,
+            &rules,
+            &email,
+            &memories_by_rule,
+            &labels,
+            &|progress| {
+                update_progress("evaluating", total_rules, Some(progress));
+            },
+        )
+        .await)
+    }
+    .await;
+    statuses.lock().unwrap().remove(&run_id);
+    result
+}
+
+#[tauri::command]
+pub fn pipeline_dry_run_status(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Option<PipelineDryRunStatus> {
+    state
+        .pipeline_dry_run_statuses
+        .lock()
+        .unwrap()
+        .get(&run_id)
+        .cloned()
 }
 
 #[tauri::command]

@@ -139,6 +139,8 @@ mod tests {
                         priority: 0,
                         enabled: true,
                         inference_policy: "default".into(),
+                        decision_reasoning_effort: crate::llm::ReasoningEffort::ServerDefault,
+                        decision_max_tokens: None,
                         continue_after_match: false,
                     },
                 )

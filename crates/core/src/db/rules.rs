@@ -3,7 +3,8 @@ use rusqlite::{params, Connection, Result, Row, ToSql};
 use crate::rules::models::Rule;
 
 const RULE_COLUMNS: &str = "r.id, r.name, r.description, r.conditions, r.prompt, r.choices, r.choose_from_all_labels,
-     r.actions, r.priority, r.enabled, r.parent_id, COALESCE(p.policy_id, 'default'), r.continue_after_match";
+     r.actions, r.priority, r.enabled, r.parent_id, COALESCE(p.policy_id, 'default'), r.decision_reasoning_effort,
+     r.decision_max_tokens, r.continue_after_match";
 
 const RULE_FROM: &str = "FROM rules r LEFT JOIN rule_inference_policy p ON p.rule_id = r.id";
 
@@ -21,7 +22,13 @@ fn map_rule_row(row: &Row<'_>) -> Result<Rule> {
         enabled: row.get::<_, i32>(9)? != 0,
         parent_id: row.get(10)?,
         inference_policy: row.get(11)?,
-        continue_after_match: row.get::<_, i32>(12)? != 0,
+        decision_reasoning_effort: serde_json::from_str(&format!(
+            "\"{}\"",
+            row.get::<_, String>(12)?
+        ))
+        .unwrap_or(crate::llm::ReasoningEffort::ServerDefault),
+        decision_max_tokens: row.get(13)?,
+        continue_after_match: row.get::<_, i32>(14)? != 0,
     })
 }
 
@@ -95,8 +102,9 @@ impl<'a> RuleRepository<'a> {
     pub fn create(&self, account_email: &str, rule: &CreateRuleRequest) -> Result<Rule> {
         self.conn.execute(
             "INSERT INTO rules (account_email, name, description, conditions, prompt, choices,
-                                choose_from_all_labels, actions, priority, enabled, continue_after_match)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                choose_from_all_labels, actions, priority, enabled, decision_reasoning_effort,
+                                decision_max_tokens, continue_after_match)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 account_email,
                 rule.name,
@@ -108,6 +116,8 @@ impl<'a> RuleRepository<'a> {
                 serde_json::to_string(&rule.actions).unwrap_or_default(),
                 rule.priority,
                 rule.enabled as i32,
+                rule.decision_reasoning_effort.config_value(),
+                rule.decision_max_tokens,
                 rule.continue_after_match as i32,
             ],
         )?;
@@ -132,6 +142,8 @@ impl<'a> RuleRepository<'a> {
             enabled: rule.enabled,
             parent_id: None,
             inference_policy: rule.inference_policy.clone(),
+            decision_reasoning_effort: rule.decision_reasoning_effort,
+            decision_max_tokens: rule.decision_max_tokens,
             continue_after_match: rule.continue_after_match,
         })
     }
@@ -140,8 +152,8 @@ impl<'a> RuleRepository<'a> {
         self.conn.execute(
             "UPDATE rules SET name = ?1, description = ?2, conditions = ?3, prompt = ?4,
              choices = ?5, choose_from_all_labels = ?6, actions = ?7, priority = ?8, enabled = ?9,
-             continue_after_match = ?10, updated_at = datetime('now')
-             WHERE id = ?11 AND account_email = ?12",
+             decision_reasoning_effort = ?10, decision_max_tokens = ?11, continue_after_match = ?12,
+             updated_at = datetime('now') WHERE id = ?13 AND account_email = ?14",
             params![
                 rule.name,
                 rule.description,
@@ -152,6 +164,8 @@ impl<'a> RuleRepository<'a> {
                 serde_json::to_string(&rule.actions).unwrap_or_default(),
                 rule.priority,
                 rule.enabled as i32,
+                rule.decision_reasoning_effort.config_value(),
+                rule.decision_max_tokens,
                 rule.continue_after_match as i32,
                 id,
                 account_email,
@@ -202,6 +216,8 @@ pub struct CreateRuleRequest {
     pub priority: i32,
     pub enabled: bool,
     pub inference_policy: String,
+    pub decision_reasoning_effort: crate::llm::ReasoningEffort,
+    pub decision_max_tokens: Option<u32>,
     pub continue_after_match: bool,
 }
 
@@ -217,6 +233,8 @@ pub struct UpdateRuleRequest {
     pub priority: i32,
     pub enabled: bool,
     pub inference_policy: String,
+    pub decision_reasoning_effort: crate::llm::ReasoningEffort,
+    pub decision_max_tokens: Option<u32>,
     pub continue_after_match: bool,
 }
 
@@ -235,6 +253,8 @@ mod tests {
         let mut req = sample_request();
         req.continue_after_match = true;
         req.choices = vec![Action::Trash];
+        req.decision_reasoning_effort = crate::llm::ReasoningEffort::Low;
+        req.decision_max_tokens = Some(4_096);
         let created = db
             .with_rules(|repo| repo.create("test@example.com", &req))
             .unwrap();
@@ -244,6 +264,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stored.continue_after_match);
+        assert_eq!(
+            stored.decision_reasoning_effort,
+            crate::llm::ReasoningEffort::Low
+        );
+        assert_eq!(stored.decision_max_tokens, Some(4_096));
         assert_eq!(stored.choices.len(), 1);
         assert_eq!(stored.actions.len(), 1);
 
@@ -258,6 +283,8 @@ mod tests {
             priority: 0,
             enabled: true,
             inference_policy: "default".into(),
+            decision_reasoning_effort: crate::llm::ReasoningEffort::Medium,
+            decision_max_tokens: None,
             continue_after_match: false,
         };
         let updated = db
@@ -266,6 +293,11 @@ mod tests {
         assert!(!updated.continue_after_match);
         assert!(updated.choose_from_all_labels);
         assert!(updated.choices.is_empty());
+        assert_eq!(
+            updated.decision_reasoning_effort,
+            crate::llm::ReasoningEffort::Medium
+        );
+        assert_eq!(updated.decision_max_tokens, None);
     }
 
     fn sample_request() -> CreateRuleRequest {
@@ -291,6 +323,8 @@ mod tests {
             priority: 0,
             enabled: true,
             inference_policy: "default".into(),
+            decision_reasoning_effort: crate::llm::ReasoningEffort::ServerDefault,
+            decision_max_tokens: None,
             continue_after_match: false,
         }
     }

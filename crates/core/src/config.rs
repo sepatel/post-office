@@ -16,7 +16,7 @@ pub struct AppConfig {
     pub llm_context_window_tokens: u32,
     pub llm_legacy_max_concurrent_requests: u8,
     pub llm_legacy_max_emails_per_request: u8,
-    pub llm_legacy_decision_reasoning_effort: ReasoningEffort,
+    pub llm_legacy_output_tokens_per_second: f64,
     pub llm_legacy_chat_reasoning_effort: ReasoningEffort,
     pub llm_legacy_name: String,
     pub llm_legacy_quality_tier: String,
@@ -55,7 +55,7 @@ impl Default for AppConfig {
             llm_context_window_tokens: 8_192,
             llm_legacy_max_concurrent_requests: 1,
             llm_legacy_max_emails_per_request: 3,
-            llm_legacy_decision_reasoning_effort: ReasoningEffort::Off,
+            llm_legacy_output_tokens_per_second: 0.0,
             llm_legacy_chat_reasoning_effort: ReasoningEffort::ServerDefault,
             llm_legacy_name: "Current endpoint".into(),
             llm_legacy_quality_tier: "balanced".into(),
@@ -113,11 +113,9 @@ impl AppConfig {
             llm_legacy_max_emails_per_request: get("llm.legacy_max_emails_per_request", "3")
                 .parse()
                 .unwrap_or(3),
-            llm_legacy_decision_reasoning_effort: serde_json::from_str(&get(
-                "llm.legacy_decision_reasoning_effort",
-                "\"off\"",
-            ))
-            .unwrap_or(ReasoningEffort::Off),
+            llm_legacy_output_tokens_per_second: get("llm.legacy_output_tokens_per_second", "0")
+                .parse()
+                .unwrap_or(0.0),
             llm_legacy_chat_reasoning_effort: serde_json::from_str(&get(
                 "llm.legacy_chat_reasoning_effort",
                 "\"server_default\"",
@@ -177,9 +175,8 @@ impl AppConfig {
             &self.llm_legacy_max_emails_per_request.to_string(),
         )?;
         set(
-            "llm.legacy_decision_reasoning_effort",
-            &serde_json::to_string(&self.llm_legacy_decision_reasoning_effort)
-                .unwrap_or_else(|_| "\"off\"".into()),
+            "llm.legacy_output_tokens_per_second",
+            &self.llm_legacy_output_tokens_per_second.to_string(),
         )?;
         set(
             "llm.legacy_chat_reasoning_effort",
@@ -266,7 +263,7 @@ mod tests {
                 context_window_tokens: 8_192,
                 max_concurrent_requests: 4,
                 max_emails_per_request: 6,
-                decision_reasoning_effort: ReasoningEffort::Off,
+                output_tokens_per_second: 30.0,
                 chat_reasoning_effort: ReasoningEffort::ServerDefault,
                 enabled: true,
             }],
@@ -282,7 +279,7 @@ mod tests {
             llm_timeout_secs: 45,
             llm_legacy_max_concurrent_requests: 1,
             llm_legacy_max_emails_per_request: 3,
-            llm_legacy_decision_reasoning_effort: ReasoningEffort::Off,
+            llm_legacy_output_tokens_per_second: 30.0,
             llm_legacy_chat_reasoning_effort: ReasoningEffort::ServerDefault,
             llm_legacy_name: "Local agent".into(),
             llm_legacy_quality_tier: "strong".into(),
@@ -298,10 +295,8 @@ mod tests {
         assert_eq!(loaded.llm_timeout_secs, 45);
         assert_eq!(loaded.llm_legacy_max_concurrent_requests, 1);
         assert_eq!(loaded.llm_legacy_max_emails_per_request, 3);
-        assert_eq!(
-            loaded.llm_legacy_decision_reasoning_effort,
-            ReasoningEffort::Off
-        );
+        assert_eq!(loaded.llm_legacy_output_tokens_per_second, 30.0);
+        assert_eq!(loaded.llm_providers[0].output_tokens_per_second, 30.0);
         assert_eq!(
             loaded.llm_providers[0].chat_reasoning_effort,
             ReasoningEffort::ServerDefault

@@ -133,6 +133,8 @@ pub async fn apply_proposal(
             priority: rule.priority,
             enabled: rule.enabled,
             inference_policy: rule.inference_policy,
+            decision_reasoning_effort: rule.decision_reasoning_effort,
+            decision_max_tokens: rule.decision_max_tokens,
             continue_after_match: rule.continue_after_match,
         };
         db.with_rules(|repo| repo.update(account_email, rule.id, &update))?;

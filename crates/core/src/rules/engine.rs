@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -9,6 +10,7 @@ use super::response_parser::ParsedAction;
 use crate::db::rules::RuleRepository;
 use crate::gmail::models::{Label, Message, MessagePayload};
 use crate::llm::InferenceRouter;
+use crate::rules::evaluation::{decision_estimate, DecisionEstimate};
 
 const TRUNCATION_MARKER: &str = "\n\n[Body truncated; middle omitted]\n\n";
 
@@ -201,6 +203,202 @@ pub struct TestResult {
     pub fallthrough: Vec<FallthroughStep>,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct PipelineDryRun {
+    pub steps: Vec<PipelineDryRunStep>,
+    pub status: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PipelineDryRunStep {
+    pub rule_id: i64,
+    pub rule_name: String,
+    pub priority: i32,
+    pub status: String,
+    pub actions: Vec<ActionDisplay>,
+    pub reasoning: String,
+    pub diagnostic: Option<String>,
+    pub llm_response: String,
+    pub llm_model: Option<String>,
+    pub llm_provider: Option<String>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub continued: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PipelineDryRunProgress {
+    pub phase: String,
+    pub rule_id: i64,
+    pub rule_name: String,
+    pub priority: i32,
+    pub decision_estimate: Option<DecisionEstimate>,
+    pub step: Option<PipelineDryRunStep>,
+}
+
+pub async fn dry_run_pipeline(
+    llm: &InferenceRouter,
+    rules: &[Rule],
+    email: &Message,
+    memories_by_rule: &HashMap<i64, Vec<String>>,
+    labels: &[Label],
+    on_progress: &impl Fn(PipelineDryRunProgress),
+) -> PipelineDryRun {
+    let mut steps = Vec::new();
+    for rule in rules.iter().filter(|rule| rule.enabled) {
+        on_progress(PipelineDryRunProgress {
+            phase: "evaluating".into(),
+            rule_id: rule.id,
+            rule_name: rule.name.clone(),
+            priority: rule.priority,
+            decision_estimate: None,
+            step: None,
+        });
+        if !rule
+            .conditions
+            .iter()
+            .all(|condition| matcher::evaluate(condition, email, &email.label_ids))
+        {
+            steps.push(PipelineDryRunStep {
+                rule_id: rule.id,
+                rule_name: rule.name.clone(),
+                priority: rule.priority,
+                status: "condition_skipped".into(),
+                actions: vec![],
+                reasoning: String::new(),
+                diagnostic: None,
+                llm_response: String::new(),
+                llm_model: None,
+                llm_provider: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                duration_ms: None,
+                continued: true,
+            });
+            on_progress(PipelineDryRunProgress {
+                phase: "completed".into(),
+                rule_id: rule.id,
+                rule_name: rule.name.clone(),
+                priority: rule.priority,
+                decision_estimate: None,
+                step: steps.last().cloned(),
+            });
+            continue;
+        }
+
+        let memories = memories_by_rule
+            .get(&rule.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        on_progress(PipelineDryRunProgress {
+            phase: "evaluating".into(),
+            rule_id: rule.id,
+            rule_name: rule.name.clone(),
+            priority: rule.priority,
+            decision_estimate: decision_estimate(llm, rule, email, memories, labels)
+                .ok()
+                .flatten(),
+            step: None,
+        });
+        let resolved = match resolve_rule(llm, rule, email, memories, labels).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                steps.push(PipelineDryRunStep {
+                    rule_id: rule.id,
+                    rule_name: rule.name.clone(),
+                    priority: rule.priority,
+                    status: "invalid_decision".into(),
+                    actions: vec![],
+                    reasoning: String::new(),
+                    diagnostic: Some(error.to_string()),
+                    llm_response: String::new(),
+                    llm_model: None,
+                    llm_provider: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    total_tokens: None,
+                    duration_ms: None,
+                    continued: false,
+                });
+                on_progress(PipelineDryRunProgress {
+                    phase: "completed".into(),
+                    rule_id: rule.id,
+                    rule_name: rule.name.clone(),
+                    priority: rule.priority,
+                    decision_estimate: None,
+                    step: steps.last().cloned(),
+                });
+                return PipelineDryRun {
+                    steps,
+                    status: "would_queue".into(),
+                    summary: "The model decision could not be completed; production would queue a recheck."
+                        .into(),
+                };
+            }
+        };
+        let actions = resolved
+            .actions
+            .iter()
+            .map(|action| display_action_for_labels(action, labels))
+            .collect();
+        let (status, continued, terminal) = match resolved.outcome {
+            Outcome::NoMatch => ("no_match", true, None),
+            Outcome::Unparsed => ("invalid_decision", false, Some("would_queue")),
+            Outcome::Matched if rule.continue_after_match => ("matched", true, None),
+            Outcome::Matched => ("matched", false, Some("claimed")),
+        };
+        steps.push(PipelineDryRunStep {
+            rule_id: rule.id,
+            rule_name: rule.name.clone(),
+            priority: rule.priority,
+            status: status.into(),
+            actions,
+            reasoning: resolved.reason,
+            diagnostic: resolved.diagnostic,
+            llm_response: resolved.llm_response,
+            llm_model: resolved.llm_model,
+            llm_provider: resolved.llm_provider,
+            prompt_tokens: resolved.prompt_tokens,
+            completion_tokens: resolved.completion_tokens,
+            total_tokens: resolved.total_tokens,
+            duration_ms: resolved.llm_duration_ms,
+            continued,
+        });
+        on_progress(PipelineDryRunProgress {
+            phase: "completed".into(),
+            rule_id: rule.id,
+            rule_name: rule.name.clone(),
+            priority: rule.priority,
+            decision_estimate: None,
+            step: steps.last().cloned(),
+        });
+
+        if let Some(status) = terminal {
+            let summary = match status {
+                "would_queue" => {
+                    "The model reply was not a readable decision; production would queue a recheck."
+                }
+                _ => "A rule claimed the message, so lower-priority rules would not run.",
+            };
+            return PipelineDryRun {
+                steps,
+                status: status.into(),
+                summary: summary.into(),
+            };
+        }
+    }
+
+    PipelineDryRun {
+        steps,
+        status: "no_match".into(),
+        summary: "No enabled rule would claim this message.".into(),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FallthroughStep {
     pub rule_id: i64,
@@ -253,6 +451,29 @@ pub fn display_action(action: &ParsedAction) -> ActionDisplay {
         ParsedAction::MarkRead => simple_action("mark_read", "Mark as read"),
         ParsedAction::MarkUnread => simple_action("mark_unread", "Mark as unread"),
         ParsedAction::Star => simple_action("star", "Star"),
+    }
+}
+
+fn display_action_for_labels(action: &ParsedAction, labels: &[Label]) -> ActionDisplay {
+    match action {
+        ParsedAction::Label(id) => label_action_display("label", "Add label", id, labels),
+        ParsedAction::RemoveLabel(id) => {
+            label_action_display("remove_label", "Remove label", id, labels)
+        }
+        _ => display_action(action),
+    }
+}
+
+fn label_action_display(kind: &str, verb: &str, id: &str, labels: &[Label]) -> ActionDisplay {
+    let name = labels
+        .iter()
+        .find(|label| label.id == id)
+        .map(|label| label.name.as_str())
+        .unwrap_or(id);
+    ActionDisplay {
+        kind: kind.into(),
+        detail: Some(id.into()),
+        display: format!("{verb} \"{name}\""),
     }
 }
 
@@ -496,7 +717,7 @@ pub(crate) fn parse_row(line: &str, menu: &[Choice]) -> Result<Row, RowError> {
 /// a reason to stall the email against every remaining rule.
 fn resolve_selection(
     text: &str,
-    reason: String,
+    mut reason: String,
     selection: &str,
     menu: &[Choice],
     declared_match: bool,
@@ -504,6 +725,18 @@ fn resolve_selection(
     // Gmail permits commas inside label names, so try the whole selection as a
     // single name before treating commas as separators.
     if let Some(choice) = menu.iter().find(|choice| choice.matches(selection)) {
+        return Ok(Row::matched(text, reason, vec![choice.action.clone()]));
+    }
+
+    if let Some((choice, explanation)) = menu
+        .iter()
+        .find_map(|choice| choice_with_explanation(choice, selection))
+    {
+        reason = if reason.is_empty() {
+            explanation.to_string()
+        } else {
+            format!("{explanation} {reason}")
+        };
         return Ok(Row::matched(text, reason, vec![choice.action.clone()]));
     }
 
@@ -529,6 +762,23 @@ fn resolve_selection(
         true => row,
         false => row.with_note(format!("Ignored {} — not on the menu", unknown.join(", "))),
     })
+}
+
+fn choice_with_explanation<'choice, 'selection>(
+    choice: &'choice Choice,
+    selection: &'selection str,
+) -> Option<(&'choice Choice, &'selection str)> {
+    [choice.name.as_str(), unquote(&choice.name)]
+        .into_iter()
+        .find_map(|name| {
+            let prefix = selection.get(..name.len())?;
+            prefix
+                .eq_ignore_ascii_case(name)
+                .then(|| selection.get(name.len()..))?
+                .and_then(|suffix| suffix.strip_prefix(" -- "))
+                .filter(|explanation| !explanation.is_empty())
+        })
+        .map(|explanation| (choice, explanation))
 }
 
 enum Verdict {
@@ -764,6 +1014,8 @@ mod tests {
             enabled: true,
             parent_id: None,
             inference_policy: "default".into(),
+            decision_reasoning_effort: crate::llm::ReasoningEffort::ServerDefault,
+            decision_max_tokens: None,
             continue_after_match: false,
         }
     }
@@ -807,6 +1059,22 @@ mod tests {
         assert_eq!(
             chosen("Bills", &menu()),
             vec![ParsedAction::Label("Label_2".into())]
+        );
+    }
+
+    #[test]
+    fn a_choice_followed_by_a_double_dash_explanation_is_accepted() {
+        let menu = vec![Choice::label("Label_1", "Education")];
+        let row = parse_row(
+            "Education -- Generic information about college visits and class officer elections",
+            &menu,
+        )
+        .expect("choice with explanation should parse");
+
+        assert_eq!(row.chosen, vec![ParsedAction::Label("Label_1".into())]);
+        assert_eq!(
+            row.reason,
+            "Generic information about college visits and class officer elections"
         );
     }
 

@@ -115,6 +115,18 @@ impl Database {
                 .execute_batch(include_str!("../../../../migrations/015_llm_requests.sql"))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (15)", [])?;
         }
+        if !migration_applied(&transaction, 16)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/016_rule_decision_reasoning_effort.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (16)", [])?;
+        }
+        if !migration_applied(&transaction, 17)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/017_rule_decision_max_tokens.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (17)", [])?;
+        }
         transaction.commit()
     }
 

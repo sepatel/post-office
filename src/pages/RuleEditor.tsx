@@ -76,6 +76,27 @@ const ACTION_TYPES: DropdownOption[] = [
   { value: "star", label: "Star" },
 ];
 
+const REASONING_OPTIONS: DropdownOption[] = [
+  { value: "off", label: "Off" },
+  { value: "server_default", label: "Server default" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra high" },
+  { value: "max", label: "Maximum" },
+];
+
+const COMPLETION_BUDGET_OPTIONS: DropdownOption[] = [
+  { value: "server_default", label: "Server default" },
+  { value: "256", label: "256 tokens" },
+  { value: "512", label: "512 tokens" },
+  { value: "1024", label: "1,024 tokens" },
+  { value: "2048", label: "2,048 tokens" },
+  { value: "4096", label: "4,096 tokens" },
+  { value: "8192", label: "8,192 tokens" },
+];
+
 function actionLabel(action: RuleAction): string {
   return ACTION_TYPES.find((o) => o.value === action.type)?.label ?? action.type;
 }
@@ -98,6 +119,8 @@ export default function RuleEditor() {
   const [priority, setPriority] = useState(0);
   const [enabled, setEnabled] = useState(true);
   const [inferencePolicy, setInferencePolicy] = useState("default");
+  const [decisionReasoningEffort, setDecisionReasoningEffort] = useState("server_default");
+  const [decisionMaxTokens, setDecisionMaxTokens] = useState("server_default");
   const [chooseFromAllLabels, setChooseFromAllLabels] = useState(false);
   const [continueAfterMatch, setContinueAfterMatch] = useState(false);
   const [routingPolicies, setRoutingPolicies] = useState<RoutingPolicy[]>([]);
@@ -277,6 +300,8 @@ export default function RuleEditor() {
         priority: number;
         enabled: boolean;
         inference_policy?: string;
+        decision_reasoning_effort?: string;
+        decision_max_tokens?: number | null;
         choices?: unknown[];
         choose_from_all_labels?: boolean;
         continue_after_match?: boolean;
@@ -311,6 +336,8 @@ export default function RuleEditor() {
         setPriority(rule.priority);
         setEnabled(rule.enabled);
         setInferencePolicy(rule.inference_policy || "default");
+        setDecisionReasoningEffort(rule.decision_reasoning_effort || "server_default");
+        setDecisionMaxTokens(rule.decision_max_tokens?.toString() || "server_default");
         setChooseFromAllLabels(rule.choose_from_all_labels || false);
         setContinueAfterMatch(rule.continue_after_match || false);
         setConditions(normalizedConditions);
@@ -431,6 +458,8 @@ export default function RuleEditor() {
       priority,
       enabled,
       inference_policy: inferencePolicy || "default",
+      decision_reasoning_effort: decisionReasoningEffort,
+      decision_max_tokens: decisionMaxTokens === "server_default" ? null : Number(decisionMaxTokens),
       continue_after_match: continueAfterMatch,
       source_rule_id: isEdit ? ruleId : undefined,
     };
@@ -944,6 +973,36 @@ export default function RuleEditor() {
                 : ""}
             </div>
           )}
+        </div>}
+
+        {decisionMode !== "automatic" && <div>
+          <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
+            Decision thinking
+          </label>
+          <Dropdown
+            value={decisionReasoningEffort}
+            options={REASONING_OPTIONS}
+            onChange={setDecisionReasoningEffort}
+            className="w-full"
+          />
+          <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+            Thinking-enabled decisions run one message at a time so the model can finish with a choice.
+          </p>
+        </div>}
+
+        {decisionMode !== "automatic" && <div>
+          <label className="block text-sm text-gray-500 dark:text-gray-400 mb-1">
+            Completion budget
+          </label>
+          <Dropdown
+            value={decisionMaxTokens}
+            options={COMPLETION_BUDGET_OPTIONS}
+            onChange={setDecisionMaxTokens}
+            className="w-full"
+          />
+          <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+            Server default omits the output cap and lets the model choose. A fixed budget bounds latency and cost.
+          </p>
         </div>}
 
         <div>

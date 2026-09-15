@@ -82,6 +82,11 @@ impl GmailClient {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(60);
 
+            tracing::warn!(
+                path,
+                retry_after,
+                "Gmail rate limited; waiting before retry"
+            );
             tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
             return Box::pin(self.send(method, path, body)).await;
         }

@@ -24,6 +24,17 @@ pub struct BulkVerdict {
     pub diagnostic: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DecisionEstimate {
+    pub input_tokens: u32,
+    pub max_completion_tokens: Option<u32>,
+    pub context_reserve_tokens: u32,
+    pub output_tokens_per_second: Option<f64>,
+    pub max_generation_ms: Option<u64>,
+    pub available_request_slots: Option<u32>,
+    pub max_concurrent_requests: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BulkRuleResolution {
     pub resolved: Vec<Resolved>,
@@ -33,6 +44,13 @@ pub struct BulkRuleResolution {
 struct ChunkResolution {
     resolved: Vec<Resolved>,
     stopped: bool,
+}
+
+struct DecisionContext {
+    menu: Vec<Choice>,
+    system_prompt: String,
+    budget: usize,
+    max_batch_size: usize,
 }
 
 pub async fn bulk_resolve_for_rule(
@@ -50,12 +68,7 @@ pub async fn bulk_resolve_for_rule(
         });
     }
 
-    let has_instruction = !rule.prompt.trim().is_empty();
-    let menu = choice_catalog(rule, labels);
-    // An empty prompt normally means a deterministic conditions-and-actions rule
-    // that costs no inference. A menu overrides that: offering one is an
-    // explicit request for the model to classify.
-    if !has_instruction && menu.is_empty() {
+    let Some(context) = decision_context(llm, rule, labels) else {
         let actions: Vec<ParsedAction> = rule.actions.iter().map(ParsedAction::from).collect();
         return Ok(BulkRuleResolution {
             resolved: emails
@@ -64,15 +77,14 @@ pub async fn bulk_resolve_for_rule(
                 .collect(),
             stopped: false,
         });
-    }
-
-    let system_prompt = decision_prompt(&menu, has_instruction);
-    let max_batch_size = llm.max_emails_per_request(&rule.inference_policy);
-    let reserved_completion_tokens = llm.decision_max_tokens(max_batch_size);
-    let budget = llm
-        .input_token_budget(&rule.inference_policy, reserved_completion_tokens)
-        .saturating_sub(estimated_tokens(&system_prompt));
-    let chunks = batch_chunks(rule, emails, memories, budget, max_batch_size)?;
+    };
+    let chunks = batch_chunks(
+        rule,
+        emails,
+        memories,
+        context.budget,
+        context.max_batch_size,
+    )?;
     let mut resolved = Vec::with_capacity(emails.len());
     let chunks = stream::iter(chunks)
         .map(|chunk| {
@@ -81,9 +93,9 @@ pub async fn bulk_resolve_for_rule(
                 rule,
                 chunk,
                 memories,
-                &menu,
-                &system_prompt,
-                budget,
+                &context.menu,
+                &context.system_prompt,
+                context.budget,
                 cancel_requested,
             )
         })
@@ -98,6 +110,69 @@ pub async fn bulk_resolve_for_rule(
     }
 
     Ok(BulkRuleResolution { resolved, stopped })
+}
+
+pub fn decision_estimate(
+    llm: &InferenceRouter,
+    rule: &Rule,
+    email: &Message,
+    memories: &[String],
+    labels: &[Label],
+) -> Result<Option<DecisionEstimate>, RuleError> {
+    let Some(context) = decision_context(llm, rule, labels) else {
+        return Ok(None);
+    };
+    let user_prompt = build_batch_prompt(rule, &[email], memories, context.budget)?;
+    let input_tokens = estimated_tokens(&context.system_prompt)
+        .saturating_add(estimated_tokens(&user_prompt))
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let max_completion_tokens = rule.decision_max_tokens;
+    let output_tokens_per_second = llm.output_tokens_per_second(&rule.inference_policy);
+    let request_slots = llm.available_request_slots(&rule.inference_policy);
+    let max_generation_ms =
+        max_completion_tokens
+            .zip(output_tokens_per_second)
+            .map(|(limit, rate)| {
+                ((limit as f64 / rate) * 1_000.0)
+                    .ceil()
+                    .min(u64::MAX as f64) as u64
+            });
+    Ok(Some(DecisionEstimate {
+        input_tokens,
+        max_completion_tokens,
+        context_reserve_tokens: llm.decision_context_reserve_tokens(max_completion_tokens),
+        output_tokens_per_second,
+        max_generation_ms,
+        available_request_slots: request_slots.map(|(available, _)| available),
+        max_concurrent_requests: request_slots.map(|(_, maximum)| maximum),
+    }))
+}
+
+fn decision_context(
+    llm: &InferenceRouter,
+    rule: &Rule,
+    labels: &[Label],
+) -> Option<DecisionContext> {
+    let has_instruction = !rule.prompt.trim().is_empty();
+    let menu = choice_catalog(rule, labels);
+    // A menu explicitly asks for inference, even without an instruction.
+    if !has_instruction && menu.is_empty() {
+        return None;
+    }
+    let system_prompt = decision_prompt(&menu, has_instruction);
+    let max_batch_size =
+        llm.max_emails_per_request(&rule.inference_policy, rule.decision_reasoning_effort);
+    let reserved_completion_tokens = llm.decision_context_reserve_tokens(rule.decision_max_tokens);
+    let budget = llm
+        .input_token_budget(&rule.inference_policy, reserved_completion_tokens)
+        .saturating_sub(estimated_tokens(&system_prompt));
+    Some(DecisionContext {
+        menu,
+        system_prompt,
+        budget,
+        max_batch_size,
+    })
 }
 
 #[expect(
@@ -133,16 +208,52 @@ async fn resolve_chunk(
                 user_prompt,
                 model: None,
                 temperature: None,
-                max_tokens: Some(llm.decision_max_tokens(chunk.len())),
+                max_tokens: rule.decision_max_tokens,
                 kind: ProcessKind::Decision,
-                reasoning_effort: None,
+                reasoning_effort: rule
+                    .decision_reasoning_effort
+                    .request_value()
+                    .map(str::to_string),
                 litellm_reasoning_passthrough: false,
             },
         )
         .await;
     let resolved = match response {
         Ok(response) => {
-            let content = strip_thinking_prefix(&response.content);
+            let content = match strip_thinking_prefix(&response.content) {
+                Ok(content) if !content.is_empty() => content,
+                Ok(_) => {
+                    let diagnostic = missing_decision_diagnostic(&response);
+                    return Ok(ChunkResolution {
+                        resolved: (0..chunk.len())
+                            .map(|_| {
+                                unparsed(
+                                    response.content.clone(),
+                                    &diagnostic,
+                                    &response,
+                                    chunk.len(),
+                                )
+                            })
+                            .collect(),
+                        stopped: false,
+                    });
+                }
+                Err(diagnostic) => {
+                    return Ok(ChunkResolution {
+                        resolved: (0..chunk.len())
+                            .map(|_| {
+                                unparsed(
+                                    response.content.clone(),
+                                    diagnostic,
+                                    &response,
+                                    chunk.len(),
+                                )
+                            })
+                            .collect(),
+                        stopped: false,
+                    });
+                }
+            };
             match parse_rows(content, chunk.len(), menu) {
                 Ok(rows) => rows
                     .into_iter()
@@ -307,21 +418,35 @@ fn parse_rows(response: &str, count: usize, menu: &[Choice]) -> Result<Vec<Row>,
     ))
 }
 
-fn strip_thinking_prefix(content: &str) -> &str {
+fn strip_thinking_prefix(content: &str) -> Result<&str, &'static str> {
     let content = content.trim();
     for tag in ["think", "thinking"] {
         let open = format!("<{tag}>");
         let close = format!("</{tag}>");
         if let Some(after_open) = content.strip_prefix(&open) {
             if let Some(after_close) = after_open.strip_prefix(&close) {
-                return after_close.trim();
+                return Ok(after_close.trim());
             }
             if let Some(end) = after_open.find(&close) {
-                return after_open[end + close.len()..].trim();
+                return Ok(after_open[end + close.len()..].trim());
             }
+            return Err("Model returned unfinished thinking without a final decision");
         }
     }
-    content
+    Ok(content)
+}
+
+fn missing_decision_diagnostic(response: &crate::llm::ProcessResponse) -> String {
+    let reason = if response.has_reasoning {
+        "Model returned reasoning without a final decision"
+    } else {
+        "Model returned no final decision"
+    };
+    if response.finish_reason.as_deref() == Some("length") {
+        format!("{reason}; output limit was reached")
+    } else {
+        reason.into()
+    }
 }
 
 fn batch_chunks(
@@ -530,11 +655,19 @@ mod tests {
     fn removes_thinking_before_reading_decisions() {
         assert_eq!(
             strip_thinking_prefix("<think>considered the message</think>\n1: NO_MATCH | unrelated"),
-            "1: NO_MATCH | unrelated"
+            Ok("1: NO_MATCH | unrelated")
         );
         assert_eq!(
             strip_thinking_prefix("1: MATCH | direct"),
-            "1: MATCH | direct"
+            Ok("1: MATCH | direct")
+        );
+    }
+
+    #[test]
+    fn incomplete_thinking_is_not_read_as_a_decision() {
+        assert_eq!(
+            strip_thinking_prefix("<think>considering the email"),
+            Err("Model returned unfinished thinking without a final decision")
         );
     }
 }

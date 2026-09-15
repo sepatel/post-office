@@ -1,4 +1,5 @@
 use async_openai::{config::OpenAIConfig, Client};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -75,40 +76,67 @@ impl LlmClient {
             }
         }
 
-        let response: Value = self.client.chat().create_byot(body).await?;
+        body["stream"] = json!(true);
+        let mut stream = self
+            .client
+            .chat()
+            .create_stream_byot::<Value, Value>(body)
+            .await?;
+        let mut content = String::new();
+        let mut finish_reason = None;
+        let mut has_reasoning = false;
+        let mut prompt_tokens = None;
+        let mut completion_tokens = None;
+        let mut tokens_used = None;
+        let mut model_used = None;
+        let mut request_key = None;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            model_used = chunk["model"].as_str().map(str::to_string).or(model_used);
+            request_key = chunk["id"].as_str().map(str::to_string).or(request_key);
+            let choice = chunk["choices"]
+                .as_array()
+                .and_then(|choices| choices.first());
+            if let Some(choice) = choice {
+                let delta = &choice["delta"];
+                content.push_str(&response_content(delta));
+                has_reasoning |= ["reasoning", "reasoning_content", "reasoning_details"]
+                    .into_iter()
+                    .any(|field| delta[field].is_array() || delta[field].is_string());
+                finish_reason = choice["finish_reason"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or(finish_reason);
+            }
+            prompt_tokens = chunk["usage"]["prompt_tokens"]
+                .as_u64()
+                .map(|value| value as u32)
+                .or(prompt_tokens);
+            completion_tokens = chunk["usage"]["completion_tokens"]
+                .as_u64()
+                .map(|value| value as u32)
+                .or(completion_tokens);
+            tokens_used = chunk["usage"]["total_tokens"]
+                .as_u64()
+                .map(|value| value as u32)
+                .or(tokens_used);
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        let content = response["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-
-        let prompt_tokens = response["usage"]["prompt_tokens"]
-            .as_u64()
-            .map(|t| t as u32);
-        let completion_tokens = response["usage"]["completion_tokens"]
-            .as_u64()
-            .map(|t| t as u32);
-        let tokens_used = response["usage"]["total_tokens"].as_u64().map(|t| t as u32);
-
-        let model_used = response["model"].as_str().unwrap_or(&model).to_string();
-        let request_key = response["id"]
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                format!("local-{}", REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed))
-            });
-
         Ok(ProcessResponse {
             content,
-            model: model_used,
+            finish_reason,
+            has_reasoning,
+            model: model_used.unwrap_or(model),
             provider_id: self.provider_id.clone(),
             prompt_tokens,
             completion_tokens,
             tokens_used,
             duration_ms,
-            request_key,
+            request_key: request_key.unwrap_or_else(|| {
+                format!("local-{}", REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+            }),
         })
     }
 
@@ -188,6 +216,21 @@ impl LlmClient {
     }
 }
 
+fn response_content(message: &Value) -> String {
+    if let Some(content) = message["content"].as_str() {
+        return content.to_string();
+    }
+    message["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part["text"].as_str().or_else(|| part.as_str()))
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn strip_code_fence(content: &str) -> String {
@@ -204,4 +247,21 @@ fn strip_code_fence(content: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_text_parts_from_openai_compatible_responses() {
+        let message = json!({
+            "content": [
+                {"type": "text", "text": "MATCH"},
+                {"type": "text", "text": " | relevant"}
+            ]
+        });
+
+        assert_eq!(response_content(&message), "MATCH | relevant");
+    }
 }
