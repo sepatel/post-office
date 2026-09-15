@@ -67,7 +67,7 @@ export interface LlmConfigUpdate {
   context_window_tokens: number;
   legacy_max_concurrent_requests: number;
   legacy_max_emails_per_request: number;
-  legacy_decision_reasoning_effort: string;
+  legacy_output_tokens_per_second: number;
   legacy_chat_reasoning_effort: string;
   legacy_name: string;
   legacy_quality_tier: string;
@@ -99,6 +99,8 @@ export interface RulePayload {
   priority: number;
   enabled: boolean;
   inference_policy: string;
+  decision_reasoning_effort: string;
+  decision_max_tokens: number | null;
   continue_after_match: boolean;
   source_rule_id?: number;
 }
@@ -486,6 +488,63 @@ export async function historyByEmail(emailId: string): Promise<HistoryEntry[]> {
   return invoke("history_by_email", { emailId });
 }
 
+export interface PipelineDryRunStep {
+  rule_id: number;
+  rule_name: string;
+  priority: number;
+  status: "condition_skipped" | "no_match" | "matched" | "invalid_decision" | string;
+  actions: ActionDisplay[];
+  reasoning: string;
+  diagnostic: string | null;
+  llm_response: string;
+  llm_model: string | null;
+  llm_provider: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  duration_ms: number | null;
+  continued: boolean;
+}
+
+export interface PipelineDryRun {
+  steps: PipelineDryRunStep[];
+  status: "claimed" | "would_queue" | "no_match" | string;
+  summary: string;
+}
+
+export interface DecisionEstimate {
+  input_tokens: number;
+  max_completion_tokens: number | null;
+  context_reserve_tokens: number;
+  output_tokens_per_second: number | null;
+  max_generation_ms: number | null;
+  available_request_slots: number | null;
+  max_concurrent_requests: number | null;
+}
+
+export interface PipelineDryRunRuleProgress {
+  phase: "evaluating" | "completed" | string;
+  rule_id: number;
+  rule_name: string;
+  priority: number;
+  decision_estimate: DecisionEstimate | null;
+  step: PipelineDryRunStep | null;
+}
+
+export interface PipelineDryRunStatus {
+  phase: "loading_credentials" | "loading_message" | "loading_labels" | "loading_rules" | "evaluating" | string;
+  total_rules: number;
+  progress: PipelineDryRunRuleProgress | null;
+}
+
+export async function pipelineDryRun(emailId: string, runId: string): Promise<PipelineDryRun> {
+  return invoke("pipeline_dry_run", { emailId, runId });
+}
+
+export async function pipelineDryRunStatus(runId: string): Promise<PipelineDryRunStatus | null> {
+  return invoke("pipeline_dry_run_status", { runId });
+}
+
 export interface GmailLabel {
   id: string;
   name: string;
@@ -513,7 +572,6 @@ export interface LlmProviderTestProfile {
   api_key_ref: string;
   timeout_secs: number;
   max_concurrent_requests: number;
-  decision_reasoning_effort: string;
 }
 
 export async function llmTest(

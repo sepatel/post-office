@@ -22,6 +22,9 @@ pub enum LlmError {
 
     #[error("No eligible LLM provider was available: {0}")]
     Routing(String),
+
+    #[error("LLM request cancelled")]
+    Cancelled,
 }
 
 impl LlmError {
@@ -93,6 +96,8 @@ impl ProcessRequest {
 
 pub struct ProcessResponse {
     pub content: String,
+    pub finish_reason: Option<String>,
+    pub has_reasoning: bool,
     pub model: String,
     pub provider_id: Option<String>,
     pub prompt_tokens: Option<u32>,
