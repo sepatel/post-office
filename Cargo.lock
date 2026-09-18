@@ -3154,7 +3154,6 @@ dependencies = [
  "async-openai",
  "base64 0.22.1",
  "chrono",
- "futures-util",
  "keyring",
  "rand 0.8.7",
  "regex",

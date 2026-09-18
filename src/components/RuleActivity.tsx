@@ -83,7 +83,7 @@ export default function RuleActivity({ ruleId }: { ruleId: number }) {
                 </div>
                 {expandedJob === job.id && (
                   <div className="mt-3 border-t border-amber-100 pt-3 dark:border-amber-900/50">
-                    {(attempts[job.id] ?? []).length === 0 ? <p className="text-xs text-gray-500">No attempt detail recorded yet.</p> : <div className="space-y-2">{attempts[job.id].map((attempt) => <div key={attempt.id} className="text-xs text-gray-600 dark:text-gray-300"><span className="font-medium">{attempt.status}</span> · {attempt.provider_id ?? "provider unavailable"}{attempt.model ? ` (${attempt.model})` : ""} · {formatLocalDateTime(attempt.created_at, "-")}{attempt.error ? ` · ${attempt.error}` : ""}</div>)}</div>}
+                    {(attempts[job.id] ?? []).length === 0 ? <p className="text-xs text-gray-500">No attempt detail recorded yet.</p> : <div className="space-y-2">{attempts[job.id].map((attempt) => <div key={attempt.id} className="text-xs text-gray-600 dark:text-gray-300"><span className="font-medium">{attempt.status}</span> · {attempt.provider_id ?? "provider unavailable"}{attempt.model ? ` (${attempt.model})` : ""} · {formatLocalDateTime(attempt.created_at, "-")}{attempt.duration_ms !== null ? ` · ${(attempt.duration_ms / 1000).toFixed(1)}s` : ""}{attempt.error ? ` · ${attempt.error}` : ""}</div>)}</div>}
                   </div>
                 )}
               </div>
