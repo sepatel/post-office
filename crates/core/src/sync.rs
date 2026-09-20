@@ -11,9 +11,7 @@ use crate::db::Database;
 use crate::gmail::models::{HistoryRecord, WatchResponse};
 use crate::gmail::{GmailClient, GmailError};
 use crate::llm::InferenceRouter;
-use crate::processing::{
-    process_pending_inference_jobs, run_for_message_ids, OpProgress, ProcessingState,
-};
+use crate::processing::{run_for_message_ids, OpProgress, ProcessingState};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayResult {
@@ -127,16 +125,6 @@ pub async fn replay_history(
         )
         .await?
     };
-
-    if let Err(error) =
-        process_pending_inference_jobs(db, account_email, state, gmail, llm, config, on_progress)
-            .await
-    {
-        tracing::warn!(
-            "Queued inference worker failed during sync replay: {}",
-            error
-        );
-    }
 
     db.with_sync_state(|repo| {
         repo.upsert_cursor(account_email, &max_history_id, Some("active"))?;

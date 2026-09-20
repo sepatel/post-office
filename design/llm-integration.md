@@ -236,33 +236,14 @@ fn html_to_text(html: &str) -> String {
 
 ## Response Parsing
 
-One email is a batch of one, so there is a single response contract, a single
-prompt builder, and a single parser. Each email gets one line:
+Every decision request contains exactly one email and receives one decision:
 
 ```text
 1: "Invoices" | Billing statement from the bank.
-2: NO_MATCH | Unrelated tech news.
 ```
 
 The answer is a choice from the rule's menu, or `NO_MATCH`, which advances to
 the next rule. With no menu the only choices are `MATCH` and `NO_MATCH`.
-
-### Ordering, Not Numbering
-
-The leading number is an alignment aid for the model; the parser strips any
-leading marker without caring what it was (`3:`, a copied `N:`, a bullet) and
-correlates rows to emails **by order**. Numbering the rows and then trusting
-those numbers is what lets a miscounting model apply one email's decision to
-another; order cannot misassign.
-
-The cost is that a reply carrying the wrong number of decisions is refused
-whole. Those emails are queued for a per-email re-ask, where correlation is not
-a question at all. That is cheaper than it looks — it only happens when the
-model breaks the contract — and it is the only alternative that neither guesses
-nor drops the email, since the resume floor moves past an email exactly once.
-
-Example lines carry real digits rather than a placeholder letter: a placeholder
-is indistinguishable from literal text, so models copy it through verbatim.
 
 ### Leniency
 
@@ -311,10 +292,9 @@ label". Only a failure with nothing cached at all surfaces as an error.
 ### Context Budgeting
 
 Each provider profile records its context window. Rules reserve completion
-tokens and size a routing policy against its smallest eligible provider. Batch
-packing is adaptive rather than a fixed message count. When a single email body
-exceeds the remaining budget, the prompt keeps headers plus the beginning and
-end of the body and marks the omitted middle.
+tokens and size a routing policy against its smallest eligible provider. When
+the email body exceeds the remaining budget, the prompt keeps headers plus the
+beginning and end of the body and marks the omitted middle.
 
 ### Prompt Template
 
@@ -328,24 +308,20 @@ RULE INSTRUCTION:
 --- Learned Memory ---
 {exceptions and notes}
 
-EMAILS:
---- EMAIL 1 ---
+EMAIL:
 From: sender@example.com
 Subject: Check in
 
 Hey, just wanted to check in about...
 
-Answer with 1 decision lines.
+Answer with exactly one decision line.
 ```
-
-Batching only changes how many emails ride along; the contract is the same one
-line per email either way.
 
 ### Parser
 
-`rules::engine::parse_row` reads one line into a decision; `rules::evaluation`
-assembles rows into a batch. Both are small enough to read directly, and the
-copies of them that used to live here went stale, so they are not reproduced.
+`rules::engine::parse_row` reads the response into a decision. It is small
+enough to read directly, and the copy that used to live here went stale, so it
+is not reproduced.
 
 The shape: strip the leading marker, split on `|` and newlines, take the decline
 keyword off the head if present, otherwise resolve the selection against the
@@ -353,13 +329,10 @@ menu by name.
 
 ### Why This Format
 
-- **Cost efficiency**: one call per batch, and a re-ask only when the model
-  breaks the contract
-- **Predictability**: a row is a decision or it is not; nothing is inferred from
-  a number the model wrote
+- **Isolation**: a model response can affect only the email it was given
+- **Predictability**: a response is a decision or it is not
 - **Debugging**: the row that produced a decision is stored on the history entry
-- **Simplicity**: one contract, one prompt, one parser, whether the batch holds
-  one email or ten
+- **Simplicity**: one contract, one prompt, and one parser
 
 ## Configuration
 
@@ -391,7 +364,7 @@ LLM settings stored in config table:
 | Error | Handling |
 |-------|----------|
 | Endpoint unreachable | Log error, skip email, mark as failed in history |
-| Timeout | Configurable timeout (default 30s), skip email |
+| Timeout or transport failure | Configurable provider deadline, record the failed attempt and retry through the durable queue |
 | Rate limit | Exponential backoff, respect 429 headers |
 | Malformed response | Log full response, skip email, mark as `invalid_format` in history |
 | Invalid API key | Notify user, pause processing |

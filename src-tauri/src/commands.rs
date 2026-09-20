@@ -7,7 +7,8 @@ use post_office_core::gmail::{delete_tokens, store_tokens, GmailAuth, GmailClien
 use post_office_core::llm::{InferenceRouter, LlmClient};
 use post_office_core::llm::{LlmProviderProfile, LlmRoutingPolicy};
 use post_office_core::processing::{
-    mark_last_successful, run_backfill, run_processing_loop, OpProgress,
+    hydrate_processing_state, mark_last_successful, process_pending_inference_jobs, run_backfill,
+    run_processing_loop, OpProgress, ProcessingState,
 };
 use post_office_core::rules::actions::execute_actions;
 use post_office_core::rules::chat::{apply_proposal, chat_with_rule, ChatProposal, ChatTurn};
@@ -15,7 +16,7 @@ use post_office_core::rules::engine::{
     display_action, dry_run_pipeline, rules_after, ActionDisplay, FallthroughStep, Outcome,
     PipelineDryRun, PipelineDryRunProgress, TestResult,
 };
-use post_office_core::rules::evaluation::BulkVerdict;
+use post_office_core::rules::evaluation::EvaluationVerdict;
 use post_office_core::rules::models::{Action, Condition, Rule};
 use post_office_core::sync::{replay_history, start_watch, stop_watch, ReplayResult};
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::sync_runtime::SyncTrigger;
 use crate::tray;
-use crate::{AppState, PipelineDryRunStatus};
+use crate::{AppState, PipelineDryRunStatus, ProcessingStates};
+
+const RETRY_WORKER_IDLE_SECS: u64 = 5;
 
 pub fn ensure_polling_started(
     app: tauri::AppHandle,
@@ -88,6 +91,122 @@ pub fn ensure_polling_started(
         }
         pollers_started.lock().unwrap().remove(&account_email);
     });
+}
+
+pub fn spawn_inference_retry_worker(
+    app: tauri::AppHandle,
+    db: Arc<post_office_core::db::Database>,
+    processing_states: ProcessingStates,
+    config: Arc<tokio::sync::Mutex<AppConfig>>,
+    inference_runtime: post_office_core::llm::InferenceRuntime,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let cfg = config.lock().await.clone();
+            let accounts = db
+                .with_accounts(|repo| repo.list())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|account| !account.paused)
+                .collect::<Vec<_>>();
+            let mut processed = false;
+
+            for account in accounts {
+                let account_email = account.email;
+                let processing_state =
+                    processing_state_for(&processing_states, &db, &account_email);
+                {
+                    let processing = processing_state.lock().await;
+                    if processing.paused.load(Ordering::Relaxed)
+                        || processing.stop_requested.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                }
+                let auth = match load_gmail_auth_for_account(&app, &cfg, &account_email) {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Inference retry worker could not load Gmail credentials for {}: {}",
+                            account_email,
+                            error
+                        );
+                        continue;
+                    }
+                };
+                let llm =
+                    InferenceRouter::from_config_with_runtime(&cfg, inference_runtime.clone())
+                        .with_database(db.as_ref().clone());
+                let mut gmail = GmailClient::new(auth);
+                let emit = app.clone();
+                let progress_account = account_email.clone();
+                let retry_running = processing_state
+                    .lock()
+                    .await
+                    .inference_retry_running
+                    .clone();
+                retry_running.store(true, Ordering::Relaxed);
+
+                let result = process_pending_inference_jobs(
+                    &db,
+                    &account_email,
+                    &processing_state,
+                    &mut gmail,
+                    &llm,
+                    &cfg,
+                    &|progress| {
+                        let _ = emit.emit(
+                            "cycle-progress",
+                            AccountProgress {
+                                account_email: progress_account.clone(),
+                                progress,
+                            },
+                        );
+                    },
+                )
+                .await;
+                retry_running.store(false, Ordering::Relaxed);
+                match result {
+                    Ok(count) => processed |= count > 0,
+                    Err(error) => tracing::warn!(
+                        "Inference retry worker failed for {}: {}",
+                        account_email,
+                        error
+                    ),
+                }
+            }
+
+            if processed {
+                continue;
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(RETRY_WORKER_IDLE_SECS)) => {}
+                _ = inference_runtime.wait_for_retry_work() => {}
+            }
+        }
+    });
+}
+
+pub(crate) fn processing_state_for(
+    processing_states: &ProcessingStates,
+    db: &post_office_core::db::Database,
+    account_email: &str,
+) -> Arc<tokio::sync::Mutex<ProcessingState>> {
+    let mut states = processing_states.lock().unwrap();
+    states
+        .entry(account_email.to_string())
+        .or_insert_with(|| {
+            let mut processing = ProcessingState::new();
+            hydrate_processing_state(db, &mut processing, account_email);
+            if let Ok(Some(account)) = db.with_accounts(|repo| repo.get(account_email)) {
+                processing.paused.store(account.paused, Ordering::Relaxed);
+            } else {
+                processing.stop_requested.store(true, Ordering::Relaxed);
+            }
+            Arc::new(tokio::sync::Mutex::new(processing))
+        })
+        .clone()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -526,8 +645,32 @@ pub async fn accounts_remove(
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     state.inference_runtime.cancel_all();
-    while state.pollers_started.lock().unwrap().contains(&email) {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let polling = state.pollers_started.lock().unwrap().contains(&email);
+            let retrying = processing_state
+                .lock()
+                .await
+                .inference_retry_running
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if !polling && !retrying {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if stopped.is_err() {
+        processing_state
+            .lock()
+            .await
+            .stop_requested
+            .store(false, Ordering::Relaxed);
+        let config = state.config.lock().await.clone();
+        if !config.sync_enabled {
+            ensure_polling_started(app, &state, &config, email.clone());
+        }
+        return Err("Timed out waiting for active mail processing to stop".into());
     }
 
     let config = state.config.lock().await.clone();
@@ -565,10 +708,10 @@ pub struct LlmConfigUpdate {
     pub default_model: String,
     pub input_cost_per_million_usd: f64,
     pub output_cost_per_million_usd: f64,
+    pub max_tokens: u32,
     pub timeout_secs: u64,
     pub context_window_tokens: u32,
     pub legacy_max_concurrent_requests: u8,
-    pub legacy_max_emails_per_request: u8,
     pub legacy_output_tokens_per_second: f64,
     pub legacy_chat_reasoning_effort: post_office_core::llm::ReasoningEffort,
     pub legacy_name: String,
@@ -591,10 +734,10 @@ pub async fn llm_config_set(
     config.llm_default_model = update.default_model;
     config.llm_input_cost_per_million_usd = update.input_cost_per_million_usd;
     config.llm_output_cost_per_million_usd = update.output_cost_per_million_usd;
+    config.llm_max_tokens = update.max_tokens.clamp(64, 8_192);
     config.llm_timeout_secs = update.timeout_secs;
     config.llm_context_window_tokens = update.context_window_tokens;
     config.llm_legacy_max_concurrent_requests = update.legacy_max_concurrent_requests;
-    config.llm_legacy_max_emails_per_request = update.legacy_max_emails_per_request;
     config.llm_legacy_output_tokens_per_second = update.legacy_output_tokens_per_second;
     config.llm_legacy_chat_reasoning_effort = update.legacy_chat_reasoning_effort;
     config.llm_legacy_name = update.legacy_name;
@@ -963,16 +1106,16 @@ fn rule_memories(state: &AppState, rule_id: i64) -> Vec<String> {
     })
 }
 
-/// Evaluates a rule against many emails in one batched LLM pass (or locally for
-/// structured-action rules) and returns the proposed action per email. No emails
-/// are mutated — the frontend applies chosen verdicts via `rules_apply`.
+/// Evaluates a rule against loaded emails one at a time and returns the proposed
+/// action per email. No emails are mutated — the frontend applies chosen verdicts
+/// via `rules_apply`.
 #[tauri::command]
-pub async fn bulk_evaluate(
+pub async fn evaluate_messages(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     mut rule: RuleCreateRequest,
     message_ids: Vec<String>,
-) -> Result<Vec<BulkVerdict>, String> {
+) -> Result<Vec<EvaluationVerdict>, String> {
     let (account_email, auth, llm) = {
         let config = state.config.lock().await;
         let account_email = active_account(&config)?;
@@ -1008,7 +1151,7 @@ pub async fn bulk_evaluate(
             .unwrap_or_default()
     });
 
-    post_office_core::rules::evaluation::bulk_evaluate(
+    post_office_core::rules::evaluation::evaluate_messages(
         &llm,
         &rule_model,
         &emails,
@@ -1227,10 +1370,7 @@ pub async fn inference_job_retry(state: State<'_, AppState>, job_id: i64) -> Res
         .with_inference(|repo| repo.retry(&account_email, job_id))
         .map_err(|e| e.to_string())?;
     if queued {
-        state
-            .sync_trigger
-            .send(SyncTrigger::Manual)
-            .map_err(|_| "Inference worker is unavailable".to_string())?;
+        state.inference_runtime.wake_retry_worker();
     }
     Ok(queued)
 }

@@ -1,5 +1,4 @@
 use async_openai::{config::OpenAIConfig, Client};
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -76,68 +75,9 @@ impl LlmClient {
             }
         }
 
-        body["stream"] = json!(true);
-        let mut stream = self
-            .client
-            .chat()
-            .create_stream_byot::<Value, Value>(body)
-            .await?;
-        let mut content = String::new();
-        let mut finish_reason = None;
-        let mut has_reasoning = false;
-        let mut prompt_tokens = None;
-        let mut completion_tokens = None;
-        let mut tokens_used = None;
-        let mut model_used = None;
-        let mut request_key = None;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            model_used = chunk["model"].as_str().map(str::to_string).or(model_used);
-            request_key = chunk["id"].as_str().map(str::to_string).or(request_key);
-            let choice = chunk["choices"]
-                .as_array()
-                .and_then(|choices| choices.first());
-            if let Some(choice) = choice {
-                let delta = &choice["delta"];
-                content.push_str(&response_content(delta));
-                has_reasoning |= ["reasoning", "reasoning_content", "reasoning_details"]
-                    .into_iter()
-                    .any(|field| delta[field].is_array() || delta[field].is_string());
-                finish_reason = choice["finish_reason"]
-                    .as_str()
-                    .map(str::to_string)
-                    .or(finish_reason);
-            }
-            prompt_tokens = chunk["usage"]["prompt_tokens"]
-                .as_u64()
-                .map(|value| value as u32)
-                .or(prompt_tokens);
-            completion_tokens = chunk["usage"]["completion_tokens"]
-                .as_u64()
-                .map(|value| value as u32)
-                .or(completion_tokens);
-            tokens_used = chunk["usage"]["total_tokens"]
-                .as_u64()
-                .map(|value| value as u32)
-                .or(tokens_used);
-        }
-
+        let response: Value = self.client.chat().create_byot(body).await?;
         let duration_ms = start.elapsed().as_millis() as u64;
-
-        Ok(ProcessResponse {
-            content,
-            finish_reason,
-            has_reasoning,
-            model: model_used.unwrap_or(model),
-            provider_id: self.provider_id.clone(),
-            prompt_tokens,
-            completion_tokens,
-            tokens_used,
-            duration_ms,
-            request_key: request_key.unwrap_or_else(|| {
-                format!("local-{}", REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed))
-            }),
-        })
+        completion_response(&response, model, self.provider_id.clone(), duration_ms)
     }
 
     /// Lists model ids from the OpenAI-compatible `/models` endpoint. Lets the
@@ -231,6 +171,49 @@ fn response_content(message: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn completion_response(
+    response: &Value,
+    default_model: String,
+    provider_id: Option<String>,
+    duration_ms: u64,
+) -> Result<ProcessResponse, LlmError> {
+    let choice = response["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+        .ok_or(LlmError::NoResponse)?;
+    let message = &choice["message"];
+    let has_reasoning = ["reasoning", "reasoning_content", "reasoning_details"]
+        .into_iter()
+        .any(|field| message[field].is_array() || message[field].is_string());
+
+    Ok(ProcessResponse {
+        content: response_content(message),
+        finish_reason: choice["finish_reason"].as_str().map(str::to_string),
+        has_reasoning,
+        model: response["model"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or(default_model),
+        provider_id,
+        prompt_tokens: response["usage"]["prompt_tokens"]
+            .as_u64()
+            .map(|value| value as u32),
+        completion_tokens: response["usage"]["completion_tokens"]
+            .as_u64()
+            .map(|value| value as u32),
+        tokens_used: response["usage"]["total_tokens"]
+            .as_u64()
+            .map(|value| value as u32),
+        duration_ms,
+        request_key: response["id"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!("local-{}", REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+            }),
+    })
+}
+
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn strip_code_fence(content: &str) -> String {
@@ -263,5 +246,30 @@ mod tests {
         });
 
         assert_eq!(response_content(&message), "MATCH | relevant");
+    }
+
+    #[test]
+    fn reads_an_unstreamed_completion() {
+        let response = json!({
+            "id": "request-1",
+            "model": "taxonomy",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "MATCH"}
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 1,
+                "total_tokens": 13
+            }
+        });
+
+        let parsed =
+            completion_response(&response, "fallback".into(), Some("test".into()), 50).unwrap();
+
+        assert_eq!(parsed.content, "MATCH");
+        assert_eq!(parsed.model, "taxonomy");
+        assert_eq!(parsed.completion_tokens, Some(1));
+        assert_eq!(parsed.request_key, "request-1");
     }
 }

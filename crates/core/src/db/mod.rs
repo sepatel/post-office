@@ -127,6 +127,12 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (17)", [])?;
         }
+        if !migration_applied(&transaction, 18)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/018_inference_attempt_duration.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (18)", [])?;
+        }
         transaction.commit()
     }
 

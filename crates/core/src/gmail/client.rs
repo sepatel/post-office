@@ -91,6 +91,19 @@ impl GmailClient {
             return Box::pin(self.send(method, path, body)).await;
         }
 
+        if response.status() == reqwest::StatusCode::FORBIDDEN {
+            let body_text = response.text().await.unwrap_or_default();
+            if is_rate_limit_error(&body_text) {
+                tracing::warn!(path, "Gmail quota exceeded; waiting before retry");
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                return Box::pin(self.send(method, path, body)).await;
+            }
+            return Err(GmailError::Api {
+                code: reqwest::StatusCode::FORBIDDEN.as_u16(),
+                message: body_text,
+            });
+        }
+
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -273,5 +286,37 @@ impl GmailClient {
         };
         let path = format!("/history?{qs}");
         self.request(reqwest::Method::GET, &path, None::<&()>).await
+    }
+}
+
+fn is_rate_limit_error(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.pointer("/error/errors")?.as_array().cloned())
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                matches!(
+                    error.get("reason").and_then(serde_json::Value::as_str),
+                    Some("rateLimitExceeded" | "userRateLimitExceeded")
+                )
+            })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_google_quota_errors() {
+        assert!(is_rate_limit_error(
+            r#"{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}"#
+        ));
+        assert!(is_rate_limit_error(
+            r#"{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}"#
+        ));
+        assert!(!is_rate_limit_error(
+            r#"{"error":{"errors":[{"reason":"forbidden"}]}}"#
+        ));
     }
 }
