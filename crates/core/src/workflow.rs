@@ -45,6 +45,7 @@ pub struct QueueItem {
     pub state: String,
     pub next_rule_index: i64,
     pub next_rule_name: Option<String>,
+    pub has_message_snapshot: bool,
     pub attempt_count: i64,
     pub next_attempt_at: String,
     pub last_error: Option<String>,
@@ -226,6 +227,7 @@ fn queue_item(
         state: run.state.clone(),
         next_rule_index: run.next_rule_index,
         next_rule_name,
+        has_message_snapshot: message.is_some(),
         attempt_count: run.attempt_count,
         next_attempt_at: run.next_attempt_at.clone(),
         last_error: run.last_error.clone(),
@@ -640,6 +642,16 @@ async fn process_run(
                     return Ok(());
                 }
                 message
+            }
+            Err(GmailError::Api { code: 404, .. }) => {
+                db.with_workflow(|repo| {
+                    repo.resolve_externally(
+                        run.id,
+                        &run.lease_token,
+                        "Message was deleted outside Post Office",
+                    )
+                })?;
+                return Ok(());
             }
             Err(error) => {
                 db.with_workflow(|repo| {

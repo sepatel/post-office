@@ -338,6 +338,7 @@ export interface WorkflowQueueItem {
   state: WorkflowRunState | string;
   next_rule_index: number;
   next_rule_name: string | null;
+  has_message_snapshot: boolean;
   attempt_count: number;
   next_attempt_at: string;
   last_error: string | null;

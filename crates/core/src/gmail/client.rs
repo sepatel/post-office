@@ -37,6 +37,12 @@ impl GmailClient {
         } else {
             text.as_str()
         };
+        if let Some(code) = embedded_api_error_code(text) {
+            return Err(GmailError::Api {
+                code,
+                message: text.to_string(),
+            });
+        }
         serde_json::from_str::<T>(text).map_err(GmailError::from)
     }
 
@@ -303,6 +309,15 @@ fn is_rate_limit_error(body: &str) -> bool {
         })
 }
 
+fn embedded_api_error_code(body: &str) -> Option<u16> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .pointer("/error/code")?
+        .as_u64()?
+        .try_into()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +333,16 @@ mod tests {
         assert!(!is_rate_limit_error(
             r#"{"error":{"errors":[{"reason":"forbidden"}]}}"#
         ));
+    }
+
+    #[test]
+    fn recognizes_an_api_error_embedded_in_a_successful_response() {
+        assert_eq!(
+            embedded_api_error_code(
+                r#"{"error":{"code":404,"message":"Requested entity was not found."}}"#
+            ),
+            Some(404)
+        );
+        assert_eq!(embedded_api_error_code(r#"{"id":"message-1"}"#), None);
     }
 }

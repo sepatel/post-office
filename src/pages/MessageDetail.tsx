@@ -31,6 +31,9 @@ function errorSummary(error: string | null): string | null {
 }
 
 function ruleContext(detail: WorkflowMessageDetail): string | null {
+  if (!detail.has_message_snapshot) {
+    return "No rule or model was attempted because Gmail message retrieval failed first.";
+  }
   const rule = detail.current_rule;
   if (!rule) return null;
   const route = rule.providers
@@ -155,6 +158,7 @@ export default function MessageDetail() {
   if (detail === null) return <div className="p-8 text-sm text-gray-400">Message not found for this account.</div>;
 
   const retryable = detail.state === "needs_attention" || detail.state === "retry_wait";
+  const messageUnavailable = !detail.has_message_snapshot;
   return (
     <div className="mx-auto flex max-w-6xl flex-col lg:h-[calc(100vh-4rem)] lg:overflow-hidden">
       <Link to="/queue" className="shrink-0 text-sm font-medium text-blue-700 hover:underline dark:text-blue-300">← Queue</Link>
@@ -174,7 +178,8 @@ export default function MessageDetail() {
           <div><span className="block text-xs text-gray-500">Manual retries</span><span className="font-medium">{detail.retry_summary.manual_retry_requested_count} requested</span></div>
           <div><span className="block text-xs text-gray-500">Run</span><span className="font-medium">#{detail.run_id}</span></div>
         </div>
-        {detail.current_rule && <section className="mt-4 rounded-xl border border-blue-100 bg-blue-50/70 p-4 dark:border-blue-900/60 dark:bg-blue-950/20"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-700 dark:text-blue-300">{retryable ? "Blocked at" : "Current rule"}</p><p className="mt-1 font-medium text-gray-900 dark:text-gray-100">Rule {detail.current_rule.rule_index + 1} of {detail.current_rule.rule_count}: {detail.current_rule.rule_name}</p><p className="mt-1 text-sm text-gray-600 dark:text-gray-300">Policy: {detail.current_rule.policy_name}</p><div className="mt-3 flex flex-wrap gap-2">{detail.current_rule.providers.map((provider) => <div key={provider.id} className="max-w-full rounded-lg border border-blue-200 bg-white px-3 py-2 text-xs dark:border-blue-900/70 dark:bg-gray-900"><p className="font-medium text-gray-800 dark:text-gray-100">{provider.name}{provider.model ? ` / ${provider.model}` : ""}{!provider.enabled && " (disabled)"}</p>{provider.endpoint && <p className="mt-1 break-all text-gray-500 dark:text-gray-400">{provider.endpoint}</p>}</div>)}</div></section>}
+        {messageUnavailable && <section className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/60 dark:bg-amber-950/20"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-amber-800 dark:text-amber-200">{retryable ? "Blocked before rules" : "Waiting for Gmail message"}</p><p className="mt-1 text-sm text-amber-900 dark:text-amber-100">No rule or model has been attempted because Post Office could not retrieve the Gmail message.</p></section>}
+        {!messageUnavailable && detail.current_rule && <section className="mt-4 rounded-xl border border-blue-100 bg-blue-50/70 p-4 dark:border-blue-900/60 dark:bg-blue-950/20"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-700 dark:text-blue-300">{retryable ? "Blocked at" : "Current rule"}</p><p className="mt-1 font-medium text-gray-900 dark:text-gray-100">Rule {detail.current_rule.rule_index + 1} of {detail.current_rule.rule_count}: {detail.current_rule.rule_name}</p><p className="mt-1 text-sm text-gray-600 dark:text-gray-300">Policy: {detail.current_rule.policy_name}</p><div className="mt-3 flex flex-wrap gap-2">{detail.current_rule.providers.map((provider) => <div key={provider.id} className="max-w-full rounded-lg border border-blue-200 bg-white px-3 py-2 text-xs dark:border-blue-900/70 dark:bg-gray-900"><p className="font-medium text-gray-800 dark:text-gray-100">{provider.name}{provider.model ? ` / ${provider.model}` : ""}{!provider.enabled && " (disabled)"}</p>{provider.endpoint && <p className="mt-1 break-all text-gray-500 dark:text-gray-400">{provider.endpoint}</p>}</div>)}</div></section>}
         {detail.retry_summary.historical_retry_policy && <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">This run preserves {detail.retry_summary.automatic_retry_scheduled_count} scheduled automatic retries from the previous retry policy. The current {detail.retry_summary.automatic_attempt_limit}-attempt limit is tracked separately.</p>}
         {detail.last_error && <div className="mt-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-200"><p>{errorSummary(detail.last_error)}</p>{errorSummary(detail.last_error) !== detail.last_error && <details className="mt-2 text-xs"><summary className="cursor-pointer">Technical error</summary><pre className="mt-2 whitespace-pre-wrap">{detail.last_error}</pre></details>}</div>}
       </header>
