@@ -5,13 +5,17 @@ import {
 } from "react";
 import {
   BrowserRouter,
+  Navigate,
   Routes,
   Route,
   useLocation,
   useNavigate,
 } from "react-router-dom";
 import Layout from "./components/Layout";
-import Dashboard from "./pages/Dashboard";
+import Queue from "./pages/Queue";
+import Messages from "./pages/Messages";
+import MessageDetail from "./pages/MessageDetail";
+import Operations from "./pages/Operations";
 import Rules from "./pages/Rules";
 import RuleEditor from "./pages/RuleEditor";
 import History from "./pages/History";
@@ -168,12 +172,17 @@ function AccountRoutes() {
   return (
     <Routes key={activeEmail ?? "none"}>
       <Route path="/" element={<Layout />}>
-        <Route index element={<Dashboard />} />
+        <Route index element={<Navigate to="/queue" replace />} />
+        <Route path="queue" element={<Queue />} />
+        <Route path="messages" element={<Messages />} />
+        <Route path="messages/:id" element={<MessageDetail />} />
+        <Route path="operations" element={<Operations />} />
         <Route path="rules" element={<Rules />} />
         <Route path="rules/new" element={<RuleEditor />} />
         <Route path="rules/:id/edit" element={<RuleEditor />} />
         <Route path="rules/:id/chat" element={<RuleEditor />} />
-        <Route path="history" element={<History />} />
+        <Route path="history" element={<Navigate to="/legacy-history" replace />} />
+        <Route path="legacy-history" element={<History />} />
         <Route path="settings" element={<Settings />} />
       </Route>
     </Routes>

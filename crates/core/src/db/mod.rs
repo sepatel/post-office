@@ -7,6 +7,7 @@ pub mod config;
 pub mod history;
 pub mod inference;
 pub mod labels;
+pub mod llm_endpoint_status;
 pub mod llm_provider_status;
 pub mod llm_requests;
 pub mod llm_usage;
@@ -146,6 +147,18 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (20)", [])?;
         }
+        if !migration_applied(&transaction, 21)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/021_workflow_retry_policy.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
+        }
+        if !migration_applied(&transaction, 22)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/022_workflow_provider_name.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (22)", [])?;
+        }
         transaction.commit()
     }
 
@@ -235,6 +248,14 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let repo = llm_provider_status::LlmProviderStatusRepository::new(&conn);
         f(repo)
+    }
+
+    pub fn with_llm_endpoint_status<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(llm_endpoint_status::LlmEndpointStatusRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        f(llm_endpoint_status::LlmEndpointStatusRepository::new(&conn))
     }
 
     pub fn with_sync_state<F, R>(&self, f: F) -> R

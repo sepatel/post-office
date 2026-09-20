@@ -9,6 +9,7 @@ use super::{InferenceRuntime, LlmClient, LlmError, ProcessKind, ProcessRequest, 
 use crate::db::Database;
 
 const MAX_RETRIES_PER_PROVIDER: usize = 2;
+const ENDPOINT_UNAVAILABLE_SECS: i64 = 300;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
 /// Hard ceiling for rule decisions. llama.cpp slots must hold prompt plus
 /// thinking plus answer, so unbounded or very large caps can exhaust a slot
@@ -130,6 +131,15 @@ pub struct InferenceRouter {
     max_tokens: u32,
     database: Option<Database>,
     runtime: InferenceRuntime,
+    bypass_endpoint_circuit: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmProviderAttribution {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model: String,
+    pub endpoint: String,
 }
 
 impl InferenceRouter {
@@ -257,12 +267,48 @@ impl InferenceRouter {
             max_tokens: config.llm_max_tokens,
             database: None,
             runtime,
+            bypass_endpoint_circuit: false,
         }
     }
 
     pub fn with_database(mut self, database: Database) -> Self {
         self.database = Some(database);
         self
+    }
+
+    /// A human-requested retry gets one probe even while the endpoint circuit is open.
+    pub fn with_endpoint_circuit_bypass(mut self) -> Self {
+        self.bypass_endpoint_circuit = true;
+        self
+    }
+
+    pub fn provider_attribution(&self, policy_id: &str) -> Option<LlmProviderAttribution> {
+        let policy = self.policy(policy_id);
+        policy
+            .candidate_provider_ids
+            .iter()
+            .find_map(|provider_id| {
+                let provider = self.providers.get(provider_id)?;
+                Some(LlmProviderAttribution {
+                    provider_id: provider.profile.id.clone(),
+                    provider_name: provider.profile.name.clone(),
+                    model: provider.profile.model.clone(),
+                    endpoint: provider.endpoint.clone(),
+                })
+            })
+    }
+
+    pub fn endpoint_circuit_open(&self, policy_id: &str) -> bool {
+        if self.bypass_endpoint_circuit {
+            return false;
+        }
+        let policy = self.policy(policy_id);
+        policy.candidate_provider_ids.iter().any(|provider_id| {
+            self.providers
+                .get(provider_id)
+                .and_then(|provider| self.endpoint_unavailable_until(&provider.endpoint))
+                .is_some()
+        })
     }
 
     pub async fn process(
@@ -298,6 +344,17 @@ impl InferenceRouter {
 
         let mut failures = unavailable;
         for (index, provider) in candidates.iter().enumerate() {
+            if !self.bypass_endpoint_circuit {
+                if let Some(until) = self.endpoint_unavailable_until(&provider.endpoint) {
+                    failures.push(format!(
+                        "{} ({}): endpoint unavailable until {}",
+                        provider.profile.id,
+                        provider.profile.model,
+                        until.to_rfc3339()
+                    ));
+                    continue;
+                }
+            }
             let Some(client) = provider.client.as_ref() else {
                 failures.push(format!(
                     "{}: {}",
@@ -358,6 +415,7 @@ impl InferenceRouter {
                 match response {
                     Ok(response) => {
                         self.clear_rate_limit(&provider.profile.id);
+                        self.clear_endpoint_unavailable(&provider.endpoint);
                         return Ok(response);
                     }
                     Err(error) => {
@@ -370,14 +428,21 @@ impl InferenceRouter {
                             ));
                             break;
                         }
+                        let connection_error = is_connection_error(&error);
                         let retryable = is_retryable(&error);
+                        if connection_error {
+                            self.mark_endpoint_unavailable(
+                                &provider.endpoint,
+                                &describe_error(&error),
+                            );
+                        }
                         failures.push(format!(
                             "{} ({}): {}",
                             provider.profile.id,
                             provider.profile.model,
                             describe_error(&error)
                         ));
-                        if !retryable || attempt + 1 >= retries {
+                        if connection_error || !retryable || attempt + 1 >= retries {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(attempt as u32)))
@@ -564,6 +629,16 @@ impl InferenceRouter {
                 ));
                 continue;
             }
+            if !self.bypass_endpoint_circuit {
+                if let Some(until) = self.endpoint_unavailable_until(&provider.endpoint) {
+                    unavailable.push(format!(
+                        "{}: endpoint unavailable until {}",
+                        label,
+                        until.to_rfc3339()
+                    ));
+                    continue;
+                }
+            }
             candidates.push(provider);
         }
         (candidates, unavailable)
@@ -601,6 +676,46 @@ impl InferenceRouter {
                 database.with_llm_provider_status(|repo| repo.clear_rate_limit(provider_id))
             {
                 tracing::warn!("Failed to clear rate limit for {}: {}", provider_id, error);
+            }
+        }
+    }
+
+    fn endpoint_unavailable_until(&self, endpoint: &str) -> Option<DateTime<Utc>> {
+        let status = self
+            .database
+            .as_ref()?
+            .with_llm_endpoint_status(|repo| repo.get(endpoint).ok().flatten())?;
+        status
+            .unavailable_until
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .filter(|until| *until > Utc::now())
+    }
+
+    fn mark_endpoint_unavailable(&self, endpoint: &str, error: &str) {
+        let Some(database) = &self.database else {
+            return;
+        };
+        let until = Utc::now() + chrono::Duration::seconds(ENDPOINT_UNAVAILABLE_SECS);
+        if let Err(error) = database.with_llm_endpoint_status(|repo| {
+            repo.mark_unavailable(endpoint, &until.to_rfc3339(), error)
+        }) {
+            tracing::warn!(
+                "Failed to open LLM endpoint circuit for {}: {}",
+                endpoint,
+                error
+            );
+        }
+    }
+
+    fn clear_endpoint_unavailable(&self, endpoint: &str) {
+        if let Some(database) = &self.database {
+            if let Err(error) = database.with_llm_endpoint_status(|repo| repo.clear(endpoint)) {
+                tracing::warn!(
+                    "Failed to close LLM endpoint circuit for {}: {}",
+                    endpoint,
+                    error
+                );
             }
         }
     }
@@ -682,6 +797,13 @@ fn is_retryable(error: &LlmError) -> bool {
         LlmError::NoResponse => true,
         LlmError::ParseError(_) | LlmError::Routing(_) | LlmError::Cancelled => false,
     }
+}
+
+fn is_connection_error(error: &LlmError) -> bool {
+    matches!(
+        error,
+        LlmError::Api(async_openai::error::OpenAIError::Reqwest(error)) if error.is_connect()
+    )
 }
 
 fn describe_error(error: &LlmError) -> String {
@@ -919,6 +1041,26 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert!(unavailable.is_empty());
+    }
+
+    #[test]
+    fn endpoint_circuit_blocks_automatic_routing_but_not_a_manual_probe() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        db.with_llm_endpoint_status(|repo| {
+            repo.mark_unavailable(
+                "http://localhost:11434/v1",
+                &(Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                "connection refused",
+            )
+        })
+        .unwrap();
+        let router = InferenceRouter::from_config(&AppConfig::default()).with_database(db);
+
+        assert!(router.endpoint_circuit_open("default"));
+        assert!(!router
+            .with_endpoint_circuit_bypass()
+            .endpoint_circuit_open("default"));
     }
 
     #[test]

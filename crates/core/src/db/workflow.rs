@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const MAX_ATTEMPTS: i64 = 7;
+const MAX_ATTEMPTS: i64 = 3;
 
 pub struct WorkflowRepository<'a> {
     conn: &'a Connection,
@@ -136,9 +136,9 @@ impl<'a> WorkflowRepository<'a> {
         self.conn.execute(
             "UPDATE workflow_runs
              SET attempt_count = attempt_count + 1,
-                 state = CASE WHEN attempt_count + 1 >= ?2 THEN 'needs_attention' ELSE 'retry_wait' END,
+                 state = CASE WHEN manual_retry = 1 OR attempt_count + 1 >= ?2 THEN 'needs_attention' ELSE 'retry_wait' END,
                  lease_token = NULL, lease_until = NULL, next_attempt_at = datetime('now'),
-                 last_error = 'Worker lease expired before completion', updated_at = datetime('now')
+                 manual_retry = 0, last_error = 'Worker lease expired before completion', updated_at = datetime('now')
              WHERE account_email = ?1 AND state = 'processing'
                AND lease_until < datetime('now')",
             params![account_email, MAX_ATTEMPTS],
@@ -154,7 +154,7 @@ impl<'a> WorkflowRepository<'a> {
                      WHERE account_email = ?1
                        AND state IN ('queued', 'retry_wait')
                        AND next_attempt_at <= datetime('now')
-                     ORDER BY next_attempt_at ASC, id ASC
+                     ORDER BY manual_retry DESC, next_attempt_at ASC, id ASC
                      LIMIT 1
                  )
                  RETURNING id",
@@ -168,7 +168,7 @@ impl<'a> WorkflowRepository<'a> {
         self.conn
             .query_row(
                 "SELECT r.id, r.account_email, r.message_id, m.gmail_message_id, m.message_json,
-                        m.labels_json, r.rule_set_id, s.rules_json, r.next_rule_index,
+                        m.labels_json, r.rule_set_id, s.rules_json, r.next_rule_index, r.manual_retry,
                         r.lease_token, r.lease_until
                  FROM workflow_runs r
                  JOIN workflow_messages m ON m.id = r.message_id
@@ -303,23 +303,27 @@ impl<'a> WorkflowRepository<'a> {
         run_id: i64,
         rule_index: i64,
         provider_id: Option<&str>,
+        provider_name: Option<&str>,
         model: Option<&str>,
         status: &str,
         error: Option<&str>,
         duration_ms: Option<i64>,
+        endpoint: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO workflow_llm_attempts (
-                 run_id, rule_index, provider_id, model, status, error, duration_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 run_id, rule_index, provider_id, provider_name, model, status, error, duration_ms, endpoint
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 run_id,
                 rule_index,
                 provider_id,
+                provider_name,
                 model,
                 status,
                 error,
-                duration_ms
+                duration_ms,
+                endpoint
             ],
         )?;
         Ok(())
@@ -332,15 +336,16 @@ impl<'a> WorkflowRepository<'a> {
         error: &str,
         delay_seconds: u64,
     ) -> Result<bool> {
-        let changed = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE workflow_runs
-             SET attempt_count = attempt_count + 1,
-                 state = CASE WHEN attempt_count + 1 >= ?4 THEN 'needs_attention' ELSE 'retry_wait' END,
+             SET attempt_count = CASE WHEN manual_retry = 1 THEN attempt_count ELSE attempt_count + 1 END,
+                 state = CASE WHEN manual_retry = 1 OR attempt_count + 1 >= ?4 THEN 'needs_attention' ELSE 'retry_wait' END,
                  next_attempt_at = CASE
-                     WHEN attempt_count + 1 >= ?4 THEN next_attempt_at
+                     WHEN manual_retry = 1 OR attempt_count + 1 >= ?4 THEN next_attempt_at
                      ELSE datetime('now', '+' || ?3 || ' seconds')
                  END,
-                 lease_token = NULL, lease_until = NULL, last_error = ?5, updated_at = datetime('now')
+                 lease_token = NULL, lease_until = NULL, manual_retry = 0, last_error = ?5, updated_at = datetime('now')
              WHERE id = ?1 AND state = 'processing' AND lease_token = ?2",
             params![
                 run_id,
@@ -350,6 +355,25 @@ impl<'a> WorkflowRepository<'a> {
                 error
             ],
         )?;
+        if changed > 0 {
+            let state = tx.query_row(
+                "SELECT state FROM workflow_runs WHERE id = ?1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let kind = if state == "needs_attention" {
+                "needs_attention"
+            } else {
+                "retry_scheduled"
+            };
+            tx.execute(
+                "INSERT INTO workflow_events (account_email, message_id, run_id, kind, detail)
+                 SELECT account_email, message_id, id, ?2, ?3
+                 FROM workflow_runs WHERE id = ?1",
+                params![run_id, kind, error],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -432,16 +456,37 @@ impl<'a> WorkflowRepository<'a> {
             params![action_id, MAX_ATTEMPTS],
             |row| row.get::<_, bool>(0),
         )?;
+        let manual_retry = tx.query_row(
+            "SELECT manual_retry != 0 FROM workflow_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get::<_, bool>(0),
+        )?;
         tx.execute(
             "UPDATE workflow_runs
-             SET state = CASE WHEN ?5 THEN 'needs_attention' ELSE 'retry_wait' END,
+             SET state = CASE WHEN ?5 OR ?6 THEN 'needs_attention' ELSE 'retry_wait' END,
                  next_attempt_at = CASE
-                     WHEN ?5 THEN next_attempt_at
+                     WHEN ?5 OR ?6 THEN next_attempt_at
                      ELSE datetime('now', '+' || ?3 || ' seconds')
                  END,
-                 lease_token = NULL, lease_until = NULL, last_error = ?4, updated_at = datetime('now')
+                 lease_token = NULL, lease_until = NULL, manual_retry = 0, last_error = ?4, updated_at = datetime('now')
              WHERE id = ?1 AND lease_token = ?2",
-            params![run_id, lease_token, delay_seconds as i64, error, exhausted],
+            params![run_id, lease_token, delay_seconds as i64, error, exhausted, manual_retry],
+        )?;
+        let state = tx.query_row(
+            "SELECT state FROM workflow_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        let kind = if state == "needs_attention" {
+            "needs_attention"
+        } else {
+            "action_retry_scheduled"
+        };
+        tx.execute(
+            "INSERT INTO workflow_events (account_email, message_id, run_id, kind, detail)
+             SELECT account_email, message_id, id, ?2, ?3
+             FROM workflow_runs WHERE id = ?1",
+            params![run_id, kind, error],
         )?;
         tx.commit()?;
         Ok(true)
@@ -496,7 +541,7 @@ impl<'a> WorkflowRepository<'a> {
             tx.execute(
                 "UPDATE workflow_runs
                  SET state = 'completed', completed_at = datetime('now'), lease_token = NULL,
-                     lease_until = NULL, updated_at = datetime('now')
+                     lease_until = NULL, last_error = NULL, updated_at = datetime('now')
                  WHERE id = ?1 AND lease_token = ?2",
                 params![run_id, lease_token],
             )?;
@@ -516,7 +561,7 @@ impl<'a> WorkflowRepository<'a> {
         let changed = tx.execute(
             "UPDATE workflow_runs
              SET state = 'completed', completed_at = datetime('now'), lease_token = NULL,
-                 lease_until = NULL, updated_at = datetime('now')
+                 lease_until = NULL, last_error = NULL, updated_at = datetime('now')
              WHERE id = ?1 AND state = 'processing' AND lease_token = ?2",
             params![run_id, lease_token],
         )?;
@@ -538,14 +583,294 @@ impl<'a> WorkflowRepository<'a> {
         lease_token: &str,
         error: &str,
     ) -> Result<bool> {
-        let changed = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE workflow_runs
              SET state = 'needs_attention', lease_token = NULL, lease_until = NULL,
                  last_error = ?3, updated_at = datetime('now')
              WHERE id = ?1 AND state = 'processing' AND lease_token = ?2",
             params![run_id, lease_token, error],
         )?;
+        if changed > 0 {
+            tx.execute(
+                "INSERT INTO workflow_events (account_email, message_id, run_id, kind, detail)
+                 SELECT account_email, message_id, id, 'needs_attention', ?2
+                 FROM workflow_runs WHERE id = ?1",
+                params![run_id, error],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
+    }
+
+    pub fn mark_endpoint_outage(
+        &self,
+        run_id: i64,
+        lease_token: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE workflow_runs
+             SET attempt_count = CASE WHEN manual_retry = 1 THEN attempt_count ELSE attempt_count + 1 END,
+                 state = 'needs_attention', lease_token = NULL, lease_until = NULL,
+                 manual_retry = 0, last_error = ?3, updated_at = datetime('now')
+             WHERE id = ?1 AND state = 'processing' AND lease_token = ?2",
+            params![run_id, lease_token, error],
+        )?;
+        if changed > 0 {
+            tx.execute(
+                "INSERT INTO workflow_events (account_email, message_id, run_id, kind, detail)
+                 SELECT account_email, message_id, id, 'endpoint_unavailable', ?2
+                 FROM workflow_runs WHERE id = ?1",
+                params![run_id, error],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    pub fn resolve_externally(&self, run_id: i64, lease_token: &str, reason: &str) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE workflow_runs
+             SET state = 'resolved_externally', completed_at = datetime('now'),
+                 lease_token = NULL, lease_until = NULL, last_error = ?3, updated_at = datetime('now')
+             WHERE id = ?1 AND state = 'processing' AND lease_token = ?2",
+            params![run_id, lease_token, reason],
+        )?;
+        if changed > 0 {
+            tx.execute(
+                "INSERT INTO workflow_events (account_email, message_id, run_id, kind, detail)
+                 SELECT account_email, message_id, id, 'resolved_externally', ?2
+                 FROM workflow_runs WHERE id = ?1",
+                params![run_id, reason],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    pub fn retry_now(&self, account_email: &str, run_id: i64) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE workflow_runs
+             SET state = 'queued', next_attempt_at = datetime('now'), lease_token = NULL,
+                 lease_until = NULL, manual_retry = 1, updated_at = datetime('now')
+             WHERE id = ?1 AND account_email = ?2
+               AND state IN ('retry_wait', 'needs_attention')",
+            params![run_id, account_email],
+        )?;
+        if changed > 0 {
+            tx.execute(
+                "INSERT INTO workflow_events (account_email, message_id, run_id, kind, detail)
+                 SELECT account_email, message_id, id, 'retry_requested', 'Manual retry requested'
+                 FROM workflow_runs WHERE id = ?1",
+                [run_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    pub fn list_runs(
+        &self,
+        account_email: &str,
+        state: Option<&str>,
+        page: u32,
+        per_page: u32,
+    ) -> Result<Vec<WorkflowRun>> {
+        let offset = page.saturating_mul(per_page);
+        let query = "SELECT r.id, m.id, m.gmail_message_id, m.gmail_thread_id, m.message_json,
+                            m.labels_json, r.state, r.next_rule_index, r.attempt_count,
+                            r.next_attempt_at, r.last_error, r.created_at, r.updated_at,
+                            r.completed_at, s.version, s.rules_json
+                     FROM workflow_runs r
+                     JOIN workflow_messages m ON m.id = r.message_id
+                     JOIN workflow_rule_sets s ON s.id = r.rule_set_id
+                     WHERE r.account_email = ?1";
+        let order = " ORDER BY CASE r.state
+                         WHEN 'needs_attention' THEN 0
+                         WHEN 'processing' THEN 1
+                         WHEN 'retry_wait' THEN 2
+                         WHEN 'queued' THEN 3
+                         ELSE 4
+                       END, r.updated_at DESC, r.id DESC";
+        let mut statement = if state.is_some() {
+            self.conn.prepare(&format!(
+                "{query} AND r.state = ?2{order} LIMIT ?3 OFFSET ?4"
+            ))?
+        } else {
+            self.conn
+                .prepare(&format!("{query}{order} LIMIT ?2 OFFSET ?3"))?
+        };
+        let rows = match state {
+            Some(state) => statement.query_map(
+                params![account_email, state, per_page, offset],
+                map_workflow_run,
+            )?,
+            None => {
+                statement.query_map(params![account_email, per_page, offset], map_workflow_run)?
+            }
+        };
+        rows.collect()
+    }
+
+    pub fn run_for_message(
+        &self,
+        account_email: &str,
+        message_id: i64,
+    ) -> Result<Option<WorkflowRun>> {
+        self.conn
+            .query_row(
+                "SELECT r.id, m.id, m.gmail_message_id, m.gmail_thread_id, m.message_json,
+                        m.labels_json, r.state, r.next_rule_index, r.attempt_count,
+                        r.next_attempt_at, r.last_error, r.created_at, r.updated_at,
+                        r.completed_at, s.version, s.rules_json
+                 FROM workflow_runs r
+                 JOIN workflow_messages m ON m.id = r.message_id
+                 JOIN workflow_rule_sets s ON s.id = r.rule_set_id
+                 WHERE r.account_email = ?1 AND m.id = ?2",
+                params![account_email, message_id],
+                map_workflow_run,
+            )
+            .optional()
+    }
+
+    pub fn state_counts(&self, account_email: &str) -> Result<Vec<WorkflowStateCount>> {
+        let mut statement = self.conn.prepare(
+            "SELECT state, COUNT(*) FROM workflow_runs
+             WHERE account_email = ?1 GROUP BY state",
+        )?;
+        let rows = statement.query_map([account_email], |row| {
+            Ok(WorkflowStateCount {
+                state: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn mailbox(&self, account_email: &str) -> Result<Option<WorkflowMailbox>> {
+        self.conn
+            .query_row(
+                "SELECT account_email, history_cursor, initialized_at, updated_at
+                 FROM workflow_mailboxes WHERE account_email = ?1",
+                [account_email],
+                |row| {
+                    Ok(WorkflowMailbox {
+                        account_email: row.get(0)?,
+                        history_cursor: row.get(1)?,
+                        initialized_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn steps(&self, run_id: i64) -> Result<Vec<WorkflowStep>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, rule_index, rule_legacy_id, rule_name, outcome, decision_json, error, created_at
+             FROM workflow_steps WHERE run_id = ?1 ORDER BY rule_index ASC, id ASC",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok(WorkflowStep {
+                id: row.get(0)?,
+                rule_index: row.get(1)?,
+                rule_legacy_id: row.get(2)?,
+                rule_name: row.get(3)?,
+                outcome: row.get(4)?,
+                decision: row.get(5)?,
+                error: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn llm_attempts(&self, run_id: i64) -> Result<Vec<WorkflowLlmAttempt>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, rule_index, provider_id, provider_name, model, status, error, duration_ms, endpoint, created_at
+             FROM workflow_llm_attempts WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok(WorkflowLlmAttempt {
+                id: row.get(0)?,
+                rule_index: row.get(1)?,
+                provider_id: row.get(2)?,
+                provider_name: row.get(3)?,
+                model: row.get(4)?,
+                status: row.get(5)?,
+                error: row.get(6)?,
+                duration_ms: row.get(7)?,
+                endpoint: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn action_plans(&self, run_id: i64) -> Result<Vec<WorkflowActionPlan>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, rule_index, add_label_ids, remove_label_ids, state, attempt_count,
+                    last_error, created_at, updated_at, completed_at
+             FROM workflow_action_plans WHERE run_id = ?1 ORDER BY rule_index ASC, id ASC",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok(WorkflowActionPlan {
+                id: row.get(0)?,
+                rule_index: row.get(1)?,
+                add_label_ids: serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
+                remove_label_ids: serde_json::from_str(&row.get::<_, String>(3)?)
+                    .unwrap_or_default(),
+                add_label_names: vec![],
+                remove_label_names: vec![],
+                state: row.get(4)?,
+                attempt_count: row.get(5)?,
+                last_error: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                completed_at: row.get(9)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn events(&self, run_id: i64) -> Result<Vec<WorkflowEvent>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, kind, detail, created_at
+             FROM workflow_events WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok(WorkflowEvent {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                detail: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn rule_set_status(&self, account_email: &str) -> Result<Vec<WorkflowRuleSetStatus>> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.version, s.active,
+                    SUM(CASE WHEN r.state IN ('queued', 'processing', 'retry_wait', 'needs_attention') THEN 1 ELSE 0 END)
+             FROM workflow_rule_sets s
+             LEFT JOIN workflow_runs r ON r.rule_set_id = s.id
+             WHERE s.account_email = ?1
+             GROUP BY s.id, s.version, s.active
+             ORDER BY s.version DESC",
+        )?;
+        let rows = statement.query_map([account_email], |row| {
+            Ok(WorkflowRuleSetStatus {
+                version: row.get(0)?,
+                active: row.get::<_, i32>(1)? != 0,
+                active_run_count: row.get(2)?,
+            })
+        })?;
+        rows.collect()
     }
 }
 
@@ -569,6 +894,7 @@ pub struct ClaimedRun {
     pub rule_set_id: i64,
     pub rules_json: String,
     pub next_rule_index: i64,
+    pub manual_retry: bool,
     pub lease_token: String,
     pub lease_until: String,
 }
@@ -583,6 +909,97 @@ pub struct ActionPlan {
     pub state: String,
     pub attempt_count: i64,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowRun {
+    pub run_id: i64,
+    pub message_id: i64,
+    pub gmail_message_id: String,
+    pub gmail_thread_id: Option<String>,
+    pub message_json: Option<String>,
+    pub labels_json: Option<String>,
+    pub state: String,
+    pub next_rule_index: i64,
+    pub attempt_count: i64,
+    pub next_attempt_at: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub rule_set_version: i64,
+    pub rules_json: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowStateCount {
+    pub state: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowMailbox {
+    pub account_email: String,
+    pub history_cursor: String,
+    pub initialized_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowStep {
+    pub id: i64,
+    pub rule_index: i64,
+    pub rule_legacy_id: i64,
+    pub rule_name: String,
+    pub outcome: String,
+    pub decision: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowLlmAttempt {
+    pub id: i64,
+    pub rule_index: i64,
+    pub provider_id: Option<String>,
+    pub provider_name: Option<String>,
+    pub model: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub endpoint: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowActionPlan {
+    pub id: i64,
+    pub rule_index: i64,
+    pub add_label_ids: Vec<String>,
+    pub remove_label_ids: Vec<String>,
+    pub add_label_names: Vec<String>,
+    pub remove_label_names: Vec<String>,
+    pub state: String,
+    pub attempt_count: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowEvent {
+    pub id: i64,
+    pub kind: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowRuleSetStatus {
+    pub version: i64,
+    pub active: bool,
+    pub active_run_count: i64,
 }
 
 fn map_rule_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuleSet> {
@@ -606,8 +1023,9 @@ fn map_claimed_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimedRun> {
         rule_set_id: row.get(6)?,
         rules_json: row.get(7)?,
         next_rule_index: row.get(8)?,
-        lease_token: row.get(9)?,
-        lease_until: row.get(10)?,
+        manual_retry: row.get::<_, i32>(9)? != 0,
+        lease_token: row.get(10)?,
+        lease_until: row.get(11)?,
     })
 }
 
@@ -623,6 +1041,27 @@ fn map_action_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionPlan> {
         state: row.get(5)?,
         attempt_count: row.get(6)?,
         last_error: row.get(7)?,
+    })
+}
+
+fn map_workflow_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRun> {
+    Ok(WorkflowRun {
+        run_id: row.get(0)?,
+        message_id: row.get(1)?,
+        gmail_message_id: row.get(2)?,
+        gmail_thread_id: row.get(3)?,
+        message_json: row.get(4)?,
+        labels_json: row.get(5)?,
+        state: row.get(6)?,
+        next_rule_index: row.get(7)?,
+        attempt_count: row.get(8)?,
+        next_attempt_at: row.get(9)?,
+        last_error: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        completed_at: row.get(13)?,
+        rule_set_version: row.get(14)?,
+        rules_json: row.get(15)?,
     })
 }
 
@@ -651,6 +1090,12 @@ mod tests {
                 repo.mailbox_cursor("test@example.com")?.as_deref(),
                 Some("101")
             );
+            assert_eq!(repo.list_runs("test@example.com", None, 0, 20)?.len(), 1);
+            assert_eq!(
+                repo.list_runs("test@example.com", Some("queued"), 0, 20)?
+                    .len(),
+                1
+            );
             let run = repo.claim_next("test@example.com", "lease-1")?.unwrap();
             assert!(repo.complete_run(run.id, "lease-1", "test")?);
             assert!(repo.claim_next("test@example.com", "lease-2")?.is_none());
@@ -676,6 +1121,26 @@ mod tests {
                 repo.action_for_rule(run.id, 0)?.unwrap().remove_label_ids,
                 ["INBOX"]
             );
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn external_resolution_is_terminal() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        db.with_workflow(|repo| {
+            repo.initialize_mailbox("test@example.com", "100")?;
+            repo.activate_rule_set("test@example.com", r#"{"rules":[]}"#)?;
+            repo.enqueue_arrivals("test@example.com", "101", &["message-1".into()])?;
+            let run = repo.claim_next("test@example.com", "lease-1")?.unwrap();
+            assert!(repo.resolve_externally(run.id, "lease-1", "Archived manually")?);
+            let stored = repo
+                .run_for_message("test@example.com", run.message_id)?
+                .unwrap();
+            assert_eq!(stored.state, "resolved_externally");
+            assert!(!repo.retry_now("test@example.com", run.id)?);
             Ok::<(), rusqlite::Error>(())
         })
         .unwrap();

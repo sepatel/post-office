@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -6,7 +6,10 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::db::workflow::{ActionPlan, ClaimedRun};
+use crate::db::workflow::{
+    ActionPlan, ClaimedRun, WorkflowActionPlan, WorkflowEvent, WorkflowLlmAttempt, WorkflowMailbox,
+    WorkflowRun, WorkflowStateCount, WorkflowStep,
+};
 use crate::db::Database;
 use crate::gmail::models::{HistoryRecord, Message};
 use crate::gmail::{cached_labels, GmailClient, GmailError};
@@ -27,6 +30,201 @@ pub struct IngestionResult {
     pub to_history_id: String,
     pub queued_messages: usize,
     pub initialized: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueItem {
+    pub message_id: i64,
+    pub run_id: i64,
+    pub gmail_message_id: String,
+    pub gmail_thread_id: Option<String>,
+    pub sender: Option<String>,
+    pub subject: Option<String>,
+    pub preview: String,
+    pub labels: Vec<String>,
+    pub state: String,
+    pub next_rule_index: i64,
+    pub next_rule_name: Option<String>,
+    pub attempt_count: i64,
+    pub next_attempt_at: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub rule_set_version: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueSummary {
+    pub counts: Vec<WorkflowStateCount>,
+    pub mailbox: Option<WorkflowMailbox>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageDetail {
+    #[serde(flatten)]
+    pub message: QueueItem,
+    pub body: String,
+    pub steps: Vec<WorkflowStep>,
+    pub llm_attempts: Vec<WorkflowLlmAttempt>,
+    pub action_plans: Vec<WorkflowActionPlan>,
+    pub events: Vec<WorkflowEvent>,
+}
+
+pub fn queue_items(
+    db: &Database,
+    account_email: &str,
+    state: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<Vec<QueueItem>, rusqlite::Error> {
+    let labels = label_names(db, account_email);
+    db.with_workflow(|repo| repo.list_runs(account_email, state, page, per_page))?
+        .iter()
+        .map(|run| queue_item(run, &labels))
+        .collect()
+}
+
+pub fn queue_summary(db: &Database, account_email: &str) -> Result<QueueSummary, rusqlite::Error> {
+    db.with_workflow(|repo| {
+        Ok(QueueSummary {
+            counts: repo.state_counts(account_email)?,
+            mailbox: repo.mailbox(account_email)?,
+        })
+    })
+}
+
+pub fn message_detail(
+    db: &Database,
+    account_email: &str,
+    message_id: i64,
+) -> Result<Option<MessageDetail>, rusqlite::Error> {
+    let Some(run) = db.with_workflow(|repo| repo.run_for_message(account_email, message_id))?
+    else {
+        return Ok(None);
+    };
+    let labels = label_names(db, account_email);
+    let message = queue_item(&run, &labels)?;
+    let body = parse_message(&run)
+        .map(|message| crate::rules::engine::email_parts(&message).1)
+        .unwrap_or_default();
+    db.with_workflow(|repo| {
+        let mut action_plans = repo.action_plans(run.run_id)?;
+        for action in &mut action_plans {
+            action.add_label_names = action
+                .add_label_ids
+                .iter()
+                .map(|label| labels.get(label).cloned().unwrap_or_else(|| label.clone()))
+                .collect();
+            action.remove_label_names = action
+                .remove_label_ids
+                .iter()
+                .map(|label| labels.get(label).cloned().unwrap_or_else(|| label.clone()))
+                .collect();
+        }
+        Ok(Some(MessageDetail {
+            message,
+            body,
+            steps: repo.steps(run.run_id)?,
+            llm_attempts: repo.llm_attempts(run.run_id)?,
+            action_plans,
+            events: repo.events(run.run_id)?,
+        }))
+    })
+}
+
+pub fn retry_now(db: &Database, account_email: &str, run_id: i64) -> Result<bool, rusqlite::Error> {
+    db.with_workflow(|repo| repo.retry_now(account_email, run_id))
+}
+
+pub fn rule_set_status(
+    db: &Database,
+    account_email: &str,
+) -> Result<Vec<crate::db::workflow::WorkflowRuleSetStatus>, rusqlite::Error> {
+    db.with_workflow(|repo| repo.rule_set_status(account_email))
+}
+
+fn queue_item(
+    run: &WorkflowRun,
+    label_names: &HashMap<String, String>,
+) -> Result<QueueItem, rusqlite::Error> {
+    let message = parse_message(run);
+    let labels = run
+        .labels_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .or_else(|| message.as_ref().map(|message| message.label_ids.clone()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|label| label_names.get(&label).cloned().unwrap_or(label))
+        .collect();
+    let (sender, subject, preview) = message
+        .as_ref()
+        .map(|message| {
+            (
+                header(message, "From"),
+                header(message, "Subject"),
+                message.snippet.clone(),
+            )
+        })
+        .unwrap_or((None, None, String::new()));
+    let next_rule_name = serde_json::from_str::<RuleSetSnapshot>(&run.rules_json)
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .rules
+                .get(run.next_rule_index as usize)
+                .map(|entry| entry.rule.name.clone())
+        });
+    Ok(QueueItem {
+        message_id: run.message_id,
+        run_id: run.run_id,
+        gmail_message_id: run.gmail_message_id.clone(),
+        gmail_thread_id: run.gmail_thread_id.clone(),
+        sender,
+        subject,
+        preview,
+        labels,
+        state: run.state.clone(),
+        next_rule_index: run.next_rule_index,
+        next_rule_name,
+        attempt_count: run.attempt_count,
+        next_attempt_at: run.next_attempt_at.clone(),
+        last_error: run.last_error.clone(),
+        created_at: run.created_at.clone(),
+        updated_at: run.updated_at.clone(),
+        completed_at: run.completed_at.clone(),
+        rule_set_version: run.rule_set_version,
+    })
+}
+
+fn label_names(db: &Database, account_email: &str) -> HashMap<String, String> {
+    db.with_labels(|repo| {
+        repo.get(account_email).map(|cached| {
+            cached
+                .into_iter()
+                .flat_map(|cached| cached.labels)
+                .map(|label| (label.id, label.name))
+                .collect()
+        })
+    })
+    .unwrap_or_default()
+}
+
+fn parse_message(run: &WorkflowRun) -> Option<Message> {
+    run.message_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
+fn header(message: &Message, name: &str) -> Option<String> {
+    message.payload.as_ref().and_then(|payload| {
+        payload
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.clone())
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,11 +480,6 @@ async fn process_run(
             return Ok(());
         }
     };
-    let llm = InferenceRouter::from_config_with_runtime(
-        &snapshot.llm.apply_to(config),
-        inference_runtime,
-    )
-    .with_database(db.as_ref().clone());
     let mut message = match run.message_json.as_deref() {
         Some(json) => match serde_json::from_str(json) {
             Ok(message) => message,
@@ -327,6 +520,87 @@ async fn process_run(
                 return Ok(());
             }
         },
+    };
+
+    if run.message_json.is_some() {
+        match gmail.get_message(&run.gmail_message_id).await {
+            Ok(remote) => {
+                let pending_action =
+                    db.with_workflow(|repo| repo.action_for_rule(run.id, run.next_rule_index))?;
+                let action_already_applied = pending_action
+                    .as_ref()
+                    .is_some_and(|action| target_reached(&remote, action));
+                if !action_already_applied {
+                    if let Some(reason) = externally_resolved_reason(&message, &remote) {
+                        let message_json = serde_json::to_string(&remote)?;
+                        let labels_json = serde_json::to_string(&remote.label_ids)?;
+                        let stored = db.with_workflow(|repo| {
+                            repo.store_message_snapshot(
+                                run.id,
+                                &run.lease_token,
+                                &remote.thread_id,
+                                &message_json,
+                                &labels_json,
+                            )
+                        })?;
+                        if !stored {
+                            return Ok(());
+                        }
+                        db.with_workflow(|repo| {
+                            repo.resolve_externally(run.id, &run.lease_token, reason)
+                        })?;
+                        return Ok(());
+                    }
+                }
+                let message_json = serde_json::to_string(&remote)?;
+                let labels_json = serde_json::to_string(&remote.label_ids)?;
+                let stored = db.with_workflow(|repo| {
+                    repo.store_message_snapshot(
+                        run.id,
+                        &run.lease_token,
+                        &remote.thread_id,
+                        &message_json,
+                        &labels_json,
+                    )
+                })?;
+                if !stored {
+                    return Ok(());
+                }
+                message = remote;
+            }
+            Err(GmailError::Api { code: 404, .. }) => {
+                db.with_workflow(|repo| {
+                    repo.resolve_externally(
+                        run.id,
+                        &run.lease_token,
+                        "Message was deleted outside Post Office",
+                    )
+                })?;
+                return Ok(());
+            }
+            Err(error) => {
+                db.with_workflow(|repo| {
+                    repo.retry_run(
+                        run.id,
+                        &run.lease_token,
+                        &error.to_string(),
+                        RETRY_DELAY_SECS,
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+    }
+
+    let llm = InferenceRouter::from_config_with_runtime(
+        &snapshot.llm.apply_to(config),
+        inference_runtime,
+    )
+    .with_database(db.as_ref().clone());
+    let llm = if run.manual_retry {
+        llm.with_endpoint_circuit_bypass()
+    } else {
+        llm
     };
 
     let labels = cached_labels(db, gmail, &run.account_email)
@@ -377,26 +651,48 @@ async fn process_run(
         }
 
         let started = Instant::now();
+        let endpoint_circuit_was_open = llm.endpoint_circuit_open(&rule.inference_policy);
         let resolved =
             match resolve_rule(&llm, rule, &message, &rule_snapshot.memories, &labels).await {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     let error = error.to_string();
+                    let attribution = llm.provider_attribution(&rule.inference_policy);
+                    let endpoint_circuit_open = llm.endpoint_circuit_open(&rule.inference_policy);
                     db.with_workflow(|repo| {
                         repo.record_llm_attempt(
                             run.id,
                             rule_index,
-                            None,
-                            None,
-                            "error",
+                            attribution.as_ref().map(|value| value.provider_id.as_str()),
+                            attribution
+                                .as_ref()
+                                .map(|value| value.provider_name.as_str()),
+                            attribution.as_ref().map(|value| value.model.as_str()),
+                            if endpoint_circuit_was_open {
+                                "blocked"
+                            } else {
+                                "error"
+                            },
                             Some(&error),
                             Some(elapsed_ms(started)),
+                            attribution.as_ref().map(|value| value.endpoint.as_str()),
                         )?;
-                        repo.retry_run(run.id, &run.lease_token, &error, RETRY_DELAY_SECS)
+                        if endpoint_circuit_open && !endpoint_circuit_was_open {
+                            repo.mark_endpoint_outage(run.id, &run.lease_token, &error)
+                        } else if endpoint_circuit_open {
+                            repo.mark_needs_attention(run.id, &run.lease_token, &error)
+                        } else {
+                            repo.retry_run(run.id, &run.lease_token, &error, RETRY_DELAY_SECS)
+                        }
                     })?;
                     return Ok(());
                 }
             };
+        let attribution = llm.provider_attribution(&rule.inference_policy);
+        let provider_name = attribution.as_ref().and_then(|value| {
+            (resolved.llm_provider.as_deref() == Some(value.provider_id.as_str()))
+                .then_some(value.provider_name.as_str())
+        });
         record_decision_attempt(
             db,
             run.id,
@@ -405,6 +701,8 @@ async fn process_run(
             "succeeded",
             None,
             started,
+            attribution.as_ref().map(|value| value.endpoint.as_str()),
+            provider_name,
         )?;
 
         match resolved.outcome {
@@ -522,6 +820,23 @@ async fn apply_action_plan(
     rule_index: i64,
     action: &ActionPlan,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if target_reached(message, action) {
+        let message_json = serde_json::to_string(message)?;
+        let labels_json = serde_json::to_string(&message.label_ids)?;
+        return db
+            .with_workflow(|repo| {
+                repo.confirm_action(
+                    action.id,
+                    run.id,
+                    &run.lease_token,
+                    &message_json,
+                    &labels_json,
+                    rule_index + 1,
+                    rule.continue_after_match,
+                )
+            })
+            .map_err(Into::into);
+    }
     let add_refs = action
         .add_label_ids
         .iter()
@@ -592,6 +907,18 @@ fn target_reached(message: &Message, action: &ActionPlan) -> bool {
             .all(|label| !message.label_ids.contains(label))
 }
 
+fn externally_resolved_reason(previous: &Message, current: &Message) -> Option<&'static str> {
+    let was_trashed = previous.label_ids.iter().any(|label| label == "TRASH");
+    let is_trashed = current.label_ids.iter().any(|label| label == "TRASH");
+    if !was_trashed && is_trashed {
+        return Some("Message was moved to Trash outside Post Office");
+    }
+
+    let was_inbox = previous.label_ids.iter().any(|label| label == "INBOX");
+    let is_inbox = current.label_ids.iter().any(|label| label == "INBOX");
+    (was_inbox && !is_inbox).then_some("Message was archived outside Post Office")
+}
+
 fn apply_local_labels(message: &mut Message, action: &ActionPlan) {
     let mut labels = message.label_ids.iter().cloned().collect::<BTreeSet<_>>();
     for label in &action.remove_label_ids {
@@ -601,6 +928,10 @@ fn apply_local_labels(message: &mut Message, action: &ActionPlan) {
     message.label_ids = labels.into_iter().collect();
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Decision telemetry carries all provider and timing fields as one durable attempt."
+)]
 fn record_decision_attempt(
     db: &Arc<Database>,
     run_id: i64,
@@ -609,16 +940,20 @@ fn record_decision_attempt(
     status: &str,
     error: Option<&str>,
     started: Instant,
+    endpoint: Option<&str>,
+    provider_name: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     db.with_workflow(|repo| {
         repo.record_llm_attempt(
             run_id,
             rule_index,
             resolved.llm_provider.as_deref(),
+            provider_name,
             resolved.llm_model.as_deref(),
             status,
             error,
             Some(elapsed_ms(started)),
+            endpoint,
         )
     })
 }
@@ -639,6 +974,19 @@ fn new_lease_token() -> String {
 mod tests {
     use super::*;
 
+    fn message_with_labels(labels: &[&str]) -> Message {
+        Message {
+            id: "m1".into(),
+            thread_id: "t1".into(),
+            label_ids: labels.iter().map(|label| (*label).into()).collect(),
+            snippet: String::new(),
+            history_id: "1".into(),
+            internal_date: String::new(),
+            size_estimate: 0,
+            payload: None,
+        }
+    }
+
     #[test]
     fn only_message_added_events_are_ingested() {
         let record: HistoryRecord = serde_json::from_str(
@@ -653,5 +1001,20 @@ mod tests {
         let mut ids = BTreeSet::new();
         collect_arrivals(&mut ids, &record);
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), ["arrival"]);
+    }
+
+    #[test]
+    fn detects_manual_archive_and_trash() {
+        assert_eq!(
+            externally_resolved_reason(&message_with_labels(&["INBOX"]), &message_with_labels(&[]),),
+            Some("Message was archived outside Post Office")
+        );
+        assert_eq!(
+            externally_resolved_reason(
+                &message_with_labels(&["INBOX"]),
+                &message_with_labels(&["TRASH"]),
+            ),
+            Some("Message was moved to Trash outside Post Office")
+        );
     }
 }

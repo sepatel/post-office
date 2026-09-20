@@ -25,6 +25,7 @@ use std::time::Duration;
 use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
+use tauri_plugin_notification::NotificationExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -44,6 +45,7 @@ pub fn spawn_message_workflow_worker(
     inference_runtime: post_office_core::llm::InferenceRuntime,
 ) {
     tauri::async_runtime::spawn(async move {
+        let mut attention_counts = HashMap::<String, i64>::new();
         loop {
             let cfg = config.lock().await.clone();
             let accounts = db
@@ -98,6 +100,32 @@ pub fn spawn_message_workflow_worker(
                     }
                 }
                 workflow_running.store(false, Ordering::Relaxed);
+
+                let attention = db
+                    .with_workflow(|repo| repo.state_counts(&account_email))
+                    .ok()
+                    .and_then(|counts| {
+                        counts
+                            .into_iter()
+                            .find(|entry| entry.state == "needs_attention")
+                            .map(|entry| entry.count)
+                    })
+                    .unwrap_or(0);
+                if let Some(previous) = attention_counts.insert(account_email.clone(), attention) {
+                    if attention > previous {
+                        let _ = app
+                            .notification()
+                            .builder()
+                            .title("Post Office needs attention")
+                            .body(format!(
+                                "{} message{} need attention in {}",
+                                attention,
+                                if attention == 1 { "" } else { "s" },
+                                account_email
+                            ))
+                            .show();
+                    }
+                }
             }
 
             if !processed {
@@ -1102,6 +1130,69 @@ pub async fn rules_apply(
     _message_id: String,
 ) -> Result<ApplyResult, String> {
     Err("Direct Gmail application was removed. Queue a message run instead.".into())
+}
+
+#[tauri::command]
+pub async fn workflow_queue_summary(
+    state: State<'_, AppState>,
+) -> Result<post_office_core::workflow::QueueSummary, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::queue_summary(&state.db, &account_email)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_messages_list(
+    state: State<'_, AppState>,
+    run_state: Option<String>,
+    page: u32,
+    per_page: u32,
+) -> Result<Vec<post_office_core::workflow::QueueItem>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::queue_items(
+        &state.db,
+        &account_email,
+        run_state.as_deref(),
+        page,
+        per_page,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_message_get(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> Result<Option<post_office_core::workflow::MessageDetail>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::message_detail(&state.db, &account_email, message_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_retry_now(state: State<'_, AppState>, run_id: i64) -> Result<bool, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::retry_now(&state.db, &account_email, run_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_rule_set_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::workflow::WorkflowRuleSetStatus>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::rule_set_status(&state.db, &account_email)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_endpoint_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::llm_endpoint_status::LlmEndpointStatus>, String> {
+    state
+        .db
+        .with_llm_endpoint_status(|repo| repo.list())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

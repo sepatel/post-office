@@ -318,6 +318,147 @@ export async function rulesApply(
   return invoke("rules_apply", { rule, messageId });
 }
 
+export type WorkflowRunState =
+  | "queued"
+  | "processing"
+  | "retry_wait"
+  | "needs_attention"
+  | "completed"
+  | "resolved_externally";
+
+export interface WorkflowQueueItem {
+  message_id: number;
+  run_id: number;
+  gmail_message_id: string;
+  gmail_thread_id: string | null;
+  sender: string | null;
+  subject: string | null;
+  preview: string;
+  labels: string[];
+  state: WorkflowRunState | string;
+  next_rule_index: number;
+  next_rule_name: string | null;
+  attempt_count: number;
+  next_attempt_at: string;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  rule_set_version: number;
+}
+
+export interface WorkflowStateCount {
+  state: WorkflowRunState | string;
+  count: number;
+}
+
+export interface WorkflowMailbox {
+  account_email: string;
+  history_cursor: string;
+  initialized_at: string;
+  updated_at: string;
+}
+
+export interface WorkflowQueueSummary {
+  counts: WorkflowStateCount[];
+  mailbox: WorkflowMailbox | null;
+}
+
+export interface WorkflowStep {
+  id: number;
+  rule_index: number;
+  rule_legacy_id: number;
+  rule_name: string;
+  outcome: string;
+  decision: string | null;
+  error: string | null;
+  created_at: string;
+}
+
+export interface WorkflowLlmAttempt {
+  id: number;
+  rule_index: number;
+  provider_id: string | null;
+  provider_name: string | null;
+  model: string | null;
+  status: string;
+  error: string | null;
+  duration_ms: number | null;
+  endpoint: string | null;
+  created_at: string;
+}
+
+export interface WorkflowActionPlan {
+  id: number;
+  rule_index: number;
+  add_label_ids: string[];
+  remove_label_ids: string[];
+  add_label_names: string[];
+  remove_label_names: string[];
+  state: string;
+  attempt_count: number;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface WorkflowEvent {
+  id: number;
+  kind: string;
+  detail: string | null;
+  created_at: string;
+}
+
+export interface WorkflowMessageDetail extends WorkflowQueueItem {
+  body: string;
+  steps: WorkflowStep[];
+  llm_attempts: WorkflowLlmAttempt[];
+  action_plans: WorkflowActionPlan[];
+  events: WorkflowEvent[];
+}
+
+export async function workflowQueueSummary(): Promise<WorkflowQueueSummary> {
+  return invoke("workflow_queue_summary");
+}
+
+export async function workflowMessagesList(
+  runState: string | null,
+  page: number,
+  perPage: number,
+): Promise<WorkflowQueueItem[]> {
+  return invoke("workflow_messages_list", { runState, page, perPage });
+}
+
+export async function workflowMessageGet(messageId: number): Promise<WorkflowMessageDetail | null> {
+  return invoke("workflow_message_get", { messageId });
+}
+
+export async function workflowRetryNow(runId: number): Promise<boolean> {
+  return invoke("workflow_retry_now", { runId });
+}
+
+export interface WorkflowRuleSetStatus {
+  version: number;
+  active: boolean;
+  active_run_count: number;
+}
+
+export async function workflowRuleSetStatus(): Promise<WorkflowRuleSetStatus[]> {
+  return invoke("workflow_rule_set_status");
+}
+
+export interface WorkflowEndpointStatus {
+  endpoint: string;
+  unavailable_until: string | null;
+  last_error: string | null;
+  updated_at: string;
+}
+
+export async function workflowEndpointStatus(): Promise<WorkflowEndpointStatus[]> {
+  return invoke("workflow_endpoint_status");
+}
+
 export interface EvaluationVerdict {
   email_id: string;
   matched: boolean;

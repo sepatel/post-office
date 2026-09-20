@@ -27,7 +27,7 @@ of truth.
 
 Runs are processed serially for an account by a durable worker. A run owns a
 lease token and moves through `queued`, `processing`, `retry_wait`, `completed`,
-or `needs_attention`.
+`needs_attention`, or `resolved_externally`.
 
 Each run references an immutable ruleset snapshot containing:
 
@@ -55,8 +55,22 @@ action plan stores resolved Gmail label IDs rather than rule text. If a Gmail
 request fails after it may have reached Gmail, the worker fetches the message
 and verifies the desired labels before retrying.
 
-Decision and action failures retry with a finite budget. Exhausted work moves to
-`needs_attention`; it never returns to the arrival queue.
+Decision and action failures receive at most three automatic attempts, including
+the first attempt. Exhausted work moves to `needs_attention`; it never returns
+to the arrival queue.
+
+Before a manual retry resumes work, the worker fetches the current Gmail message.
+Messages deleted, moved to Trash, or archived outside Post Office end as
+`resolved_externally`. If Gmail already reflects a persisted action plan, the
+plan is confirmed without sending the mutation again.
+
+Queue Retry is one human-requested probe, not a new automatic retry cycle. A
+failed probe returns directly to `needs_attention`.
+
+Connection failures open a five-minute circuit for the shared LLM endpoint.
+Messages routed to that endpoint then move to `needs_attention` without making
+their own connection attempts. A successful human-requested probe closes the
+circuit.
 
 External services cannot provide exactly-once delivery across a process crash.
 The workflow instead provides exactly-once logical progression: only one
