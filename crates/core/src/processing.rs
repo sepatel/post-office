@@ -44,6 +44,7 @@ pub struct ProcessingState {
     pub backfill_running: Arc<AtomicBool>,
     pub backfill_cancel_requested: Arc<AtomicBool>,
     pub inference_retry_running: Arc<AtomicBool>,
+    pub workflow_running: Arc<AtomicBool>,
     // The resume floor advances after every completed live message.
     pub last_processed: Option<chrono::DateTime<Utc>>,
     pub last_successful: Option<chrono::DateTime<Utc>>,
@@ -87,6 +88,7 @@ impl ProcessingState {
             backfill_running: Arc::new(AtomicBool::new(false)),
             backfill_cancel_requested: Arc::new(AtomicBool::new(false)),
             inference_retry_running: Arc::new(AtomicBool::new(false)),
+            workflow_running: Arc::new(AtomicBool::new(false)),
             last_processed: None,
             last_successful: None,
             emails_processed_today: 0,

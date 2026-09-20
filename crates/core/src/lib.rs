@@ -6,5 +6,6 @@ pub mod llm;
 pub mod processing;
 pub mod rules;
 pub mod sync;
+pub mod workflow;
 
 pub use gmail::GmailError;

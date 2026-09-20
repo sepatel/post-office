@@ -134,6 +134,26 @@ impl<'a> AccountRepository<'a> {
             "DELETE FROM gmail_labels WHERE account_email = ?1",
             params![email],
         )?;
+        transaction.execute(
+            "DELETE FROM workflow_events WHERE account_email = ?1",
+            params![email],
+        )?;
+        transaction.execute(
+            "DELETE FROM workflow_runs WHERE account_email = ?1",
+            params![email],
+        )?;
+        transaction.execute(
+            "DELETE FROM workflow_messages WHERE account_email = ?1",
+            params![email],
+        )?;
+        transaction.execute(
+            "DELETE FROM workflow_rule_sets WHERE account_email = ?1",
+            params![email],
+        )?;
+        transaction.execute(
+            "DELETE FROM workflow_mailboxes WHERE account_email = ?1",
+            params![email],
+        )?;
         transaction.execute("DELETE FROM accounts WHERE email = ?1", params![email])?;
         transaction.commit()
     }
