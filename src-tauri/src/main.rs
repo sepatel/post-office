@@ -32,7 +32,6 @@ pub struct AppState {
     pub config: Arc<Mutex<AppConfig>>,
     pub inference_runtime: InferenceRuntime,
     pub sync_trigger: mpsc::UnboundedSender<sync_runtime::SyncTrigger>,
-    pub pollers_started: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub tray: Arc<std::sync::Mutex<Option<TrayIcon>>>,
 }
 
@@ -63,7 +62,30 @@ fn main() {
                 post_office_core::db::Database::open(&db_path).expect("Failed to open database");
             db.migrate().expect("Failed to run migrations");
 
-            let config = db.with_config(|repo| AppConfig::load(&repo));
+            let mut config = db.with_config(|repo| AppConfig::load(&repo));
+            if !config.llm_api_key.trim().is_empty() {
+                match post_office_core::llm::credentials::store_provider_api_key(
+                    "legacy",
+                    &config.llm_api_key,
+                ) {
+                    Ok(()) => {
+                        config.llm_api_key.clear();
+                        db.with_config(|repo| config.save(&repo))
+                            .expect("Failed to save migrated LLM configuration");
+                    }
+                    Err(error) => tracing::warn!(
+                        "Could not migrate the legacy LLM credential to the keyring: {}",
+                        error
+                    ),
+                }
+            }
+            for account in db
+                .with_accounts(|repo| repo.list())
+                .expect("Failed to load accounts for workflow migration")
+            {
+                post_office_core::workflow::publish_rule_set(&db, &account.email, &config)
+                    .expect("Failed to import rule set into message workflow");
+            }
             let config_arc = Arc::new(Mutex::new(config.clone()));
             let inference_runtime = InferenceRuntime::default();
             let processing_states =
@@ -85,35 +107,19 @@ fn main() {
                 config: config_arc.clone(),
                 inference_runtime,
                 sync_trigger,
-                pollers_started: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
                 tray: Arc::new(std::sync::Mutex::new(None)),
             };
 
             app.manage(app_state);
 
             let state_handle = app.state::<AppState>();
-            commands::spawn_inference_retry_worker(
+            commands::spawn_message_workflow_worker(
                 app.handle().clone(),
                 Arc::new(state_handle.db.clone()),
                 state_handle.processing_states.clone(),
                 state_handle.config.clone(),
                 state_handle.inference_runtime.clone(),
             );
-
-            if !config.sync_enabled {
-                let accounts = state_handle
-                    .db
-                    .with_accounts(|repo| repo.list())
-                    .unwrap_or_default();
-                for account in accounts.into_iter().filter(|account| !account.paused) {
-                    crate::commands::ensure_polling_started(
-                        app.handle().clone(),
-                        &state_handle,
-                        &config,
-                        account.email,
-                    );
-                }
-            }
 
             let tray = tray::setup_tray(app, &config.tray_theme)?;
             app.state::<AppState>().tray.lock().unwrap().replace(tray);

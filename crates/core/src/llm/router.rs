@@ -200,12 +200,18 @@ impl InferenceRouter {
                 } else {
                     profile.api_key_ref.clone()
                 };
-                let key = if key_ref == "legacy" {
-                    Ok(config.llm_api_key.clone())
-                } else {
-                    crate::llm::credentials::load_provider_api_key(&key_ref)
-                        .map(|key| key.unwrap_or_default())
-                };
+                let key = crate::llm::credentials::load_provider_api_key(&key_ref).map(|key| {
+                    key.filter(|value| !value.trim().is_empty())
+                        // Config remains a read-only fallback for databases created before
+                        // provider secrets moved into the OS keyring.
+                        .unwrap_or_else(|| {
+                            if key_ref == "legacy" {
+                                config.llm_api_key.clone()
+                            } else {
+                                String::new()
+                            }
+                        })
+                });
                 let init_error = key.as_ref().err().cloned().or_else(|| {
                     if profile.base_url.trim().is_empty() || profile.model.trim().is_empty() {
                         Some("base URL and model are required".into())
