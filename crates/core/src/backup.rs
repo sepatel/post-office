@@ -453,7 +453,7 @@ pub fn apply_import(
     let existing = db
         .with_rules(|repo| repo.list_all(account_email))
         .map_err(|e| e.to_string())?;
-    let mut next_priority = existing
+    let first_priority = existing
         .iter()
         .map(|rule| rule.priority)
         .max()
@@ -467,7 +467,7 @@ pub fn apply_import(
     let mut resolver = LabelResolver::new(live_labels, &doc.label_names);
     let mut imported_memories = 0;
 
-    for mut rule in doc.rules {
+    for (offset, mut rule) in doc.rules.into_iter().enumerate() {
         for condition in &mut rule.conditions {
             resolver.resolve_condition(condition);
         }
@@ -499,7 +499,7 @@ pub fn apply_import(
                         choices: rule.choices.clone(),
                         choose_from_all_labels: rule.choose_from_all_labels,
                         actions: rule.actions.clone(),
-                        priority: next_priority,
+                        priority: first_priority + offset as i32,
                         enabled: rule.enabled,
                         inference_policy: policy,
                         decision_reasoning_effort: rule.decision_reasoning_effort,
@@ -509,8 +509,6 @@ pub fn apply_import(
                 )
             })
             .map_err(|e| e.to_string())?;
-        next_priority += 1;
-
         for memory in rule.memories {
             if memory.text.trim().is_empty() {
                 continue;

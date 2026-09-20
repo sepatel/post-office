@@ -91,10 +91,6 @@ pub fn spawn(
                 _ = &mut sleeper => SyncTrigger::Sweep,
             };
 
-            if !cfg.sync_enabled && !matches!(trigger, SyncTrigger::Manual) {
-                continue;
-            }
-
             let (account_emails, relay_event_key) = match &trigger {
                 SyncTrigger::Relay {
                     account_email,

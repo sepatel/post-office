@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
@@ -8,10 +7,10 @@ use tokio::sync::Mutex;
 use crate::config::AppConfig;
 use crate::db::sync_state::GmailSyncState;
 use crate::db::Database;
-use crate::gmail::models::{HistoryRecord, WatchResponse};
-use crate::gmail::{GmailClient, GmailError};
+use crate::gmail::models::WatchResponse;
+use crate::gmail::GmailClient;
 use crate::llm::InferenceRouter;
-use crate::processing::{run_for_message_ids, OpProgress, ProcessingState};
+use crate::processing::{OpProgress, ProcessingState};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayResult {
@@ -42,109 +41,33 @@ pub async fn ensure_cursor(
 #[allow(clippy::too_many_arguments)]
 pub async fn replay_history(
     db: &Arc<Database>,
-    state: &Arc<Mutex<ProcessingState>>,
+    _state: &Arc<Mutex<ProcessingState>>,
     gmail: &mut GmailClient,
-    llm: &InferenceRouter,
+    _llm: &InferenceRouter,
     config: &AppConfig,
     account_email: &str,
-    trigger: &str,
+    _trigger: &str,
     on_progress: &impl Fn(OpProgress),
 ) -> Result<ReplayResult, Box<dyn std::error::Error + Send + Sync>> {
-    let sync_state = ensure_cursor(db, gmail, account_email).await?;
-    let from_history_id = sync_state.last_history_id;
-
-    let mut page_token: Option<String> = None;
-    let mut max_history_id = from_history_id.clone();
-    let mut message_ids: BTreeSet<String> = BTreeSet::new();
-
     on_progress(OpProgress {
         source: "sync".into(),
         phase: "sync-fetching".into(),
         processed: 0,
         total: None,
-        detail: Some(format!("history from {}", from_history_id)),
+        detail: Some("Recording Gmail arrivals".into()),
         current_email_id: None,
         current_email_from: None,
         current_email_subject: None,
         current_email_sent_at: None,
     });
 
-    loop {
-        let page = match gmail
-            .list_history_page(&from_history_id, page_token.as_deref())
-            .await
-        {
-            Ok(page) => page,
-            Err(GmailError::Api { code: 404, .. }) => {
-                let profile = gmail.get_profile().await?;
-                db.with_sync_state(|repo| {
-                    repo.upsert_cursor(account_email, &profile.history_id, Some("resynced"))?;
-                    repo.set_sync_error(
-                        account_email,
-                        Some("history cursor expired; reseeded to current mailbox cursor"),
-                    )?;
-                    Ok::<(), rusqlite::Error>(())
-                })?;
-                return Ok(ReplayResult {
-                    from_history_id,
-                    to_history_id: profile.history_id,
-                    touched_messages: 0,
-                    processed_messages: 0,
-                });
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if let Some(latest) = page.history_id.as_deref() {
-            max_history_id = max_history(max_history_id, latest);
-        }
-        if let Some(records) = page.history.as_ref() {
-            for record in records {
-                max_history_id = max_history(max_history_id, &record.id);
-                collect_message_ids(&mut message_ids, record);
-            }
-        }
-        page_token = page.next_page_token;
-        if page_token.is_none() {
-            break;
-        }
-    }
-
-    let ids: Vec<String> = message_ids.into_iter().collect();
-    let processed_messages = if ids.is_empty() {
-        0
-    } else {
-        run_for_message_ids(
-            db,
-            account_email,
-            state,
-            gmail,
-            llm,
-            config,
-            &ids,
-            on_progress,
-        )
-        .await?
-    };
-
-    db.with_sync_state(|repo| {
-        repo.upsert_cursor(account_email, &max_history_id, Some("active"))?;
-        repo.mark_history_pull(account_email)?;
-        repo.set_sync_error(account_email, None)?;
-        repo.insert_cursor_log(
-            account_email,
-            Some(&from_history_id),
-            &max_history_id,
-            trigger,
-            processed_messages,
-        )?;
-        Ok::<(), rusqlite::Error>(())
-    })?;
+    let result = crate::workflow::ingest_history(db, gmail, account_email, config).await?;
 
     Ok(ReplayResult {
-        from_history_id,
-        to_history_id: max_history_id,
-        touched_messages: ids.len(),
-        processed_messages,
+        from_history_id: result.from_history_id,
+        to_history_id: result.to_history_id,
+        touched_messages: result.queued_messages,
+        processed_messages: result.queued_messages,
     })
 }
 
@@ -190,36 +113,6 @@ pub fn queue_notification(
         repo.mark_notification_received(account_email)?;
         Ok(())
     })
-}
-
-fn max_history(current: String, candidate: &str) -> String {
-    match (current.parse::<u128>(), candidate.parse::<u128>()) {
-        (Ok(left), Ok(right)) if right > left => candidate.to_string(),
-        _ => current,
-    }
-}
-
-fn collect_message_ids(ids: &mut BTreeSet<String>, record: &HistoryRecord) {
-    if let Some(messages) = record.messages.as_ref() {
-        for m in messages {
-            ids.insert(m.id.clone());
-        }
-    }
-    if let Some(messages) = record.messages_added.as_ref() {
-        for m in messages {
-            ids.insert(m.message.id.clone());
-        }
-    }
-    if let Some(messages) = record.labels_added.as_ref() {
-        for m in messages {
-            ids.insert(m.message.id.clone());
-        }
-    }
-    if let Some(messages) = record.labels_removed.as_ref() {
-        for m in messages {
-            ids.insert(m.message.id.clone());
-        }
-    }
 }
 
 fn millis_to_rfc3339(raw: &str) -> Option<String> {

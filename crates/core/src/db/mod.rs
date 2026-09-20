@@ -14,6 +14,7 @@ pub mod rule_chat;
 pub mod rule_memory;
 pub mod rules;
 pub mod sync_state;
+pub mod workflow;
 
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -133,6 +134,18 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (18)", [])?;
         }
+        if !migration_applied(&transaction, 19)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/019_message_workflow.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])?;
+        }
+        if !migration_applied(&transaction, 20)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/020_workflow_run_attempt_count.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (20)", [])?;
+        }
         transaction.commit()
     }
 
@@ -231,6 +244,14 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let repo = sync_state::SyncStateRepository::new(&conn);
         f(repo)
+    }
+
+    pub fn with_workflow<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(workflow::WorkflowRepository<'_>) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        f(workflow::WorkflowRepository::new(&conn))
     }
 
     pub fn with_labels<F, R>(&self, f: F) -> R

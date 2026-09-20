@@ -3,10 +3,10 @@ use crate::gmail::models::Label;
 use crate::gmail::GmailClient;
 use std::collections::BTreeSet;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LabelMutation {
-    add: Vec<String>,
-    remove: Vec<String>,
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
 }
 
 pub async fn execute_action(
