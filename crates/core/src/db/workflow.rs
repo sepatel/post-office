@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const MAX_ATTEMPTS: i64 = 3;
+pub const MAX_ATTEMPTS: i64 = 3;
 
 pub struct WorkflowRepository<'a> {
     conn: &'a Connection,
@@ -798,6 +798,7 @@ impl<'a> WorkflowRepository<'a> {
             Ok(WorkflowLlmAttempt {
                 id: row.get(0)?,
                 rule_index: row.get(1)?,
+                rule_name: None,
                 provider_id: row.get(2)?,
                 provider_name: row.get(3)?,
                 model: row.get(4)?,
@@ -961,6 +962,7 @@ pub struct WorkflowStep {
 pub struct WorkflowLlmAttempt {
     pub id: i64,
     pub rule_index: i64,
+    pub rule_name: Option<String>,
     pub provider_id: Option<String>,
     pub provider_name: Option<String>,
     pub model: Option<String>,

@@ -165,7 +165,7 @@ export default function Queue() {
                   <span>{item.sender || "Unknown sender"}</span>
                   <span>Message #{item.message_id}</span>
                   <span>v{item.rule_set_version}</span>
-                  {item.next_rule_name && <span>Next: {item.next_rule_name}</span>}
+                  {item.next_rule_name && <span>Rule {item.next_rule_index + 1}: {item.next_rule_name}</span>}
                   <span>{formatLocalDateTime(item.created_at, "-")}</span>
                 </div>
                 {((item.state === "needs_attention" || item.state === "retry_wait") ? item.last_error : item.preview) && (

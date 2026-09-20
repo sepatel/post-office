@@ -12,13 +12,95 @@ function title(kind: string): string {
   return kind.replace(/_/g, " ").replace(/\b\w/g, (letter: string) => letter.toUpperCase());
 }
 
+interface TimelineEntry {
+  at: string;
+  key: string;
+  title: string;
+  detail: string | null;
+  technicalDetail?: string | null;
+  context?: string | null;
+  tone: string;
+}
+
+function errorSummary(error: string | null): string | null {
+  if (!error) return null;
+  const message = error.match(/"message"\s*:\s*"([^"]+)"/)?.[1];
+  const code = error.match(/"code"\s*:\s*(\d+)/)?.[1];
+  if (message) return code ? `API error ${code}: ${message}` : message;
+  return error.split("\n").find((line) => line.trim())?.trim() ?? error;
+}
+
+function ruleContext(detail: WorkflowMessageDetail): string | null {
+  const rule = detail.current_rule;
+  if (!rule) return null;
+  const route = rule.providers
+    .map((provider) => {
+      const model = provider.model ? ` / ${provider.model}` : "";
+      return `${provider.name}${model}${provider.enabled ? "" : " (disabled)"}`;
+    })
+    .join(" -> ");
+  return `Rule ${rule.rule_index + 1} of ${rule.rule_count}: ${rule.rule_name} · ${rule.policy_name}${route ? ` · ${route}` : ""}`;
+}
+
 function Timeline({ detail }: { detail: WorkflowMessageDetail }) {
-  const entries = [
-    ...detail.events.map((entry) => ({ at: entry.created_at, key: `event-${entry.id}`, title: title(entry.kind), detail: entry.detail, tone: "bg-slate-400" })),
-    ...detail.steps.map((step) => ({ at: step.created_at, key: `step-${step.id}`, title: `${step.rule_name}: ${title(step.outcome)}`, detail: step.error || (step.decision ? "Decision recorded" : null), tone: "bg-blue-500" })),
-    ...detail.llm_attempts.map((attempt) => ({ at: attempt.created_at, key: `llm-${attempt.id}`, title: `${attempt.status === "error" ? "Failed" : "Completed"} LLM decision${attempt.provider_name || attempt.provider_id ? ` · ${attempt.provider_name || attempt.provider_id}` : ""}${attempt.model ? ` / ${attempt.model}` : ""}`, detail: [attempt.endpoint ? `Endpoint: ${attempt.endpoint}` : "", attempt.error || (attempt.duration_ms != null ? `${(attempt.duration_ms / 1000).toFixed(1)}s` : "")].filter(Boolean).join(" · ") || null, tone: attempt.status === "error" ? "bg-red-500" : "bg-indigo-500" })),
-    ...detail.action_plans.map((action) => ({ at: action.created_at, key: `action-${action.id}`, title: `Action plan: ${title(action.state)}`, detail: action.last_error || [action.add_label_names.length ? `Add ${action.add_label_names.join(", ")}` : "", action.remove_label_names.length ? `Remove ${action.remove_label_names.join(", ")}` : ""].filter(Boolean).join(" · "), tone: action.state === "succeeded" ? "bg-emerald-500" : "bg-amber-500" })),
-  ].sort((left, right) => left.at.localeCompare(right.at));
+  const entries: TimelineEntry[] = [];
+  const context = ruleContext(detail);
+  let automaticRetries = 0;
+  let manualRetries = 0;
+
+  for (const event of detail.events) {
+    let eventTitle = title(event.kind);
+    if (event.kind === "retry_scheduled") {
+      automaticRetries += 1;
+      eventTitle = `Automatic retry ${automaticRetries} scheduled`;
+    } else if (event.kind === "retry_requested") {
+      manualRetries += 1;
+      eventTitle = `Manual retry ${manualRetries} requested`;
+    }
+    const error = errorSummary(event.detail);
+    entries.push({
+      at: event.created_at,
+      key: `event-${event.id}`,
+      title: eventTitle,
+      detail: error,
+      technicalDetail: error !== event.detail ? event.detail : null,
+      context: ["retry_scheduled", "retry_requested", "needs_attention", "endpoint_unavailable"].includes(event.kind)
+        ? context
+        : null,
+      tone: event.kind === "retry_scheduled" ? "bg-amber-500" : event.kind === "needs_attention" ? "bg-red-500" : "bg-slate-400",
+    });
+  }
+  for (const step of detail.steps) {
+    entries.push({
+      at: step.created_at,
+      key: `step-${step.id}`,
+      title: `${step.rule_name}: ${title(step.outcome)}`,
+      detail: step.error || (step.decision ? "Decision recorded" : null),
+      tone: "bg-blue-500",
+    });
+  }
+  for (const attempt of detail.llm_attempts) {
+    const failed = attempt.status !== "succeeded";
+    const provider = attempt.provider_name || attempt.provider_id;
+    entries.push({
+      at: attempt.created_at,
+      key: `llm-${attempt.id}`,
+      title: `${failed ? "Failed" : "Completed"} LLM decision${attempt.rule_name ? ` · ${attempt.rule_name}` : ""}${provider ? ` · ${provider}` : ""}${attempt.model ? ` / ${attempt.model}` : ""}`,
+      detail: errorSummary(attempt.error) || (attempt.duration_ms != null ? `${(attempt.duration_ms / 1000).toFixed(1)}s` : null),
+      technicalDetail: attempt.error && errorSummary(attempt.error) !== attempt.error ? attempt.error : null,
+      tone: failed ? "bg-red-500" : "bg-indigo-500",
+    });
+  }
+  for (const action of detail.action_plans) {
+    entries.push({
+      at: action.created_at,
+      key: `action-${action.id}`,
+      title: `Action plan: ${title(action.state)}`,
+      detail: action.last_error || [action.add_label_names.length ? `Add ${action.add_label_names.join(", ")}` : "", action.remove_label_names.length ? `Remove ${action.remove_label_names.join(", ")}` : ""].filter(Boolean).join(" · ") || null,
+      tone: action.state === "succeeded" ? "bg-emerald-500" : "bg-amber-500",
+    });
+  }
+  entries.sort((left, right) => left.at.localeCompare(right.at));
 
   return (
     <ol className="space-y-4 border-l border-gray-200 pl-5 dark:border-gray-700">
@@ -29,7 +111,9 @@ function Timeline({ detail }: { detail: WorkflowMessageDetail }) {
             <span className="text-sm font-medium">{entry.title}</span>
             <span className="text-xs text-gray-500 dark:text-gray-400">{formatLocalDateTime(entry.at, "-")}</span>
           </div>
+          {entry.context && <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{entry.context}</p>}
           {entry.detail && <p className="mt-1 whitespace-pre-wrap text-sm text-gray-600 dark:text-gray-300">{entry.detail}</p>}
+          {entry.technicalDetail && <details className="mt-2 text-xs text-gray-500 dark:text-gray-400"><summary className="cursor-pointer">Technical error</summary><pre className="mt-2 whitespace-pre-wrap">{entry.technicalDetail}</pre></details>}
         </li>
       ))}
       {entries.length === 0 && <li className="text-sm text-gray-400">No workflow evidence recorded yet.</li>}
@@ -81,15 +165,18 @@ export default function MessageDetail() {
             <h1 className="mt-1 break-words text-3xl font-semibold tracking-tight">{detail.subject || "Untitled message"}</h1>
             <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">{detail.sender || "Unknown sender"} · received {formatLocalDateTime(detail.created_at, "-")}</p>
           </div>
-          {retryable && <button type="button" onClick={() => void retry()} disabled={retrying} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">{retrying ? "Queuing…" : "Retry after reconciliation"}</button>}
+          {retryable && <div className="text-right"><button type="button" onClick={() => void retry()} disabled={retrying} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">{retrying ? "Queuing…" : "Run manual retry"}</button><p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Runs once without resetting automatic retries.</p></div>}
         </div>
-        <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-3 border-t border-gray-100 pt-5 text-sm dark:border-gray-700 sm:grid-cols-4">
+        <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-3 border-t border-gray-100 pt-5 text-sm dark:border-gray-700 sm:grid-cols-5">
           <div><span className="block text-xs text-gray-500">State</span><span className="font-medium">{title(detail.state)}</span></div>
           <div><span className="block text-xs text-gray-500">Ruleset</span><span className="font-medium">v{detail.rule_set_version}</span></div>
-          <div><span className="block text-xs text-gray-500">Automatic attempts</span><span className="font-medium">{detail.attempt_count}/3</span></div>
+          <div><span className="block text-xs text-gray-500">Automatic attempts</span><span className="font-medium">{detail.retry_summary.automatic_attempt_count} recorded</span><span className="block text-xs text-gray-500">Current limit: {detail.retry_summary.automatic_attempt_limit}</span></div>
+          <div><span className="block text-xs text-gray-500">Manual retries</span><span className="font-medium">{detail.retry_summary.manual_retry_requested_count} requested</span></div>
           <div><span className="block text-xs text-gray-500">Run</span><span className="font-medium">#{detail.run_id}</span></div>
         </div>
-        {detail.last_error && <p className="mt-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-200">{detail.last_error}</p>}
+        {detail.current_rule && <section className="mt-4 rounded-xl border border-blue-100 bg-blue-50/70 p-4 dark:border-blue-900/60 dark:bg-blue-950/20"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-700 dark:text-blue-300">{retryable ? "Blocked at" : "Current rule"}</p><p className="mt-1 font-medium text-gray-900 dark:text-gray-100">Rule {detail.current_rule.rule_index + 1} of {detail.current_rule.rule_count}: {detail.current_rule.rule_name}</p><p className="mt-1 text-sm text-gray-600 dark:text-gray-300">Policy: {detail.current_rule.policy_name}</p><div className="mt-3 flex flex-wrap gap-2">{detail.current_rule.providers.map((provider) => <div key={provider.id} className="max-w-full rounded-lg border border-blue-200 bg-white px-3 py-2 text-xs dark:border-blue-900/70 dark:bg-gray-900"><p className="font-medium text-gray-800 dark:text-gray-100">{provider.name}{provider.model ? ` / ${provider.model}` : ""}{!provider.enabled && " (disabled)"}</p>{provider.endpoint && <p className="mt-1 break-all text-gray-500 dark:text-gray-400">{provider.endpoint}</p>}</div>)}</div></section>}
+        {detail.retry_summary.historical_retry_policy && <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">This run preserves {detail.retry_summary.automatic_retry_scheduled_count} scheduled automatic retries from the previous retry policy. The current {detail.retry_summary.automatic_attempt_limit}-attempt limit is tracked separately.</p>}
+        {detail.last_error && <div className="mt-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-200"><p>{errorSummary(detail.last_error)}</p>{errorSummary(detail.last_error) !== detail.last_error && <details className="mt-2 text-xs"><summary className="cursor-pointer">Technical error</summary><pre className="mt-2 whitespace-pre-wrap">{detail.last_error}</pre></details>}</div>}
       </header>
 
       <div className="mt-6 grid min-h-0 flex-1 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(22rem,0.75fr)]">

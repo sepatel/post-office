@@ -378,6 +378,7 @@ export interface WorkflowStep {
 export interface WorkflowLlmAttempt {
   id: number;
   rule_index: number;
+  rule_name: string | null;
   provider_id: string | null;
   provider_name: string | null;
   model: string | null;
@@ -410,8 +411,35 @@ export interface WorkflowEvent {
   created_at: string;
 }
 
+export interface WorkflowRouteProvider {
+  id: string;
+  name: string;
+  model: string;
+  endpoint: string;
+  enabled: boolean;
+}
+
+export interface WorkflowRuleContext {
+  rule_index: number;
+  rule_count: number;
+  rule_name: string;
+  policy_id: string;
+  policy_name: string;
+  providers: WorkflowRouteProvider[];
+}
+
+export interface WorkflowRetrySummary {
+  automatic_attempt_count: number;
+  automatic_attempt_limit: number;
+  automatic_retry_scheduled_count: number;
+  manual_retry_requested_count: number;
+  historical_retry_policy: boolean;
+}
+
 export interface WorkflowMessageDetail extends WorkflowQueueItem {
   body: string;
+  current_rule: WorkflowRuleContext | null;
+  retry_summary: WorkflowRetrySummary;
   steps: WorkflowStep[];
   llm_attempts: WorkflowLlmAttempt[];
   action_plans: WorkflowActionPlan[];
