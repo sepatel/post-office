@@ -11,7 +11,7 @@ import {
   gmailRecentMessages,
   rulesTest,
   rulesApply,
-  bulkEvaluate,
+  evaluateMessages,
   configGet,
   gmailListLabels,
   ruleMemoriesList,
@@ -25,7 +25,7 @@ import {
   type RuleRequestMetrics,
   type TestResult,
   type ApplyResult,
-  type BulkVerdict,
+  type EvaluationVerdict,
 } from "../lib/tauri";
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
@@ -141,9 +141,9 @@ export default function RuleEditor() {
   const [testing, setTesting] = useState(false);
   const [applying, setApplying] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [bulkResults, setBulkResults] = useState<BulkVerdict[] | null>(null);
-  const [bulkEvaluating, setBulkEvaluating] = useState(false);
-  const [bulkApplyingId, setBulkApplyingId] = useState<string | null>(null);
+  const [evaluationResults, setEvaluationResults] = useState<EvaluationVerdict[] | null>(null);
+  const [evaluatingMessages, setEvaluatingMessages] = useState(false);
+  const [applyingEvaluationId, setApplyingEvaluationId] = useState<string | null>(null);
   const [pendingMemories, setPendingMemories] = useState<MemoryInput[]>([]);
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [metrics, setMetrics] = useState<RuleMetrics | null>(null);
@@ -548,7 +548,7 @@ export default function RuleEditor() {
     }
     setTestResult(null);
     setApplyResult(null);
-    setBulkResults(null);
+    setEvaluationResults(null);
     toast.success("Proposal applied to draft. Save to persist.");
   }
 
@@ -599,27 +599,27 @@ export default function RuleEditor() {
     }
   }
 
-  async function handleBulkEvaluate() {
+  async function handleEvaluateMessages() {
     if (recentMessages.length === 0) return;
-    setBulkEvaluating(true);
-    setBulkResults(null);
+    setEvaluatingMessages(true);
+    setEvaluationResults(null);
     try {
-      const results = await bulkEvaluate(
+      const results = await evaluateMessages(
         buildRulePayload(),
         recentMessages.map((m) => m.id)
       );
-      setBulkResults(results);
+      setEvaluationResults(results);
     } catch (e) {
       const msg = typeof e === "string" ? e : String(e);
       toast.error(msg);
-      console.error("Failed to evaluate batch:", e);
+      console.error("Failed to evaluate messages:", e);
     } finally {
-      setBulkEvaluating(false);
+      setEvaluatingMessages(false);
     }
   }
 
-  async function handleBulkApply(verdict: BulkVerdict) {
-    setBulkApplyingId(verdict.email_id);
+  async function handleApplyEvaluation(verdict: EvaluationVerdict) {
+    setApplyingEvaluationId(verdict.email_id);
     try {
       await rulesApply(buildRulePayload(), verdict.email_id);
       toast.success(`Applied to ${verdict.email_id.slice(0, 8)}…`);
@@ -628,7 +628,7 @@ export default function RuleEditor() {
       toast.error(msg);
       console.error("Failed to apply rule:", e);
     } finally {
-      setBulkApplyingId(null);
+      setApplyingEvaluationId(null);
     }
   }
 
@@ -956,7 +956,7 @@ export default function RuleEditor() {
             className="w-full"
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            The same policy is used for production, testing, bulk evaluation, and rule chat.
+            The same policy is used for production, testing, multi-message evaluation, and rule chat.
           </p>
           {selectedRoutingPolicy && (
             <div className="mt-2 rounded-lg bg-gray-100 px-3 py-2 text-xs text-gray-500 dark:bg-gray-800 dark:text-gray-400">
@@ -1001,7 +1001,7 @@ export default function RuleEditor() {
             className="w-full"
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Server default omits the output cap and lets the model choose. A fixed budget bounds latency and cost.
+            Server default uses the default completion budget (up to 8,192 tokens for thinking plus the answer). A fixed budget bounds latency and cost.
           </p>
         </div>}
 
@@ -1286,24 +1286,24 @@ export default function RuleEditor() {
           <div className="border-t border-gray-200 dark:border-gray-700 pt-4 mt-4">
             <div className="flex items-center justify-between mb-2">
               <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-200">
-                Evaluate many at once
+                Evaluate loaded messages
               </h4>
               <button
-                onClick={handleBulkEvaluate}
-                disabled={recentMessages.length === 0 || bulkEvaluating}
+                onClick={handleEvaluateMessages}
+                disabled={recentMessages.length === 0 || evaluatingMessages}
                 className="bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 disabled:opacity-50 px-3 py-1 rounded text-sm transition-colors"
               >
-                {bulkEvaluating ? "Evaluating…" : "Evaluate loaded messages"}
+                {evaluatingMessages ? "Evaluating…" : "Evaluate loaded messages"}
               </button>
             </div>
             <p className="text-xs text-gray-400 dark:text-gray-500 mb-2">
-              Runs the rule across all loaded messages in one batched pass
+              Runs the rule across loaded messages sequentially, one email at a time
               (structured-action rules need no LLM call). Apply the ones you like.
             </p>
 
-            {bulkResults && (
+            {evaluationResults && (
               <div className="space-y-2">
-                {bulkResults.map((v) => {
+                {evaluationResults.map((v) => {
                   const msg = recentMessages.find((m) => m.id === v.email_id);
                   const canApply = v.matched && v.actions.length > 0;
                   return (
@@ -1352,11 +1352,11 @@ export default function RuleEditor() {
                         )}
                       </div>
                       <button
-                        onClick={() => handleBulkApply(v)}
-                        disabled={!canApply || bulkApplyingId === v.email_id}
+                        onClick={() => handleApplyEvaluation(v)}
+                        disabled={!canApply || applyingEvaluationId === v.email_id}
                         className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-2 py-1 rounded text-xs transition-colors"
                       >
-                        {bulkApplyingId === v.email_id ? "Applying…" : "Apply"}
+                        {applyingEvaluationId === v.email_id ? "Applying…" : "Apply"}
                       </button>
                     </div>
                   );

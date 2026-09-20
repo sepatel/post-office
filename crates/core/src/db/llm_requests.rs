@@ -121,7 +121,7 @@ mod tests {
     use crate::rules::models::Action;
 
     #[test]
-    fn deduplicates_a_batched_request_and_keeps_its_email_count() {
+    fn deduplicates_a_request_and_keeps_its_message_count() {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
         let rule = db
@@ -154,7 +154,7 @@ mod tests {
             provider_id: Some("local".into()),
             model: "test".into(),
             policy_id: Some("default".into()),
-            email_count: 3,
+            email_count: 1,
             prompt_tokens: Some(120),
             completion_tokens: Some(30),
             total_tokens: Some(150),
@@ -171,7 +171,7 @@ mod tests {
             .with_llm_requests(|repo| repo.rule_metrics("test@example.com"))
             .unwrap();
         assert_eq!(metrics[0].requests_24h, 1);
-        assert_eq!(metrics[0].emails_24h, 3);
+        assert_eq!(metrics[0].emails_24h, 1);
         assert_eq!(metrics[0].total_tokens_24h, 150);
     }
 }

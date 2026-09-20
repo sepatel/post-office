@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
@@ -12,7 +12,6 @@ use crate::db::llm_requests::NewLlmRequest;
 use crate::db::Database;
 use crate::gmail::models::{Message, MessageRef};
 use crate::rules::engine::{no_action_reason, resolve_rule, Outcome, Resolved};
-use crate::rules::evaluation::bulk_resolve_for_rule;
 use crate::rules::matcher;
 
 const LAST_RUN_KEY: &str = "last_run";
@@ -44,7 +43,8 @@ pub struct ProcessingState {
     pub stop_requested: Arc<AtomicBool>,
     pub backfill_running: Arc<AtomicBool>,
     pub backfill_cancel_requested: Arc<AtomicBool>,
-    // Keep "Last Run" moving even when cycles fail.
+    pub inference_retry_running: Arc<AtomicBool>,
+    // The resume floor advances after every completed live message.
     pub last_processed: Option<chrono::DateTime<Utc>>,
     pub last_successful: Option<chrono::DateTime<Utc>>,
     pub emails_processed_today: usize,
@@ -86,6 +86,7 @@ impl ProcessingState {
             stop_requested: Arc::new(AtomicBool::new(false)),
             backfill_running: Arc::new(AtomicBool::new(false)),
             backfill_cancel_requested: Arc::new(AtomicBool::new(false)),
+            inference_retry_running: Arc::new(AtomicBool::new(false)),
             last_processed: None,
             last_successful: None,
             emails_processed_today: 0,
@@ -131,8 +132,8 @@ pub async fn mark_last_successful(
 }
 
 /// Resolve the timestamp from which polling should fetch messages. We resume
-/// from the most recent successful run so a restart never re-scans history:
-/// 1. the persisted `processing.last_run` (set after each cycle), else
+/// from the most recent processed message so a restart never re-scans history:
+/// 1. the persisted `processing.last_run` (set after each live message), else
 /// 2. the newest `history.created_at` (messages we've already handled), else
 /// 3. `now` — a brand-new install anchors to the present and ignores old mail.
 fn resolve_floor(db: &Arc<Database>, account_email: &str) -> DateTime<Utc> {
@@ -155,11 +156,29 @@ fn resolve_floor(db: &Arc<Database>, account_email: &str) -> DateTime<Utc> {
     Utc::now()
 }
 
-/// Persist the last successful run so restarts resume from here instead of
-/// walking the entire mailbox again.
+/// Persist the live-processing resume floor.
 fn persist_last_run(db: &Arc<Database>, account_email: &str, ts: DateTime<Utc>) {
     let value = ts.to_rfc3339();
     let _ = db.with_config(|repo| repo.set(&processing_key(account_email, LAST_RUN_KEY), &value));
+}
+
+async fn advance_resume_floor(
+    db: &Arc<Database>,
+    state: &Arc<Mutex<ProcessingState>>,
+    account_email: &str,
+    source: PipelineSource,
+    email: &Message,
+) {
+    if !matches!(source, PipelineSource::Cycle) {
+        return;
+    }
+    let Some(timestamp) =
+        message_internal_millis(email).and_then(|millis| Utc.timestamp_millis_opt(millis).single())
+    else {
+        return;
+    };
+    persist_last_run(db, account_email, timestamp);
+    state.lock().await.last_processed = Some(timestamp);
 }
 
 fn persist_last_successful(db: &Arc<Database>, account_email: &str, ts: DateTime<Utc>) {
@@ -234,6 +253,27 @@ pub struct PipelineRunResult {
     pub stopped: bool,
 }
 
+struct LoadedEmail {
+    email: Message,
+    email_from: Option<String>,
+    email_subject: Option<String>,
+    email_sent_at: Option<String>,
+    rule: Option<Rule>,
+}
+
+fn sort_oldest_first(emails: &mut [LoadedEmail]) {
+    emails.sort_by(|left, right| {
+        message_internal_millis(&left.email)
+            .unwrap_or(i64::MAX)
+            .cmp(&message_internal_millis(&right.email).unwrap_or(i64::MAX))
+            .then_with(|| left.email.id.cmp(&right.email.id))
+    });
+}
+
+fn message_internal_millis(email: &Message) -> Option<i64> {
+    email.internal_date.trim().parse().ok()
+}
+
 /// Build the Gmail query window, appending `after:<unix_seconds>` and
 /// optionally `before:<unix_seconds>`.
 fn effective_query(base: &str, floor: DateTime<Utc>, until: Option<DateTime<Utc>>) -> String {
@@ -296,11 +336,10 @@ pub async fn run_processing_loop(
             }
         };
 
-        // Last Run tracks attempts; resume floor tracks last success.
+        // The query boundary excludes mail that arrives while this cycle runs.
         let cycle_started = Utc::now();
         {
             let mut s = state.lock().await;
-            s.last_processed = Some(cycle_started);
             s.last_cycle_error = None;
             s.active_phase = "running".into();
         }
@@ -309,6 +348,7 @@ pub async fn run_processing_loop(
         let llm = InferenceRouter::from_config_with_runtime(&cfg, inference_runtime.clone())
             .with_database(db.as_ref().clone());
         let stop_requested = state.lock().await.stop_requested.clone();
+        let mut process_next_batch = false;
         match run_pipeline(
             &db,
             &account_email,
@@ -328,8 +368,6 @@ pub async fn run_processing_loop(
         {
             Ok(result) => {
                 tracing::info!("Processed {} emails this cycle", result.processed);
-                // Only successful cycles move the persisted resume floor.
-                persist_last_run(&db, &account_email, cycle_started);
                 persist_last_successful(&db, &account_email, cycle_started);
                 let _ = db.with_accounts(|repo| repo.record_success(&account_email));
                 let mut s = state.lock().await;
@@ -337,6 +375,8 @@ pub async fn run_processing_loop(
                 s.last_cycle_count = result.processed;
                 s.active_phase = "idle".into();
                 s.current_progress = None;
+                process_next_batch = cfg.polling_max_per_cycle > 0
+                    && result.processed >= cfg.polling_max_per_cycle as usize;
             }
             Err(e) => {
                 tracing::error!("Processing cycle failed: {}", e);
@@ -355,20 +395,6 @@ pub async fn run_processing_loop(
             }
         }
 
-        if let Err(e) = process_pending_inference_jobs(
-            &db,
-            &account_email,
-            &state,
-            &mut gmail,
-            &llm,
-            &cfg,
-            &on_progress,
-        )
-        .await
-        {
-            tracing::warn!("Inference retry worker failed: {}", e);
-        }
-
         // Hide stale progress between cycles.
         publish_progress(
             &state,
@@ -379,6 +405,9 @@ pub async fn run_processing_loop(
 
         state.lock().await.active_phase = "idle".into();
 
+        if process_next_batch {
+            continue;
+        }
         tokio::time::sleep(interval).await;
     }
 }
@@ -394,29 +423,83 @@ pub async fn process_pending_inference_jobs(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut processed = 0;
     while processed < 20 {
+        let processing = state.lock().await;
+        if processing.paused.load(Ordering::Relaxed)
+            || processing.stop_requested.load(Ordering::Relaxed)
+        {
+            break;
+        }
+        drop(processing);
+
         let Some(job) = db.with_inference(|repo| repo.claim_next(account_email))? else {
             break;
         };
 
+        let started = Instant::now();
         let result = process_inference_job(db, account_email, gmail, llm, config, &job).await;
+        let duration_ms = elapsed_ms(started);
         match result {
-            Ok(JobOutcome::Succeeded) => {
-                db.with_inference(|repo| repo.mark_success(account_email, job.id))?;
+            Ok(JobOutcome::Succeeded(attempt)) => {
+                record_inference_attempt(
+                    db,
+                    job.id,
+                    attempt.provider_id.as_deref(),
+                    attempt.model.as_deref(),
+                    "succeeded",
+                    None,
+                    Some(duration_ms),
+                );
+                let updated = db.with_inference(|repo| {
+                    repo.mark_success(account_email, job.id, job.lease_until.as_deref())
+                })?;
+                log_lost_inference_lease(job.id, updated);
             }
-            Ok(JobOutcome::Skipped(reason)) => {
-                db.with_inference(|repo| repo.mark_skipped(account_email, job.id, &reason))?;
+            Ok(JobOutcome::Skipped(reason, attempt)) => {
+                record_inference_attempt(
+                    db,
+                    job.id,
+                    attempt.provider_id.as_deref(),
+                    attempt.model.as_deref(),
+                    "skipped",
+                    Some(&reason),
+                    Some(duration_ms),
+                );
+                let updated = db.with_inference(|repo| {
+                    repo.mark_skipped(account_email, job.id, &reason, job.lease_until.as_deref())
+                })?;
+                log_lost_inference_lease(job.id, updated);
             }
             Err(error) => {
                 let error = error.to_string();
                 let delay = retry_delay(job.attempt_count);
-                db.with_inference(|repo| {
-                    repo.record_attempt(job.id, None, None, "error", Some(&error))?;
+                record_inference_attempt(
+                    db,
+                    job.id,
+                    None,
+                    None,
+                    "error",
+                    Some(&error),
+                    Some(duration_ms),
+                );
+                let updated = db.with_inference(|repo| {
                     if job.attempt_count + 1 >= MAX_INFERENCE_ATTEMPTS {
-                        repo.mark_dead_letter(account_email, job.id, &error)
+                        repo.mark_dead_letter(
+                            account_email,
+                            job.id,
+                            &error,
+                            job.lease_until.as_deref(),
+                        )
                     } else {
-                        repo.mark_retry(account_email, job.id, &error, delay)
+                        repo.mark_retry(
+                            account_email,
+                            job.id,
+                            &error,
+                            delay,
+                            job.lease_until.as_deref(),
+                        )
                     }
                 })?;
+                log_lost_inference_lease(job.id, updated);
             }
         }
 
@@ -444,8 +527,23 @@ pub async fn process_pending_inference_jobs(
 }
 
 enum JobOutcome {
-    Succeeded,
-    Skipped(String),
+    Succeeded(AttemptMetadata),
+    Skipped(String, AttemptMetadata),
+}
+
+#[derive(Default)]
+struct AttemptMetadata {
+    provider_id: Option<String>,
+    model: Option<String>,
+}
+
+impl From<&Resolved> for AttemptMetadata {
+    fn from(resolved: &Resolved) -> Self {
+        Self {
+            provider_id: resolved.llm_provider.clone(),
+            model: resolved.llm_model.clone(),
+        }
+    }
 }
 
 async fn process_inference_job(
@@ -457,13 +555,22 @@ async fn process_inference_job(
     job: &crate::db::inference::InferenceJob,
 ) -> Result<JobOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let Some(rule_id) = job.rule_id else {
-        return Ok(JobOutcome::Skipped("Rule was deleted".into()));
+        return Ok(JobOutcome::Skipped(
+            "Rule was deleted".into(),
+            AttemptMetadata::default(),
+        ));
     };
     let Some(rule) = db.with_rules(|repo| repo.get_by_id(account_email, rule_id))? else {
-        return Ok(JobOutcome::Skipped("Rule was deleted".into()));
+        return Ok(JobOutcome::Skipped(
+            "Rule was deleted".into(),
+            AttemptMetadata::default(),
+        ));
     };
     if !rule.enabled {
-        return Ok(JobOutcome::Skipped("Rule is disabled".into()));
+        return Ok(JobOutcome::Skipped(
+            "Rule is disabled".into(),
+            AttemptMetadata::default(),
+        ));
     }
 
     let email = gmail.get_message(&job.email_id).await?;
@@ -472,7 +579,10 @@ async fn process_inference_job(
         .iter()
         .all(|condition| matcher::evaluate(condition, &email, &email.label_ids))
     {
-        return Ok(JobOutcome::Skipped("Rule no longer matches".into()));
+        return Ok(JobOutcome::Skipped(
+            "Rule no longer matches".into(),
+            AttemptMetadata::default(),
+        ));
     }
 
     let memories = db.with_rule_memory(|repo| {
@@ -487,6 +597,7 @@ async fn process_inference_job(
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
     record_llm_request(db, account_email, &rule, &resolved, "retry");
+    let attempt = AttemptMetadata::from(&resolved);
     match resolved.outcome {
         // A retried email still has to reach lower-priority rules, otherwise a
         // transient failure on one rule silently exempts it from all the others.
@@ -507,7 +618,7 @@ async fn process_inference_job(
                 PipelineSource::parse(&job.source),
             )
             .await?;
-            return Ok(JobOutcome::Skipped("Rule did not match".into()));
+            return Ok(JobOutcome::Skipped("Rule did not match".into(), attempt));
         }
         // The re-ask asked about this email alone, so a reply that still cannot
         // be read is the model's answer, not a correlation problem to retry.
@@ -516,6 +627,7 @@ async fn process_inference_job(
                 resolved
                     .diagnostic
                     .unwrap_or_else(|| "Invalid LLM decision".into()),
+                attempt,
             ));
         }
         Outcome::Matched => {}
@@ -557,7 +669,7 @@ async fn process_inference_job(
             job,
         )
         .await?;
-        return Ok(JobOutcome::Succeeded);
+        return Ok(JobOutcome::Succeeded(attempt));
     }
 
     let error = execute_actions(gmail, &email.id, &resolved.actions, &labels)
@@ -605,7 +717,7 @@ async fn process_inference_job(
         job,
     )
     .await?;
-    Ok(JobOutcome::Succeeded)
+    Ok(JobOutcome::Succeeded(attempt))
 }
 
 #[expect(
@@ -651,6 +763,87 @@ fn retry_delay(attempt_count: i64) -> u64 {
 /// Past this the backoff is over an hour a try, so the job is parked for manual
 /// retry instead of being re-run forever.
 const MAX_INFERENCE_ATTEMPTS: i64 = 7;
+const INITIAL_INFERENCE_RETRY_DELAY_SECS: u64 = 60;
+
+fn elapsed_ms(started: Instant) -> i64 {
+    started.elapsed().as_millis().min(i64::MAX as u128) as i64
+}
+
+fn log_lost_inference_lease(job_id: i64, updated: bool) {
+    if !updated {
+        tracing::warn!(
+            "Inference job {} changed owner before its result could be recorded",
+            job_id
+        );
+    }
+}
+
+fn record_inference_attempt(
+    db: &Arc<Database>,
+    job_id: i64,
+    provider_id: Option<&str>,
+    model: Option<&str>,
+    status: &str,
+    error: Option<&str>,
+    duration_ms: Option<i64>,
+) {
+    if let Err(error) = db.with_inference(|repo| {
+        repo.record_attempt(job_id, provider_id, model, status, error, duration_ms)
+    }) {
+        tracing::warn!(
+            "Failed to record inference attempt for job {}: {}",
+            job_id,
+            error
+        );
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The retry record keeps the original decision's routing and timing telemetry together."
+)]
+fn enqueue_inference_retry(
+    db: &Arc<Database>,
+    llm: &InferenceRouter,
+    account_email: &str,
+    email_id: &str,
+    rule: &Rule,
+    source: PipelineSource,
+    status: &str,
+    error: Option<&str>,
+    duration_ms: Option<i64>,
+    attempt: AttemptMetadata,
+) {
+    match db.with_inference(|repo| {
+        repo.enqueue(
+            account_email,
+            email_id,
+            rule.id,
+            source.as_str(),
+            error,
+            INITIAL_INFERENCE_RETRY_DELAY_SECS,
+        )
+    }) {
+        Ok(job_id) => {
+            record_inference_attempt(
+                db,
+                job_id,
+                attempt.provider_id.as_deref(),
+                attempt.model.as_deref(),
+                status,
+                error,
+                duration_ms,
+            );
+            llm.wake_retry_worker();
+        }
+        Err(error) => tracing::warn!(
+            "Failed to queue inference retry for email {} and rule {}: {}",
+            email_id,
+            rule.id,
+            error
+        ),
+    }
+}
 
 fn insert_history_entry(
     db: &Arc<Database>,
@@ -691,7 +884,7 @@ fn record_llm_request(
         provider_id: resolved.llm_provider.clone(),
         model: model.to_string(),
         policy_id: Some(rule.inference_policy.clone()),
-        email_count: resolved.llm_request_email_count.unwrap_or(1) as i64,
+        email_count: 1,
         prompt_tokens: resolved.prompt_tokens.map(|value| value as i64),
         completion_tokens: resolved.completion_tokens.map(|value| value as i64),
         total_tokens: resolved.total_tokens.map(|value| value as i64),
@@ -722,7 +915,7 @@ async fn run_pipeline(
     source: PipelineSource,
     on_progress: &impl Fn(OpProgress),
 ) -> Result<PipelineRunResult, Box<dyn std::error::Error + Send + Sync>> {
-    let total_limit = message_limit.map(|v| v as usize);
+    let total_limit = message_limit.map(|limit| limit as usize);
     publish_progress(
         state,
         on_progress,
@@ -772,23 +965,13 @@ async fn run_pipeline(
             }
             None => 500,
         };
-
-        if page_size == 0 {
-            break;
-        }
-
         let page = gmail
             .list_messages_page(query, page_size, page_token.as_deref())
             .await?;
         let mut page_messages = page.messages.unwrap_or_default();
-
         if let Some(limit) = total_limit {
-            let remaining = limit.saturating_sub(messages.len());
-            if page_messages.len() > remaining {
-                page_messages.truncate(remaining);
-            }
+            page_messages.truncate(limit.saturating_sub(messages.len()));
         }
-
         messages.extend(page_messages);
         publish_progress(
             state,
@@ -887,13 +1070,6 @@ async fn process_message_refs(
     cancel_requested: Option<&AtomicBool>,
     on_progress: &impl Fn(OpProgress),
 ) -> Result<PipelineRunResult, Box<dyn std::error::Error + Send + Sync>> {
-    struct MatchedEmail {
-        email: Message,
-        email_from: Option<String>,
-        email_subject: Option<String>,
-        email_sent_at: Option<String>,
-    }
-
     let total = messages.len();
     publish_progress(
         state,
@@ -903,7 +1079,7 @@ async fn process_message_refs(
     .await;
 
     let mut count = 0;
-    let mut grouped: Vec<(Rule, Vec<MatchedEmail>)> = Vec::new();
+    let mut emails = Vec::with_capacity(messages.len());
 
     for msg_ref in messages {
         if cancel_requested
@@ -1016,51 +1192,26 @@ async fn process_message_refs(
             .min_by_key(|r| r.priority)
             .cloned();
 
-        if let Some(rule) = matched_rule {
-            let item = MatchedEmail {
-                email,
-                email_from,
-                email_subject,
-                email_sent_at,
-            };
-
-            if let Some((_, bucket)) = grouped
-                .iter_mut()
-                .find(|(existing_rule, _)| existing_rule.id == rule.id)
-            {
-                bucket.push(item);
-            } else {
-                grouped.push((rule, vec![item]));
-            }
-            continue;
-        }
-
-        count += 1;
-        publish_progress(
-            state,
-            on_progress,
-            with_current_email(
-                op_progress(
-                    source,
-                    "processing",
-                    count,
-                    Some(total),
-                    Some("No rule matched".into()),
-                ),
-                Some(&email.id),
-                email_from.as_deref(),
-                email_subject.as_deref(),
-                email_sent_at.as_deref(),
-            ),
-        )
-        .await;
+        emails.push(LoadedEmail {
+            email,
+            email_from,
+            email_subject,
+            email_sent_at,
+            rule: matched_rule,
+        });
     }
 
-    for (rule, emails) in grouped {
-        if emails.is_empty() {
-            continue;
-        }
+    sort_oldest_first(&mut emails);
+    let labels = if emails.iter().any(|item| item.rule.is_some()) {
+        crate::gmail::cached_labels(db, gmail, account_email)
+            .await
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+    let labels_ref = labels.as_slice();
 
+    for item in emails {
         if cancel_requested
             .map(|flag| flag.load(Ordering::Relaxed))
             .unwrap_or(false)
@@ -1089,7 +1240,9 @@ async fn process_message_refs(
             });
         }
 
-        if let Some(first) = emails.first() {
+        let Some(rule) = item.rule else {
+            count += 1;
+            advance_resume_floor(db, state, account_email, source, &item.email).await;
             publish_progress(
                 state,
                 on_progress,
@@ -1099,220 +1252,8 @@ async fn process_message_refs(
                         "processing",
                         count,
                         Some(total),
-                        Some(format!(
-                            "Evaluating {} email{} with rule \"{}\"",
-                            emails.len(),
-                            if emails.len() == 1 { "" } else { "s" },
-                            rule.name
-                        )),
+                        Some("No rule matched".into()),
                     ),
-                    Some(&first.email.id),
-                    first.email_from.as_deref(),
-                    first.email_subject.as_deref(),
-                    first.email_sent_at.as_deref(),
-                ),
-            )
-            .await;
-        }
-
-        let memories: Vec<String> = db.with_rule_memory(|repo| {
-            repo.list_for_rule(rule.id)
-                .map(|rows| rows.into_iter().map(|e| e.text).collect::<Vec<String>>())
-                .unwrap_or_default()
-        });
-        let batch_messages: Vec<Message> = emails.iter().map(|item| item.email.clone()).collect();
-        let labels = crate::gmail::cached_labels(db, gmail, account_email)
-            .await
-            .unwrap_or_default();
-        let labels_ref = labels.as_slice();
-        let batch = match bulk_resolve_for_rule(
-            llm,
-            &rule,
-            &batch_messages,
-            &memories,
-            labels_ref,
-            cancel_requested,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                for item in &emails {
-                    let _ = db.with_inference(|repo| {
-                        repo.enqueue(account_email, &item.email.id, rule.id, source.as_str())
-                    });
-                    insert_history_entry(
-                        db,
-                        account_email,
-                        NewHistoryEntry {
-                            email_id: item.email.id.clone(),
-                            email_from: item.email_from.clone(),
-                            email_subject: item.email_subject.clone(),
-                            rule_id: Some(rule.id),
-                            rule_name: Some(rule.name.clone()),
-                            action: "RESOLVE_RULE".into(),
-                            status: "error".into(),
-                            llm_model: None,
-                            llm_response: None,
-                            error: Some(e.to_string()),
-                            duration_ms: None,
-                            llm_provider: None,
-                            policy_id: Some(rule.inference_policy.clone()),
-                        },
-                    );
-                    count += 1;
-                    publish_progress(
-                        state,
-                        on_progress,
-                        with_current_email(
-                            op_progress(source, "processing", count, Some(total), None),
-                            Some(&item.email.id),
-                            item.email_from.as_deref(),
-                            item.email_subject.as_deref(),
-                            item.email_sent_at.as_deref(),
-                        ),
-                    )
-                    .await;
-                }
-                continue;
-            }
-        };
-
-        for (item, resolved) in emails.iter().zip(batch.resolved.iter()) {
-            if resolved.outcome != Outcome::Matched || resolved.actions.is_empty() {
-                let (action, status, error) = match resolved.outcome {
-                    Outcome::NoMatch => (
-                        "NO_MATCH".to_string(),
-                        "skipped".to_string(),
-                        Some("Rule did not match".to_string()),
-                    ),
-                    // Batching is an optimization; when its output cannot be
-                    // trusted, re-ask about this email alone rather than guess
-                    // or drop it. The floor moves past emails only once.
-                    Outcome::Unparsed => {
-                        let _ = db.with_inference(|repo| {
-                            repo.enqueue(account_email, &item.email.id, rule.id, source.as_str())
-                        });
-                        (
-                            "RETRY_QUEUED".to_string(),
-                            "error".to_string(),
-                            Some(
-                                resolved
-                                    .diagnostic
-                                    .clone()
-                                    .unwrap_or_else(|| "Invalid LLM decision".to_string()),
-                            ),
-                        )
-                    }
-                    Outcome::Matched => (
-                        "SKIP".to_string(),
-                        "skipped".to_string(),
-                        Some(no_action_reason(
-                            &rule,
-                            labels_ref,
-                            resolved.diagnostic.as_deref(),
-                        )),
-                    ),
-                };
-                insert_history_entry(
-                    db,
-                    account_email,
-                    NewHistoryEntry {
-                        email_id: item.email.id.clone(),
-                        email_from: item.email_from.clone(),
-                        email_subject: item.email_subject.clone(),
-                        rule_id: Some(rule.id),
-                        rule_name: Some(rule.name.clone()),
-                        action,
-                        status,
-                        llm_model: resolved.llm_model.clone(),
-                        llm_response: Some(resolved.llm_response.clone()),
-                        error,
-                        duration_ms: resolved.llm_duration_ms.map(|v| v as i64),
-                        llm_provider: resolved.llm_provider.clone(),
-                        policy_id: Some(rule.inference_policy.clone()),
-                    },
-                );
-
-                record_llm_request(db, account_email, &rule, resolved, source.as_str());
-                if continues_past(&rule, resolved.outcome) {
-                    process_fallthrough(
-                        db,
-                        account_email,
-                        gmail,
-                        llm,
-                        config,
-                        &item.email,
-                        item.email_from.as_deref(),
-                        item.email_subject.as_deref(),
-                        rules,
-                        rule.id,
-                        labels_ref,
-                        source,
-                    )
-                    .await?;
-                }
-            } else {
-                let error = execute_actions(gmail, &item.email.id, &resolved.actions, labels_ref)
-                    .await
-                    .err()
-                    .map(|err| err.to_string());
-
-                let action_str = resolved
-                    .actions
-                    .iter()
-                    .map(|action| history_action_label(action, labels_ref))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let status = if error.is_none() { "success" } else { "error" };
-
-                insert_history_entry(
-                    db,
-                    account_email,
-                    NewHistoryEntry {
-                        email_id: item.email.id.clone(),
-                        email_from: item.email_from.clone(),
-                        email_subject: item.email_subject.clone(),
-                        rule_id: Some(rule.id),
-                        rule_name: Some(rule.name.clone()),
-                        action: action_str,
-                        status: status.into(),
-                        llm_model: resolved.llm_model.clone(),
-                        llm_response: Some(resolved.llm_response.clone()),
-                        error,
-                        duration_ms: resolved.llm_duration_ms.map(|v| v as i64),
-                        llm_provider: resolved.llm_provider.clone(),
-                        policy_id: Some(rule.inference_policy.clone()),
-                    },
-                );
-
-                record_llm_request(db, account_email, &rule, resolved, source.as_str());
-
-                if continues_past(&rule, Outcome::Matched) {
-                    process_fallthrough(
-                        db,
-                        account_email,
-                        gmail,
-                        llm,
-                        config,
-                        &item.email,
-                        item.email_from.as_deref(),
-                        item.email_subject.as_deref(),
-                        rules,
-                        rule.id,
-                        labels_ref,
-                        source,
-                    )
-                    .await?;
-                }
-            }
-
-            count += 1;
-            publish_progress(
-                state,
-                on_progress,
-                with_current_email(
-                    op_progress(source, "processing", count, Some(total), None),
                     Some(&item.email.id),
                     item.email_from.as_deref(),
                     item.email_subject.as_deref(),
@@ -1320,32 +1261,257 @@ async fn process_message_refs(
                 ),
             )
             .await;
-        }
+            continue;
+        };
 
-        if batch.stopped {
+        if db.with_inference(|repo| repo.has_active(account_email, &item.email.id, rule.id))? {
+            count += 1;
+            advance_resume_floor(db, state, account_email, source, &item.email).await;
             publish_progress(
                 state,
                 on_progress,
-                op_progress(
-                    source,
-                    "stopped",
-                    count,
-                    Some(total),
-                    Some("Backfill stopped".into()),
+                with_current_email(
+                    op_progress(
+                        source,
+                        "processing",
+                        count,
+                        Some(total),
+                        Some("Waiting for queued inference retry".into()),
+                    ),
+                    Some(&item.email.id),
+                    item.email_from.as_deref(),
+                    item.email_subject.as_deref(),
+                    item.email_sent_at.as_deref(),
                 ),
             )
             .await;
-
-            if update_today {
-                state.lock().await.emails_processed_today += count;
-            }
-
-            return Ok(PipelineRunResult {
-                processed: count,
-                discovered: total,
-                stopped: true,
-            });
+            continue;
         }
+
+        publish_progress(
+            state,
+            on_progress,
+            with_current_email(
+                op_progress(
+                    source,
+                    "processing",
+                    count,
+                    Some(total),
+                    Some(format!("Evaluating email with rule \"{}\"", rule.name)),
+                ),
+                Some(&item.email.id),
+                item.email_from.as_deref(),
+                item.email_subject.as_deref(),
+                item.email_sent_at.as_deref(),
+            ),
+        )
+        .await;
+        let memories: Vec<String> = db.with_rule_memory(|repo| {
+            repo.list_for_rule(rule.id)
+                .map(|rows| rows.into_iter().map(|e| e.text).collect::<Vec<String>>())
+                .unwrap_or_default()
+        });
+        let started = Instant::now();
+        let resolved = match resolve_rule(llm, &rule, &item.email, &memories, labels_ref).await {
+            Ok(result) => result,
+            Err(e) => {
+                let error = e.to_string();
+                enqueue_inference_retry(
+                    db,
+                    llm,
+                    account_email,
+                    &item.email.id,
+                    &rule,
+                    source,
+                    "error",
+                    Some(&error),
+                    Some(elapsed_ms(started)),
+                    AttemptMetadata::default(),
+                );
+                insert_history_entry(
+                    db,
+                    account_email,
+                    NewHistoryEntry {
+                        email_id: item.email.id.clone(),
+                        email_from: item.email_from.clone(),
+                        email_subject: item.email_subject.clone(),
+                        rule_id: Some(rule.id),
+                        rule_name: Some(rule.name.clone()),
+                        action: "RESOLVE_RULE".into(),
+                        status: "error".into(),
+                        llm_model: None,
+                        llm_response: None,
+                        error: Some(error),
+                        duration_ms: None,
+                        llm_provider: None,
+                        policy_id: Some(rule.inference_policy.clone()),
+                    },
+                );
+                count += 1;
+                advance_resume_floor(db, state, account_email, source, &item.email).await;
+                publish_progress(
+                    state,
+                    on_progress,
+                    with_current_email(
+                        op_progress(source, "processing", count, Some(total), None),
+                        Some(&item.email.id),
+                        item.email_from.as_deref(),
+                        item.email_subject.as_deref(),
+                        item.email_sent_at.as_deref(),
+                    ),
+                )
+                .await;
+                continue;
+            }
+        };
+
+        if resolved.outcome != Outcome::Matched || resolved.actions.is_empty() {
+            let (action, status, error) = match resolved.outcome {
+                Outcome::NoMatch => (
+                    "NO_MATCH".to_string(),
+                    "skipped".to_string(),
+                    Some("Rule did not match".to_string()),
+                ),
+                Outcome::Unparsed => {
+                    let diagnostic = resolved
+                        .diagnostic
+                        .clone()
+                        .unwrap_or_else(|| "Invalid LLM decision".to_string());
+                    enqueue_inference_retry(
+                        db,
+                        llm,
+                        account_email,
+                        &item.email.id,
+                        &rule,
+                        source,
+                        "unparsed",
+                        Some(&diagnostic),
+                        resolved.llm_duration_ms.map(|value| value as i64),
+                        AttemptMetadata::from(&resolved),
+                    );
+                    (
+                        "RETRY_QUEUED".to_string(),
+                        "error".to_string(),
+                        Some(diagnostic),
+                    )
+                }
+                Outcome::Matched => (
+                    "SKIP".to_string(),
+                    "skipped".to_string(),
+                    Some(no_action_reason(
+                        &rule,
+                        labels_ref,
+                        resolved.diagnostic.as_deref(),
+                    )),
+                ),
+            };
+            insert_history_entry(
+                db,
+                account_email,
+                NewHistoryEntry {
+                    email_id: item.email.id.clone(),
+                    email_from: item.email_from.clone(),
+                    email_subject: item.email_subject.clone(),
+                    rule_id: Some(rule.id),
+                    rule_name: Some(rule.name.clone()),
+                    action,
+                    status,
+                    llm_model: resolved.llm_model.clone(),
+                    llm_response: Some(resolved.llm_response.clone()),
+                    error,
+                    duration_ms: resolved.llm_duration_ms.map(|v| v as i64),
+                    llm_provider: resolved.llm_provider.clone(),
+                    policy_id: Some(rule.inference_policy.clone()),
+                },
+            );
+
+            record_llm_request(db, account_email, &rule, &resolved, source.as_str());
+            if continues_past(&rule, resolved.outcome) {
+                process_fallthrough(
+                    db,
+                    account_email,
+                    gmail,
+                    llm,
+                    config,
+                    &item.email,
+                    item.email_from.as_deref(),
+                    item.email_subject.as_deref(),
+                    rules,
+                    rule.id,
+                    labels_ref,
+                    source,
+                )
+                .await?;
+            }
+        } else {
+            let error = execute_actions(gmail, &item.email.id, &resolved.actions, labels_ref)
+                .await
+                .err()
+                .map(|err| err.to_string());
+
+            let action_str = resolved
+                .actions
+                .iter()
+                .map(|action| history_action_label(action, labels_ref))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let status = if error.is_none() { "success" } else { "error" };
+
+            insert_history_entry(
+                db,
+                account_email,
+                NewHistoryEntry {
+                    email_id: item.email.id.clone(),
+                    email_from: item.email_from.clone(),
+                    email_subject: item.email_subject.clone(),
+                    rule_id: Some(rule.id),
+                    rule_name: Some(rule.name.clone()),
+                    action: action_str,
+                    status: status.into(),
+                    llm_model: resolved.llm_model.clone(),
+                    llm_response: Some(resolved.llm_response.clone()),
+                    error,
+                    duration_ms: resolved.llm_duration_ms.map(|v| v as i64),
+                    llm_provider: resolved.llm_provider.clone(),
+                    policy_id: Some(rule.inference_policy.clone()),
+                },
+            );
+
+            record_llm_request(db, account_email, &rule, &resolved, source.as_str());
+
+            if continues_past(&rule, Outcome::Matched) {
+                process_fallthrough(
+                    db,
+                    account_email,
+                    gmail,
+                    llm,
+                    config,
+                    &item.email,
+                    item.email_from.as_deref(),
+                    item.email_subject.as_deref(),
+                    rules,
+                    rule.id,
+                    labels_ref,
+                    source,
+                )
+                .await?;
+            }
+        }
+
+        count += 1;
+        advance_resume_floor(db, state, account_email, source, &item.email).await;
+        publish_progress(
+            state,
+            on_progress,
+            with_current_email(
+                op_progress(source, "processing", count, Some(total), None),
+                Some(&item.email.id),
+                item.email_from.as_deref(),
+                item.email_subject.as_deref(),
+                item.email_sent_at.as_deref(),
+            ),
+        )
+        .await;
     }
 
     let mut s = state.lock().await;
@@ -1394,17 +1560,31 @@ async fn process_fallthrough(
     let candidates = crate::rules::engine::rules_after(rules, current_rule_id, email);
     let considered = candidates.len();
     for rule in candidates {
+        if db.with_inference(|repo| repo.has_active(account_email, &email.id, rule.id))? {
+            return Ok(());
+        }
         let memories = db.with_rule_memory(|repo| {
             repo.list_for_rule(rule.id)
                 .map(|rows| rows.into_iter().map(|entry| entry.text).collect::<Vec<_>>())
                 .unwrap_or_default()
         });
+        let started = Instant::now();
         let resolved = match resolve_rule(llm, rule, email, &memories, labels).await {
             Ok(resolved) => resolved,
             Err(error) => {
-                let _ = db.with_inference(|repo| {
-                    repo.enqueue(account_email, &email.id, rule.id, source.as_str())
-                });
+                let error = error.to_string();
+                enqueue_inference_retry(
+                    db,
+                    llm,
+                    account_email,
+                    &email.id,
+                    rule,
+                    source,
+                    "error",
+                    Some(&error),
+                    Some(elapsed_ms(started)),
+                    AttemptMetadata::default(),
+                );
                 record_fallthrough(
                     db,
                     account_email,
@@ -1417,7 +1597,7 @@ async fn process_fallthrough(
                     None,
                     "RESOLVE_RULE",
                     "error",
-                    Some(error.to_string()),
+                    Some(error),
                 );
                 return Ok(());
             }
@@ -1440,9 +1620,22 @@ async fn process_fallthrough(
                 );
             }
             Outcome::Unparsed => {
-                let _ = db.with_inference(|repo| {
-                    repo.enqueue(account_email, &email.id, rule.id, source.as_str())
-                });
+                let diagnostic = resolved
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "Invalid LLM decision".into());
+                enqueue_inference_retry(
+                    db,
+                    llm,
+                    account_email,
+                    &email.id,
+                    rule,
+                    source,
+                    "unparsed",
+                    Some(&diagnostic),
+                    resolved.llm_duration_ms.map(|value| value as i64),
+                    AttemptMetadata::from(&resolved),
+                );
                 record_fallthrough(
                     db,
                     account_email,
@@ -1455,12 +1648,7 @@ async fn process_fallthrough(
                     Some(&resolved),
                     "RETRY_QUEUED",
                     "error",
-                    Some(
-                        resolved
-                            .diagnostic
-                            .clone()
-                            .unwrap_or_else(|| "Invalid LLM decision".into()),
-                    ),
+                    Some(diagnostic),
                 );
                 return Ok(());
             }
@@ -1689,6 +1877,44 @@ fn history_action_label(action: &ParsedAction, labels: &[crate::gmail::models::L
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loaded_email(id: &str, internal_date: &str) -> LoadedEmail {
+        LoadedEmail {
+            email: Message {
+                id: id.into(),
+                thread_id: String::new(),
+                label_ids: vec![],
+                snippet: String::new(),
+                history_id: String::new(),
+                internal_date: internal_date.into(),
+                size_estimate: 0,
+                payload: None,
+            },
+            email_from: None,
+            email_subject: None,
+            email_sent_at: None,
+            rule: None,
+        }
+    }
+
+    #[test]
+    fn loaded_emails_are_processed_oldest_first() {
+        let mut emails = vec![
+            loaded_email("middle", "200"),
+            loaded_email("oldest", "100"),
+            loaded_email("newest", "300"),
+        ];
+
+        sort_oldest_first(&mut emails);
+
+        assert_eq!(
+            emails
+                .iter()
+                .map(|item| item.email.id.as_str())
+                .collect::<Vec<_>>(),
+            ["oldest", "middle", "newest"]
+        );
+    }
 
     fn rule(continue_after_match: bool) -> Rule {
         Rule {

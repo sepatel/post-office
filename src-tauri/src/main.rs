@@ -38,24 +38,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn processing_state_for(&self, account_email: &str) -> Arc<Mutex<ProcessingState>> {
-        let mut states = self.processing_states.lock().unwrap();
-        states
-            .entry(account_email.to_string())
-            .or_insert_with(|| {
-                let mut processing = ProcessingState::new();
-                post_office_core::processing::hydrate_processing_state(
-                    &self.db,
-                    &mut processing,
-                    account_email,
-                );
-                if let Ok(Some(account)) = self.db.with_accounts(|repo| repo.get(account_email)) {
-                    processing
-                        .paused
-                        .store(account.paused, std::sync::atomic::Ordering::Relaxed);
-                }
-                Arc::new(Mutex::new(processing))
-            })
-            .clone()
+        commands::processing_state_for(&self.processing_states, &self.db, account_email)
     }
 
     pub fn remove_processing_state(&self, account_email: &str) {
@@ -108,8 +91,16 @@ fn main() {
 
             app.manage(app_state);
 
+            let state_handle = app.state::<AppState>();
+            commands::spawn_inference_retry_worker(
+                app.handle().clone(),
+                Arc::new(state_handle.db.clone()),
+                state_handle.processing_states.clone(),
+                state_handle.config.clone(),
+                state_handle.inference_runtime.clone(),
+            );
+
             if !config.sync_enabled {
-                let state_handle = app.state::<AppState>();
                 let accounts = state_handle
                     .db
                     .with_accounts(|repo| repo.list())
@@ -155,7 +146,7 @@ fn main() {
             commands::gmail_recent_messages,
             commands::rules_test,
             commands::rules_apply,
-            commands::bulk_evaluate,
+            commands::evaluate_messages,
             commands::history_list,
             commands::rules_metrics,
             commands::rule_roi_metrics,

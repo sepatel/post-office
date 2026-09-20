@@ -63,10 +63,10 @@ export interface LlmConfigUpdate {
   default_model: string;
   input_cost_per_million_usd: number;
   output_cost_per_million_usd: number;
+  max_tokens: number;
   timeout_secs: number;
   context_window_tokens: number;
   legacy_max_concurrent_requests: number;
-  legacy_max_emails_per_request: number;
   legacy_output_tokens_per_second: number;
   legacy_chat_reasoning_effort: string;
   legacy_name: string;
@@ -318,7 +318,7 @@ export async function rulesApply(
   return invoke("rules_apply", { rule, messageId });
 }
 
-export interface BulkVerdict {
+export interface EvaluationVerdict {
   email_id: string;
   matched: boolean;
   indeterminate: boolean;
@@ -328,11 +328,11 @@ export interface BulkVerdict {
   diagnostic: string | null;
 }
 
-export async function bulkEvaluate(
+export async function evaluateMessages(
   rule: RulePayload,
   messageIds: string[]
-): Promise<BulkVerdict[]> {
-  return invoke("bulk_evaluate", { rule, messageIds });
+): Promise<EvaluationVerdict[]> {
+  return invoke("evaluate_messages", { rule, messageIds });
 }
 
 export async function historyList(
@@ -390,6 +390,7 @@ export interface InferenceAttempt {
   model: string | null;
   status: string;
   error: string | null;
+  duration_ms: number | null;
   created_at: string;
 }
 

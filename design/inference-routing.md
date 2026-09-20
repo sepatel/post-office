@@ -10,11 +10,11 @@ different retention policies per upstream model.
 Rules reference a routing policy by id. A policy contains an ordered list of
 provider profile ids, a minimum quality tier, a privacy requirement, and whether
 fallback is allowed. The same policy applies to production inference, testing,
-bulk evaluation, and rule chat.
+multi-message evaluation, and rule chat.
 
 The router retries transient provider failures, then moves to the next eligible
 candidate. It never chooses a candidate below the policy's quality or privacy
-requirements. When no eligible candidate succeeds, production work is retained
+requirements. When all eligible candidates fail, production work is retained
 in the local inference queue and retried with backoff.
 
 Rate limits are different from ordinary transient failures: a 429 immediately
@@ -25,10 +25,12 @@ request storm or hide why a route is temporarily unavailable.
 
 ## Durable Jobs
 
-An inference job stores only the Gmail message id, rule id, source, retry state,
-and error metadata. The worker reloads the current rule on every attempt, so
-rule edits affect retries by default. Each completed inference records the
-provider, model, and policy used in local history.
+An inference job stores the Gmail message id, rule id, source, retry state, and
+error metadata. A dedicated worker wakes when work is queued and independently
+of polling or sync batches, so retry work does not wait behind a long mailbox
+run. It reloads the current rule on every attempt, so rule edits affect retries
+by default. Each attempt records its result and duration; completed inference
+also records the provider, model, and policy used in local history.
 
 Gmail cursor replay can advance after a failed inference has been durably
 queued. This separates mailbox ingestion from provider availability and means

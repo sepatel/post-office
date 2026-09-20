@@ -63,8 +63,7 @@ pub fn rules_after<'a>(rules: &'a [Rule], current_rule_id: i64, email: &Message)
 
 /// Resolves one email against one rule.
 ///
-/// A single email is a batch of one, so this shares every prompt, contract, and
-/// parser with the batched path rather than maintaining a second grammar.
+/// Rule decisions always use a single-email prompt and response contract.
 pub async fn resolve_rule(
     llm: &InferenceRouter,
     rule: &Rule,
@@ -79,20 +78,8 @@ pub async fn resolve_rule(
     if !conditions_match {
         return Ok(Resolved::declined());
     }
-    let batch = crate::rules::evaluation::bulk_resolve_for_rule(
-        llm,
-        rule,
-        std::slice::from_ref(email),
-        memories,
-        labels,
-        None,
-    )
-    .await?;
-    let resolved = batch
-        .resolved
-        .into_iter()
-        .next()
-        .unwrap_or_else(Resolved::declined);
+    let resolved =
+        crate::rules::evaluation::resolve_decision(llm, rule, email, memories, labels).await?;
     if resolved.llm_unavailable {
         return Err(RuleError::Llm(crate::llm::LlmError::Routing(
             resolved
@@ -156,7 +143,6 @@ pub struct Resolved {
     pub total_tokens: Option<u32>,
     pub llm_duration_ms: Option<u64>,
     pub llm_request_key: Option<String>,
-    pub llm_request_email_count: Option<u32>,
     pub llm_unavailable: bool,
     /// A non-fatal deviation from the response contract, kept so it surfaces in
     /// the UI without blocking the decision.
@@ -182,7 +168,6 @@ impl Resolved {
             total_tokens: None,
             llm_duration_ms: None,
             llm_request_key: None,
-            llm_request_email_count: None,
             llm_unavailable: false,
             diagnostic: None,
         }
@@ -651,7 +636,10 @@ const DECLINE_KEYWORDS: [&str; 3] = ["NO_MATCH", "NO MATCH", "SKIP"];
 /// email's answer over several lines reads the same as the single line the
 /// contract asks for.
 pub(crate) fn parse_row(line: &str, menu: &[Choice]) -> Result<Row, RowError> {
-    let text = strip_markers(line);
+    // A template wrapper around an otherwise valid decision reads the same as
+    // the bare decision: `<1: NO_MATCH | ...>` and `1: <NO_MATCH | ...>` both
+    // decline. Markers are stripped before and after so either ordering lands.
+    let text = strip_markers(strip_angle_wrapper(&strip_markers(line)));
     let fields: Vec<&str> = text
         .split(['|', '\n'])
         .map(str::trim)
@@ -840,6 +828,20 @@ fn strip_markers(line: &str) -> String {
         line = rest;
     }
     line.to_string()
+}
+
+/// Drops one outer angle-bracket wrapper copied from a templated example.
+/// Models that see `<choice> | <reason>` in the prompt mirror the delimiters
+/// around an otherwise valid decision, e.g. `<NO_MATCH | banking>`.
+fn strip_angle_wrapper(line: &str) -> &str {
+    let trimmed = line.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('<') && trimmed.ends_with('>') {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if !inner.is_empty() {
+            return inner;
+        }
+    }
+    trimmed
 }
 
 static MARKER_RE: LazyLock<Regex> =
@@ -1118,6 +1120,25 @@ mod tests {
     fn a_marker_is_never_mistaken_for_the_decision_itself() {
         assert!(!parse_row("1: NO_MATCH", &[]).unwrap().matched);
         assert!(parse_row("MATCH", &[]).unwrap().matched);
+    }
+
+    /// The reported Gemma failure: the model wrapped an otherwise valid
+    /// decision in the template's angle brackets.
+    #[test]
+    fn a_template_wrapper_around_a_decision_still_reads() {
+        for line in [
+            "<NO_MATCH | banking notification>",
+            "<1: NO_MATCH | banking notification>",
+            "1: <NO_MATCH | banking notification>",
+            "<NO_MATCH | The email content is about banking and data sharing with Splitwise from Chase, which does not relate to music.>",
+        ] {
+            let row = parse_row(line, &[]).expect("row should parse");
+            assert!(!row.matched, "{line:?} should decline");
+        }
+
+        let row = parse_row("<Bills | Monthly power bill.>", &menu())
+            .expect("wrapped choice should parse");
+        assert_eq!(row.chosen, vec![ParsedAction::Label("Label_2".into())]);
     }
 
     #[test]

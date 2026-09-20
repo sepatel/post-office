@@ -10,6 +10,13 @@ use crate::db::Database;
 
 const MAX_RETRIES_PER_PROVIDER: usize = 2;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
+/// Hard ceiling for rule decisions. llama.cpp slots must hold prompt plus
+/// thinking plus answer, so unbounded or very large caps can exhaust a slot
+/// (observed as `Context size has been exceeded` with runaway generations).
+/// Thinking tokens count toward this cap, so it must leave room for reasoning
+/// plus the final decision line.
+pub const MAX_DECISION_MAX_TOKENS: u32 = 8_192;
+const MIN_DECISION_MAX_TOKENS: u32 = 64;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -75,8 +82,6 @@ pub struct LlmProviderProfile {
     pub context_window_tokens: u32,
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: u8,
-    #[serde(default = "default_max_emails_per_request")]
-    pub max_emails_per_request: u8,
     #[serde(default)]
     pub output_tokens_per_second: f64,
     #[serde(default = "default_chat_reasoning_effort")]
@@ -381,7 +386,7 @@ impl InferenceRouter {
         }
 
         Err(LlmError::Routing(format!(
-            "policy '{}' exhausted: {}",
+            "All eligible LLM providers failed for policy '{}': {}",
             policy.id,
             failures.join("; ")
         )))
@@ -433,25 +438,25 @@ impl InferenceRouter {
         context_window.saturating_sub(reserved_completion_tokens as usize)
     }
 
-    pub fn max_emails_per_request(
-        &self,
-        policy_id: &str,
-        reasoning_effort: ReasoningEffort,
-    ) -> usize {
-        if reasoning_effort != ReasoningEffort::Off {
-            return 1;
-        }
-        self.policy_limit(policy_id, |profile| profile.max_emails_per_request as usize)
-    }
-
     pub fn max_concurrent_requests(&self, policy_id: &str) -> usize {
         self.policy_limit(policy_id, |profile| {
             profile.max_concurrent_requests as usize
         })
     }
 
+    /// Effective completion budget for a rule decision, always capped.
+    ///
+    /// A missing per-rule budget falls back to the configured global default,
+    /// clamped to the decision ceiling so a stale large `llm.max_tokens`
+    /// cannot produce an unbounded request.
+    pub fn decision_max_tokens(&self, decision_max_tokens: Option<u32>) -> u32 {
+        decision_max_tokens
+            .unwrap_or(self.max_tokens)
+            .clamp(MIN_DECISION_MAX_TOKENS, MAX_DECISION_MAX_TOKENS)
+    }
+
     pub fn decision_context_reserve_tokens(&self, decision_max_tokens: Option<u32>) -> u32 {
-        decision_max_tokens.unwrap_or(self.max_tokens).max(64)
+        self.decision_max_tokens(decision_max_tokens)
     }
 
     pub fn output_tokens_per_second(&self, policy_id: &str) -> Option<f64> {
@@ -473,6 +478,10 @@ impl InferenceRouter {
                 .min(u32::MAX as usize) as u32,
             capacity.min(u32::MAX as usize) as u32,
         ))
+    }
+
+    pub fn wake_retry_worker(&self) {
+        self.runtime.wake_retry_worker();
     }
 
     fn policy(&self, policy_id: &str) -> LlmRoutingPolicy {
@@ -605,7 +614,6 @@ fn legacy_profile(config: &crate::config::AppConfig) -> LlmProviderProfile {
         timeout_secs: config.llm_timeout_secs,
         context_window_tokens: config.llm_context_window_tokens,
         max_concurrent_requests: config.llm_legacy_max_concurrent_requests,
-        max_emails_per_request: config.llm_legacy_max_emails_per_request,
         output_tokens_per_second: config.llm_legacy_output_tokens_per_second,
         chat_reasoning_effort: config.llm_legacy_chat_reasoning_effort,
         enabled: config.llm_legacy_enabled,
@@ -659,6 +667,7 @@ fn is_retryable(error: &LlmError) -> bool {
             async_openai::error::OpenAIError::Reqwest(reqwest_error) => {
                 reqwest_error.is_timeout() || reqwest_error.is_connect()
             }
+            async_openai::error::OpenAIError::StreamError(_) => true,
             async_openai::error::OpenAIError::ApiError(response) => {
                 response.status_code.as_u16() >= 500 || response.status_code.as_u16() == 429
             }
@@ -766,10 +775,6 @@ fn default_max_concurrent_requests() -> u8 {
     1
 }
 
-fn default_max_emails_per_request() -> u8 {
-    3
-}
-
 fn default_chat_reasoning_effort() -> ReasoningEffort {
     ReasoningEffort::ServerDefault
 }
@@ -819,22 +824,48 @@ mod tests {
     }
 
     #[test]
-    fn thinking_decisions_are_given_one_email_and_reserve_their_configured_budget() {
+    fn decisions_reserve_their_configured_budget() {
         let router = InferenceRouter::from_config(&AppConfig::default());
 
-        assert_eq!(
-            router.max_emails_per_request("default", ReasoningEffort::Off),
-            3
-        );
-        assert_eq!(
-            router.max_emails_per_request("default", ReasoningEffort::ServerDefault),
-            1
-        );
         assert_eq!(
             router.decision_context_reserve_tokens(None),
             AppConfig::default().llm_max_tokens
         );
         assert_eq!(router.decision_context_reserve_tokens(Some(4_096)), 4_096);
+    }
+
+    #[test]
+    fn decisions_are_always_capped_at_8k() {
+        let router = InferenceRouter::from_config(&AppConfig {
+            llm_max_tokens: 32_767,
+            ..AppConfig::default()
+        });
+
+        assert_eq!(router.decision_max_tokens(None), 8_192);
+        assert_eq!(router.decision_max_tokens(Some(1_024)), 1_024);
+        assert_eq!(router.decision_max_tokens(Some(32_767)), 8_192);
+        assert_eq!(router.decision_max_tokens(Some(0)), 64);
+        assert_eq!(
+            router.decision_context_reserve_tokens(None),
+            router.decision_max_tokens(None)
+        );
+    }
+
+    #[test]
+    fn same_endpoint_shares_one_permit_across_accounts() {
+        use crate::llm::InferenceRuntime;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let runtime = InferenceRuntime::default();
+            let endpoint = "http://shade:4000/v1";
+            let _permit = runtime.acquire(endpoint, 1).await;
+            assert_eq!(runtime.available_permits(endpoint, 1), 0);
+            assert_eq!(runtime.available_permits("http://other:4000/v1", 1), 1);
+        });
     }
 
     #[test]
@@ -849,6 +880,15 @@ mod tests {
         };
 
         assert_eq!(attempts_per_candidate(&policy), 1);
+    }
+
+    #[test]
+    fn retries_stream_transport_failures() {
+        let error = LlmError::Api(async_openai::error::OpenAIError::StreamError(Box::new(
+            async_openai::error::StreamError::EventStream("connection reset".into()),
+        )));
+
+        assert!(is_retryable(&error));
     }
 
     #[test]

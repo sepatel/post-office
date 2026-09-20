@@ -20,7 +20,7 @@ pub enum LlmError {
     #[error("Failed to parse LLM JSON response: {0}")]
     ParseError(String),
 
-    #[error("No eligible LLM provider was available: {0}")]
+    #[error("{0}")]
     Routing(String),
 
     #[error("LLM request cancelled")]

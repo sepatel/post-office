@@ -196,7 +196,7 @@ export default function PipelineDryRunDialog({
           requests but does not change Gmail, history, or recovery jobs.
         </p>
         <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
-          This runs one message at a time, so a previous batched decision with thinking off may differ.
+          Rule decisions run one message at a time, so this matches the processing pipeline.
         </p>
         <p className="mt-1 break-all text-xs text-gray-400 dark:text-gray-500">Message {emailId}</p>
 

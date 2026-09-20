@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone)]
 pub struct InferenceRuntime {
     gates: Arc<Mutex<HashMap<String, Gate>>>,
     reasoning_passthrough: Arc<Mutex<HashSet<String>>>,
     cancellation: watch::Sender<u64>,
+    retry_wake: Arc<Notify>,
 }
 
 impl Default for InferenceRuntime {
@@ -17,6 +18,7 @@ impl Default for InferenceRuntime {
             gates: Arc::new(Mutex::new(HashMap::new())),
             reasoning_passthrough: Arc::new(Mutex::new(HashSet::new())),
             cancellation,
+            retry_wake: Arc::new(Notify::new()),
         }
     }
 }
@@ -62,6 +64,14 @@ impl InferenceRuntime {
         self.cancellation.send_modify(|generation| {
             *generation = generation.wrapping_add(1);
         });
+    }
+
+    pub fn wake_retry_worker(&self) {
+        self.retry_wake.notify_one();
+    }
+
+    pub async fn wait_for_retry_work(&self) {
+        self.retry_wake.notified().await;
     }
 
     pub fn requires_reasoning_passthrough(&self, endpoint: &str, model: &str) -> bool {

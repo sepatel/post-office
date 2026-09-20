@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::db::Database;
 use crate::db::rules::CreateRuleRequest;
+use crate::db::Database;
 use crate::gmail::models::Label;
 use crate::llm::{LlmProviderProfile, LlmRoutingPolicy, ReasoningEffort};
 use crate::rules::models::{Action, Condition};
@@ -97,8 +97,6 @@ pub struct BackupLlmLegacy {
     #[serde(default)]
     pub legacy_max_concurrent_requests: u8,
     #[serde(default)]
-    pub legacy_max_emails_per_request: u8,
-    #[serde(default)]
     pub legacy_output_tokens_per_second: f64,
     #[serde(default = "default_reasoning_effort")]
     pub legacy_chat_reasoning_effort: ReasoningEffort,
@@ -139,7 +137,6 @@ impl BackupLlmLegacy {
             input_cost_per_million_usd: config.llm_input_cost_per_million_usd,
             output_cost_per_million_usd: config.llm_output_cost_per_million_usd,
             legacy_max_concurrent_requests: config.llm_legacy_max_concurrent_requests,
-            legacy_max_emails_per_request: config.llm_legacy_max_emails_per_request,
             legacy_output_tokens_per_second: config.llm_legacy_output_tokens_per_second,
             legacy_chat_reasoning_effort: config.llm_legacy_chat_reasoning_effort,
             legacy_name: config.llm_legacy_name.clone(),
@@ -159,7 +156,6 @@ impl BackupLlmLegacy {
         config.llm_input_cost_per_million_usd = self.input_cost_per_million_usd;
         config.llm_output_cost_per_million_usd = self.output_cost_per_million_usd;
         config.llm_legacy_max_concurrent_requests = self.legacy_max_concurrent_requests;
-        config.llm_legacy_max_emails_per_request = self.legacy_max_emails_per_request;
         config.llm_legacy_output_tokens_per_second = self.legacy_output_tokens_per_second;
         config.llm_legacy_chat_reasoning_effort = self.legacy_chat_reasoning_effort;
         config.llm_legacy_name = self.legacy_name.clone();
@@ -411,7 +407,11 @@ pub fn apply_import(
             warnings.push("Skipped a routing policy with an empty id.".into());
             continue;
         }
-        if config.llm_routing_policies.iter().any(|p| p.id == policy.id) {
+        if config
+            .llm_routing_policies
+            .iter()
+            .any(|p| p.id == policy.id)
+        {
             warnings.push(format!(
                 "Routing policy '{}' already exists; kept the existing one.",
                 policy.id
@@ -604,7 +604,6 @@ mod tests {
                     timeout_secs: 45,
                     context_window_tokens: 8192,
                     max_concurrent_requests: 4,
-                    max_emails_per_request: 6,
                     output_tokens_per_second: 30.0,
                     chat_reasoning_effort: ReasoningEffort::ServerDefault,
                     enabled: true,
