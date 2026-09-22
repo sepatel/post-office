@@ -12,6 +12,7 @@ pub struct TokenStore {
     pub refresh: String,
 }
 
+#[derive(Clone)]
 pub struct GmailAuth {
     pub(crate) access_token: String,
     pub(crate) refresh_token: String,

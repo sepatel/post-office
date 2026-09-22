@@ -7,6 +7,7 @@ interface GateValue {
   setConnection: (c: GmailConnection | null) => void;
   activeEmail: string | null;
   accounts: Account[];
+  refreshAccountList: () => Promise<void>;
   refreshAccounts: () => Promise<void>;
   selectAccount: (email: string) => Promise<void>;
 }
@@ -17,6 +18,7 @@ export const GateContext = createContext<GateValue>({
   setConnection: () => {},
   activeEmail: null,
   accounts: [],
+  refreshAccountList: async () => {},
   refreshAccounts: async () => {},
   selectAccount: async () => {},
 });

@@ -128,14 +128,14 @@ export default function AccountSwitcher() {
           <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
           <button
             type="button"
-            onClick={() => { setOpen(false); navigate("/settings"); }}
+            onClick={() => { setOpen(false); navigate("/settings?tab=mailbox"); }}
             className="w-full px-3 py-2 text-left text-sm text-blue-600 hover:bg-gray-100 dark:text-blue-300 dark:hover:bg-gray-700"
           >
             Add account
           </button>
           <button
             type="button"
-            onClick={() => { setOpen(false); navigate("/settings"); }}
+            onClick={() => { setOpen(false); navigate("/settings?tab=mailbox"); }}
             className="w-full px-3 py-2 text-left text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
           >
             Manage accounts

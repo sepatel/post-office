@@ -159,6 +159,12 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (22)", [])?;
         }
+        if !migration_applied(&transaction, 23)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/023_workflow_model_route.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (23)", [])?;
+        }
         transaction.commit()
     }
 

@@ -117,6 +117,9 @@ pub enum RuleError {
     #[error(transparent)]
     Llm(#[from] crate::llm::LlmError),
 
+    #[error("{0}")]
+    IncompleteDecision(String),
+
     #[error("Rule prompt and context exceed the model input budget")]
     PromptTooLarge,
 }

@@ -26,7 +26,7 @@ fn map_rule_row(row: &Row<'_>) -> Result<Rule> {
             "\"{}\"",
             row.get::<_, String>(12)?
         ))
-        .unwrap_or(crate::llm::ReasoningEffort::ServerDefault),
+        .unwrap_or(crate::llm::ReasoningEffort::Off),
         decision_max_tokens: row.get(13)?,
         continue_after_match: row.get::<_, i32>(14)? != 0,
     })

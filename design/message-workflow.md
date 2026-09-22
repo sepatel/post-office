@@ -25,9 +25,12 @@ of truth.
 
 ## Runs
 
-Runs are processed serially for an account by a durable worker. A run owns a
-lease token and moves through `queued`, `processing`, `retry_wait`, `completed`,
-`needs_attention`, or `resolved_externally`.
+The durable worker prepares runs in queue order, then dispatches each LLM
+decision through its endpoint/model lane. A lane uses its configured request
+limit, defaulting to one; work for another idle model does not wait behind a
+busy lane. A run owns a lease token only while its current preparation or
+decision stage is active and moves through `queued`, `processing`,
+`retry_wait`, `completed`, `needs_attention`, or `resolved_externally`.
 
 Each run references an immutable ruleset snapshot containing:
 
@@ -42,7 +45,9 @@ messages use it; existing runs keep their original behavior.
 The worker evaluates one message through the ruleset in priority order.
 Condition skips and LLM decisions are written to `workflow_steps`. A `NO_MATCH`
 advances to the next rule. A match normally completes the run; a rule with
-`continue_after_match` advances after its action is confirmed.
+`continue_after_match` advances after its action is confirmed. Each decision
+returns to the queue before its next rule, so a message moving from taxonomy to
+the default model never blocks unrelated default-model work.
 
 Labels planned by a confirmed earlier action update the local message snapshot
 before the next rule runs. Lower-priority rules therefore see the result within

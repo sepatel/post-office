@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import { Link, NavLink, Outlet } from "react-router-dom";
 import AccountSwitcher from "./AccountSwitcher";
 import ThemeToggle from "./ThemeToggle";
 import { processingPause, processingResume, processingStatus, workflowQueueSummary, type WorkflowQueueSummary } from "../lib/tauri";
@@ -18,7 +18,7 @@ function count(summary: WorkflowQueueSummary | null, state: string) {
 }
 
 export default function Layout() {
-  const { activeEmail } = useGate();
+  const { activeEmail, accounts, connection, refreshAccountList } = useGate();
   const [summary, setSummary] = useState<WorkflowQueueSummary | null>(null);
   const [paused, setPaused] = useState(false);
   const [changingPause, setChangingPause] = useState(false);
@@ -27,6 +27,7 @@ export default function Layout() {
     const [nextSummary, status] = await Promise.all([workflowQueueSummary(), processingStatus() as Promise<{ paused: boolean }>]);
     setSummary(nextSummary);
     setPaused(status.paused);
+    void refreshAccountList().catch(() => undefined);
   }
 
   useEffect(() => {
@@ -48,6 +49,23 @@ export default function Layout() {
 
   const attention = count(summary, "needs_attention");
   const active = count(summary, "processing") + count(summary, "retry_wait") + count(summary, "queued");
+  const erroredAccounts = accounts.filter((account) => account.status === "error");
+  const gmailNeedsAttention = Boolean(connection?.error) || erroredAccounts.length > 0;
+  const gmailLabel = erroredAccounts.length > 1
+    ? `${erroredAccounts.length} Gmail accounts need reconnecting`
+    : "Gmail needs reconnecting";
+  const healthLabel = paused
+    ? "Worker paused"
+    : attention > 0
+      ? "Attention needed"
+      : gmailNeedsAttention
+        ? "Gmail needs attention"
+        : "Automation healthy";
+  const healthTone = paused
+    ? "bg-amber-500"
+    : attention > 0 || gmailNeedsAttention
+      ? "bg-red-500"
+      : "bg-emerald-500";
   return (
     <div className="flex min-h-screen bg-gray-50 text-gray-900 transition-colors dark:bg-gray-900 dark:text-gray-100">
       <aside className="sticky top-0 flex h-screen w-64 shrink-0 flex-col border-r border-gray-200 bg-gray-100 dark:border-gray-700 dark:bg-gray-800">
@@ -70,10 +88,19 @@ export default function Layout() {
           <NavLink to="/legacy-history" className="mt-4 block px-3 py-2 text-xs text-gray-400 hover:text-gray-700 dark:hover:text-gray-200">Legacy archive</NavLink>
         </nav>
         <div className="border-t border-gray-200 p-3 dark:border-gray-700">
+          {gmailNeedsAttention && (
+            <Link to="/settings?tab=mailbox" className="mb-3 block rounded-xl border border-red-200 bg-red-50 p-3 text-red-900 transition-colors hover:bg-red-100 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-100 dark:hover:bg-red-950/50">
+              <div className="flex items-center gap-2 text-xs font-semibold">
+                <span className="h-2 w-2 rounded-full bg-red-500" />
+                {gmailLabel}
+              </div>
+              <p className="mt-1 text-[11px] text-red-700 dark:text-red-200">Open Mailbox settings to reconnect.</p>
+            </Link>
+          )}
           <div className="rounded-xl border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-900/30">
             <div className="flex items-center gap-2 text-xs font-medium">
-              <span className={`h-2 w-2 rounded-full ${paused ? "bg-amber-500" : attention > 0 ? "bg-red-500" : "bg-emerald-500"}`} />
-              {paused ? "Worker paused" : attention > 0 ? "Attention needed" : "Automation healthy"}
+              <span className={`h-2 w-2 rounded-full ${healthTone}`} />
+              {healthLabel}
             </div>
             <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">{active} active · {count(summary, "completed")} completed</p>
             <button type="button" onClick={() => void togglePause()} disabled={changingPause} className={`mt-3 w-full rounded-lg px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 ${paused ? "bg-emerald-600 hover:bg-emerald-700" : "bg-amber-600 hover:bg-amber-700"}`}>{changingPause ? "Updating…" : paused ? "Resume worker" : "Pause worker"}</button>

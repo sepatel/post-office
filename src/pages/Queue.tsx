@@ -4,6 +4,7 @@ import {
   workflowMessagesList,
   workflowQueueSummary,
   workflowRetryNow,
+  workflowRetryWithCurrentRules,
   type WorkflowQueueItem,
   type WorkflowQueueSummary,
   type WorkflowRunState,
@@ -90,6 +91,16 @@ export default function Queue() {
     }
   }
 
+  async function retryWithCurrentRules(item: WorkflowQueueItem) {
+    setRetrying(item.run_id);
+    try {
+      await workflowRetryWithCurrentRules(item.run_id);
+      await load();
+    } finally {
+      setRetrying(null);
+    }
+  }
+
   const attention = count(summary, "needs_attention");
   return (
     <div className="mx-auto flex min-h-full max-w-7xl flex-col gap-6">
@@ -166,6 +177,7 @@ export default function Queue() {
                   <span>Message #{item.message_id}</span>
                   <span>v{item.rule_set_version}</span>
                   {item.next_rule_name && <span>Rule {item.next_rule_index + 1}: {item.next_rule_name}</span>}
+                  {item.next_model && <span>Model lane: {item.next_model}</span>}
                   <span>{formatLocalDateTime(item.created_at, "-")}</span>
                 </div>
                 {((item.state === "needs_attention" || item.state === "retry_wait") ? item.last_error : item.preview) && (
@@ -184,6 +196,16 @@ export default function Queue() {
                   <span className="text-xs text-amber-700 dark:text-amber-300">
                     Retry {formatLocalDateTime(item.next_attempt_at, "scheduled")}
                   </span>
+                )}
+                {(item.state === "needs_attention" || item.state === "retry_wait") && (
+                  <button
+                    type="button"
+                    onClick={() => void retryWithCurrentRules(item)}
+                    disabled={retrying === item.run_id}
+                    className="rounded-lg border border-blue-300 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/30"
+                  >
+                    {retrying === item.run_id ? "Queuing…" : "Retry with current rules"}
+                  </button>
                 )}
                 {(item.state === "needs_attention" || item.state === "retry_wait") && (
                   <button

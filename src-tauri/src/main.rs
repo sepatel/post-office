@@ -88,6 +88,7 @@ fn main() {
             }
             let config_arc = Arc::new(Mutex::new(config.clone()));
             let inference_runtime = InferenceRuntime::default();
+            post_office_core::llm::configure_runtime(&config, &inference_runtime);
             let processing_states =
                 Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let sync_trigger = sync_runtime::spawn(
@@ -157,6 +158,7 @@ fn main() {
             commands::workflow_messages_list,
             commands::workflow_message_get,
             commands::workflow_retry_now,
+            commands::workflow_retry_with_current_rules,
             commands::workflow_rule_set_status,
             commands::workflow_endpoint_status,
             commands::history_list,

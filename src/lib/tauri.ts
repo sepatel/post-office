@@ -346,6 +346,9 @@ export interface WorkflowQueueItem {
   updated_at: string;
   completed_at: string | null;
   rule_set_version: number;
+  next_provider_id: string | null;
+  next_endpoint: string | null;
+  next_model: string | null;
 }
 
 export interface WorkflowStateCount {
@@ -465,6 +468,10 @@ export async function workflowMessageGet(messageId: number): Promise<WorkflowMes
 
 export async function workflowRetryNow(runId: number): Promise<boolean> {
   return invoke("workflow_retry_now", { runId });
+}
+
+export async function workflowRetryWithCurrentRules(runId: number): Promise<boolean> {
+  return invoke("workflow_retry_with_current_rules", { runId });
 }
 
 export interface WorkflowRuleSetStatus {

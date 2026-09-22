@@ -112,7 +112,7 @@ export default function RuleEditor() {
   const [priority, setPriority] = useState(0);
   const [enabled, setEnabled] = useState(true);
   const [inferencePolicy, setInferencePolicy] = useState("default");
-  const [decisionReasoningEffort, setDecisionReasoningEffort] = useState("server_default");
+  const [decisionReasoningEffort, setDecisionReasoningEffort] = useState("off");
   const [decisionMaxTokens, setDecisionMaxTokens] = useState("server_default");
   const [chooseFromAllLabels, setChooseFromAllLabels] = useState(false);
   const [continueAfterMatch, setContinueAfterMatch] = useState(false);
@@ -321,7 +321,7 @@ export default function RuleEditor() {
         setPriority(rule.priority);
         setEnabled(rule.enabled);
         setInferencePolicy(rule.inference_policy || "default");
-        setDecisionReasoningEffort(rule.decision_reasoning_effort || "server_default");
+        setDecisionReasoningEffort(rule.decision_reasoning_effort || "off");
         setDecisionMaxTokens(rule.decision_max_tokens?.toString() || "server_default");
         setChooseFromAllLabels(rule.choose_from_all_labels || false);
         setContinueAfterMatch(rule.continue_after_match || false);
@@ -910,7 +910,7 @@ export default function RuleEditor() {
             className="w-full"
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Thinking-enabled decisions run one message at a time so the model can finish with a choice.
+            Leave this off for fast, reliable classification. Thinking consumes the completion budget before the final choice.
           </p>
         </div>}
 
@@ -925,7 +925,7 @@ export default function RuleEditor() {
             className="w-full"
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Server default uses the default completion budget (up to 8,192 tokens for thinking plus the answer). A fixed budget bounds latency and cost.
+            Server default uses the 1,024-token decision budget. A fixed budget bounds latency and cost.
           </p>
         </div>}
 

@@ -48,7 +48,7 @@ function Onboarding() {
           <li>Create a rule that tells the AI how to triage mail.</li>
         </ol>
         <button
-          onClick={() => navigate("/settings")}
+          onClick={() => navigate("/settings?tab=mailbox")}
           className="inline-block bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
         >
           Open Settings
@@ -59,9 +59,9 @@ function Onboarding() {
 }
 
 function OnboardingOverlay() {
-  const { connected } = useGate();
+  const { connected, connection } = useGate();
   const location = useLocation();
-  if (connected || location.pathname === "/settings") return null;
+  if (connected || connection?.error || location.pathname === "/settings") return null;
   return <Onboarding />;
 }
 
@@ -69,6 +69,12 @@ function AppGate({ children }: { children: ReactNode }) {
   const [connection, setConnection] = useState<GmailConnection | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [activeEmail, setActiveEmail] = useState<string | null>(null);
+
+  async function refreshAccountList() {
+    const next = await accountsList();
+    setAccounts(next.accounts);
+    setActiveEmail(next.active_email);
+  }
 
   async function refreshAccounts() {
     const next = await accountsList();
@@ -146,6 +152,7 @@ function AppGate({ children }: { children: ReactNode }) {
       setConnection,
       activeEmail,
       accounts,
+      refreshAccountList,
       refreshAccounts,
       selectAccount,
     }}>

@@ -7,6 +7,7 @@ use crate::GmailError;
 
 const BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1";
 
+#[derive(Clone)]
 pub struct GmailClient {
     http: Client,
     auth: GmailAuth,

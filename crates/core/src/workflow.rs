@@ -17,7 +17,7 @@ use crate::llm::{
     InferenceRouter, InferenceRuntime, LlmProviderProfile, LlmRoutingPolicy, ReasoningEffort,
 };
 use crate::rules::actions::resolve_actions;
-use crate::rules::engine::{resolve_rule, Outcome, Resolved};
+use crate::rules::engine::{choice_catalog, resolve_rule, Outcome, Resolved};
 use crate::rules::matcher;
 use crate::rules::models::Rule;
 
@@ -53,6 +53,9 @@ pub struct QueueItem {
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub rule_set_version: i64,
+    pub next_provider_id: Option<String>,
+    pub next_endpoint: Option<String>,
+    pub next_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,6 +184,14 @@ pub fn retry_now(db: &Database, account_email: &str, run_id: i64) -> Result<bool
     db.with_workflow(|repo| repo.retry_now(account_email, run_id))
 }
 
+pub fn retry_with_current_rule_set(
+    db: &Database,
+    account_email: &str,
+    run_id: i64,
+) -> Result<bool, rusqlite::Error> {
+    db.with_workflow(|repo| repo.retry_with_current_rule_set(account_email, run_id))
+}
+
 pub fn rule_set_status(
     db: &Database,
     account_email: &str,
@@ -235,6 +246,9 @@ fn queue_item(
         updated_at: run.updated_at.clone(),
         completed_at: run.completed_at.clone(),
         rule_set_version: run.rule_set_version,
+        next_provider_id: run.route_provider_id.clone(),
+        next_endpoint: run.route_endpoint.clone(),
+        next_model: run.route_model.clone(),
     })
 }
 
@@ -320,7 +334,12 @@ fn retry_summary(attempt_count: i64, events: &[WorkflowEvent]) -> WorkflowRetryS
         .count();
     let manual_retry_requested_count = events
         .iter()
-        .filter(|event| event.kind == "retry_requested")
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "retry_requested" | "retry_current_rules_requested"
+            )
+        })
         .count();
     WorkflowRetrySummary {
         automatic_attempt_count: attempt_count,
@@ -593,13 +612,13 @@ pub async fn process_pending_runs(
         else {
             break;
         };
-        process_run(db, gmail, config, inference_runtime.clone(), run).await?;
+        prepare_run(db, gmail, config, inference_runtime.clone(), run).await?;
         processed += 1;
     }
     Ok(processed)
 }
 
-async fn process_run(
+pub async fn prepare_run(
     db: &Arc<Database>,
     gmail: &mut GmailClient,
     config: &AppConfig,
@@ -795,165 +814,308 @@ async fn process_run(
             continue;
         }
 
-        let started = Instant::now();
-        let endpoint_circuit_was_open = llm.endpoint_circuit_open(&rule.inference_policy);
-        let resolved =
-            match resolve_rule(&llm, rule, &message, &rule_snapshot.memories, &labels).await {
-                Ok(resolved) => resolved,
+        if rule.prompt.trim().is_empty() && choice_catalog(rule, &labels).is_empty() {
+            let resolved =
+                resolve_rule(&llm, rule, &message, &rule_snapshot.memories, &labels).await?;
+            persist_decision(db, &run, rule, rule_index, &labels, &resolved)?;
+            return Ok(());
+        }
+
+        match llm.next_provider(&rule.inference_policy) {
+            Ok(provider) => {
+                db.with_workflow(|repo| {
+                    repo.queue_for_route(
+                        run.id,
+                        &run.lease_token,
+                        &provider.provider_id,
+                        &provider.endpoint,
+                        &provider.model,
+                        provider.max_concurrent_requests,
+                    )
+                })?;
+            }
+            Err(error) => {
+                record_decision_error(db, &run, &llm, rule_index, &rule.inference_policy, error)?;
+            }
+        }
+        return Ok(());
+    }
+}
+
+pub async fn process_routed_run(
+    db: &Arc<Database>,
+    gmail: &mut GmailClient,
+    config: &AppConfig,
+    inference_runtime: InferenceRuntime,
+    run: ClaimedRun,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let snapshot: RuleSetSnapshot = match serde_json::from_str(&run.rules_json) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            db.with_workflow(|repo| {
+                repo.mark_needs_attention(run.id, &run.lease_token, &error.to_string())
+            })?;
+            return Ok(());
+        }
+    };
+    let message = match run.message_json.as_deref() {
+        Some(json) => match serde_json::from_str(json) {
+            Ok(message) => message,
+            Err(error) => {
+                db.with_workflow(|repo| {
+                    repo.mark_needs_attention(run.id, &run.lease_token, &error.to_string())
+                })?;
+                return Ok(());
+            }
+        },
+        None => {
+            db.with_workflow(|repo| {
+                repo.mark_needs_attention(
+                    run.id,
+                    &run.lease_token,
+                    "A routed decision is missing its Gmail message snapshot",
+                )
+            })?;
+            return Ok(());
+        }
+    };
+    let llm = InferenceRouter::from_config_with_runtime(
+        &snapshot.llm.apply_to(config),
+        inference_runtime,
+    )
+    .with_database(db.as_ref().clone());
+    let llm = if run.manual_retry {
+        llm.with_endpoint_circuit_bypass()
+    } else {
+        llm
+    }
+    .without_fallback();
+    let labels = cached_labels(db, gmail, &run.account_email)
+        .await
+        .unwrap_or_default();
+    let Some(rule_snapshot) = snapshot.rules.get(run.next_rule_index as usize) else {
+        db.with_workflow(|repo| {
+            repo.complete_run(run.id, &run.lease_token, "all rules considered")
+        })?;
+        return Ok(());
+    };
+    let rule = &rule_snapshot.rule;
+    let (route_endpoint, route_model) = match (&run.route_endpoint, &run.route_model) {
+        (Some(endpoint), Some(model)) => (endpoint, model),
+        _ => {
+            db.with_workflow(|repo| repo.yield_run(run.id, &run.lease_token))?;
+            return Ok(());
+        }
+    };
+    match llm.next_provider(&rule.inference_policy) {
+        Ok(provider) if provider.endpoint == *route_endpoint && provider.model == *route_model => {}
+        Ok(_) => {
+            db.with_workflow(|repo| repo.yield_run(run.id, &run.lease_token))?;
+            return Ok(());
+        }
+        Err(error) => {
+            record_decision_error(
+                db,
+                &run,
+                &llm,
+                run.next_rule_index,
+                &rule.inference_policy,
+                error,
+            )?;
+            return Ok(());
+        }
+    }
+    let started = Instant::now();
+    let resolved = match resolve_rule(&llm, rule, &message, &rule_snapshot.memories, &labels).await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            record_decision_error(
+                db,
+                &run,
+                &llm,
+                run.next_rule_index,
+                &rule.inference_policy,
+                error,
+            )?;
+            return Ok(());
+        }
+    };
+    let attribution = llm.provider_attribution(&rule.inference_policy);
+    let provider_name = attribution.as_ref().and_then(|value| {
+        (resolved.llm_provider.as_deref() == Some(value.provider_id.as_str()))
+            .then_some(value.provider_name.as_str())
+    });
+    record_decision_attempt(
+        db,
+        run.id,
+        run.next_rule_index,
+        &resolved,
+        "succeeded",
+        None,
+        started,
+        attribution.as_ref().map(|value| value.endpoint.as_str()),
+        provider_name,
+    )?;
+    persist_decision(db, &run, rule, run.next_rule_index, &labels, &resolved)?;
+    Ok(())
+}
+
+fn record_decision_error(
+    db: &Arc<Database>,
+    run: &ClaimedRun,
+    llm: &InferenceRouter,
+    rule_index: i64,
+    policy_id: &str,
+    error: impl std::fmt::Display,
+) -> Result<(), rusqlite::Error> {
+    let error = error.to_string();
+    let attribution = llm.provider_attribution(policy_id);
+    let endpoint_circuit_open = llm.endpoint_circuit_open(policy_id);
+    db.with_workflow(|repo| {
+        repo.record_llm_attempt(
+            run.id,
+            rule_index,
+            attribution.as_ref().map(|value| value.provider_id.as_str()),
+            attribution
+                .as_ref()
+                .map(|value| value.provider_name.as_str()),
+            attribution.as_ref().map(|value| value.model.as_str()),
+            if endpoint_circuit_open {
+                "blocked"
+            } else {
+                "error"
+            },
+            Some(&error),
+            None,
+            attribution.as_ref().map(|value| value.endpoint.as_str()),
+        )?;
+        if let Some(provider) = run
+            .route_provider_id
+            .as_deref()
+            .and_then(|provider_id| llm.fallback_provider(policy_id, provider_id))
+        {
+            return repo.queue_for_route(
+                run.id,
+                &run.lease_token,
+                &provider.provider_id,
+                &provider.endpoint,
+                &provider.model,
+                provider.max_concurrent_requests,
+            );
+        }
+        if endpoint_circuit_open {
+            repo.mark_needs_attention(run.id, &run.lease_token, &error)
+        } else {
+            repo.retry_run(run.id, &run.lease_token, &error, RETRY_DELAY_SECS)
+        }
+    })
+    .map(|_| ())
+}
+
+fn persist_decision(
+    db: &Arc<Database>,
+    run: &ClaimedRun,
+    rule: &Rule,
+    rule_index: i64,
+    labels: &[crate::gmail::models::Label],
+    resolved: &Resolved,
+) -> Result<(), rusqlite::Error> {
+    match resolved.outcome {
+        Outcome::NoMatch => {
+            let advanced = db.with_workflow(|repo| {
+                repo.record_step_and_advance(
+                    run.id,
+                    &run.lease_token,
+                    rule_index,
+                    rule.id,
+                    &rule.name,
+                    "no_match",
+                    non_empty(&resolved.llm_response),
+                    None,
+                )
+            })?;
+            if advanced {
+                db.with_workflow(|repo| repo.yield_run(run.id, &run.lease_token))?;
+            }
+        }
+        Outcome::Unparsed => {
+            let error = resolved
+                .diagnostic
+                .as_deref()
+                .unwrap_or("Invalid LLM decision");
+            db.with_workflow(|repo| {
+                repo.retry_run(run.id, &run.lease_token, error, RETRY_DELAY_SECS)
+            })?;
+        }
+        Outcome::Matched if resolved.actions.is_empty() => {
+            let advanced = db.with_workflow(|repo| {
+                repo.record_step_and_advance(
+                    run.id,
+                    &run.lease_token,
+                    rule_index,
+                    rule.id,
+                    &rule.name,
+                    "matched_no_action",
+                    non_empty(&resolved.llm_response),
+                    resolved.diagnostic.as_deref(),
+                )
+            })?;
+            if !advanced {
+                return Ok(());
+            }
+            if rule.continue_after_match {
+                db.with_workflow(|repo| repo.yield_run(run.id, &run.lease_token))?;
+            } else {
+                db.with_workflow(|repo| {
+                    repo.complete_run(
+                        run.id,
+                        &run.lease_token,
+                        "rule claimed message without action",
+                    )
+                })?;
+            }
+        }
+        Outcome::Matched => {
+            let mutation = match resolve_actions(&resolved.actions, labels) {
+                Ok(mutation) => mutation,
                 Err(error) => {
-                    let error = error.to_string();
-                    let attribution = llm.provider_attribution(&rule.inference_policy);
-                    let endpoint_circuit_open = llm.endpoint_circuit_open(&rule.inference_policy);
                     db.with_workflow(|repo| {
-                        repo.record_llm_attempt(
-                            run.id,
-                            rule_index,
-                            attribution.as_ref().map(|value| value.provider_id.as_str()),
-                            attribution
-                                .as_ref()
-                                .map(|value| value.provider_name.as_str()),
-                            attribution.as_ref().map(|value| value.model.as_str()),
-                            if endpoint_circuit_was_open {
-                                "blocked"
-                            } else {
-                                "error"
-                            },
-                            Some(&error),
-                            Some(elapsed_ms(started)),
-                            attribution.as_ref().map(|value| value.endpoint.as_str()),
-                        )?;
-                        if endpoint_circuit_open && !endpoint_circuit_was_open {
-                            repo.mark_endpoint_outage(run.id, &run.lease_token, &error)
-                        } else if endpoint_circuit_open {
-                            repo.mark_needs_attention(run.id, &run.lease_token, &error)
-                        } else {
-                            repo.retry_run(run.id, &run.lease_token, &error, RETRY_DELAY_SECS)
-                        }
+                        repo.mark_needs_attention(run.id, &run.lease_token, &error.to_string())
                     })?;
                     return Ok(());
                 }
             };
-        let attribution = llm.provider_attribution(&rule.inference_policy);
-        let provider_name = attribution.as_ref().and_then(|value| {
-            (resolved.llm_provider.as_deref() == Some(value.provider_id.as_str()))
-                .then_some(value.provider_name.as_str())
-        });
-        record_decision_attempt(
-            db,
-            run.id,
-            rule_index,
-            &resolved,
-            "succeeded",
-            None,
-            started,
-            attribution.as_ref().map(|value| value.endpoint.as_str()),
-            provider_name,
-        )?;
-
-        match resolved.outcome {
-            Outcome::NoMatch => {
-                let advanced = db.with_workflow(|repo| {
-                    repo.record_step_and_advance(
-                        run.id,
-                        &run.lease_token,
-                        rule_index,
-                        rule.id,
-                        &rule.name,
-                        "no_match",
-                        non_empty(&resolved.llm_response),
-                        None,
-                    )
-                })?;
-                if !advanced {
-                    return Ok(());
-                }
-                rule_index += 1;
-            }
-            Outcome::Unparsed => {
-                let error = resolved
-                    .diagnostic
-                    .as_deref()
-                    .unwrap_or("Invalid LLM decision");
-                db.with_workflow(|repo| {
-                    repo.retry_run(run.id, &run.lease_token, error, RETRY_DELAY_SECS)
-                })?;
+            let recorded = db.with_workflow(|repo| {
+                repo.record_step(
+                    run.id,
+                    &run.lease_token,
+                    rule_index,
+                    rule.id,
+                    &rule.name,
+                    "matched",
+                    non_empty(&resolved.llm_response),
+                    resolved.diagnostic.as_deref(),
+                )
+            })?;
+            if !recorded {
                 return Ok(());
             }
-            Outcome::Matched if resolved.actions.is_empty() => {
-                let advanced = db.with_workflow(|repo| {
-                    repo.record_step_and_advance(
-                        run.id,
-                        &run.lease_token,
-                        rule_index,
-                        rule.id,
-                        &rule.name,
-                        "matched_no_action",
-                        non_empty(&resolved.llm_response),
-                        resolved.diagnostic.as_deref(),
-                    )
-                })?;
-                if !advanced {
-                    return Ok(());
-                }
-                if !rule.continue_after_match {
-                    db.with_workflow(|repo| {
-                        repo.complete_run(
-                            run.id,
-                            &run.lease_token,
-                            "rule claimed message without action",
-                        )
-                    })?;
-                    return Ok(());
-                }
-                rule_index += 1;
-            }
-            Outcome::Matched => {
-                let mutation = match resolve_actions(&resolved.actions, &labels) {
-                    Ok(mutation) => mutation,
-                    Err(error) => {
-                        db.with_workflow(|repo| {
-                            repo.mark_needs_attention(run.id, &run.lease_token, &error.to_string())
-                        })?;
-                        return Ok(());
-                    }
-                };
-                let recorded = db.with_workflow(|repo| {
-                    repo.record_step(
-                        run.id,
-                        &run.lease_token,
-                        rule_index,
-                        rule.id,
-                        &rule.name,
-                        "matched",
-                        non_empty(&resolved.llm_response),
-                        resolved.diagnostic.as_deref(),
-                    )
-                })?;
-                if !recorded {
-                    return Ok(());
-                }
-                let Some(action) = db.with_workflow(|repo| {
-                    repo.plan_action(
-                        run.id,
-                        &run.lease_token,
-                        rule_index,
-                        &mutation.add,
-                        &mutation.remove,
-                    )
-                })?
-                else {
-                    return Ok(());
-                };
-                let confirmed =
-                    apply_action_plan(db, gmail, &run, &mut message, rule, rule_index, &action)
-                        .await?;
-                if !confirmed || !rule.continue_after_match {
-                    return Ok(());
-                }
-                rule_index += 1;
+            let planned = db.with_workflow(|repo| {
+                repo.plan_action(
+                    run.id,
+                    &run.lease_token,
+                    rule_index,
+                    &mutation.add,
+                    &mutation.remove,
+                )
+            })?;
+            if planned.is_some() {
+                db.with_workflow(|repo| repo.yield_run(run.id, &run.lease_token))?;
             }
         }
     }
+    Ok(())
 }
 
 async fn apply_action_plan(
@@ -1111,7 +1273,7 @@ fn non_empty(value: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value)
 }
 
-fn new_lease_token() -> String {
+pub fn new_lease_token() -> String {
     format!("{:032x}", rand::thread_rng().gen::<u128>())
 }
 
@@ -1235,12 +1397,18 @@ mod tests {
                 created_at: String::new(),
             })
             .collect::<Vec<_>>();
-        events.extend((6..9).map(|id| WorkflowEvent {
+        events.extend((6..8).map(|id| WorkflowEvent {
             id,
             kind: "retry_requested".into(),
             detail: None,
             created_at: String::new(),
         }));
+        events.push(WorkflowEvent {
+            id: 8,
+            kind: "retry_current_rules_requested".into(),
+            detail: None,
+            created_at: String::new(),
+        });
 
         let summary = retry_summary(3, &events);
 
