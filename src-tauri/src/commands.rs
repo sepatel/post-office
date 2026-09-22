@@ -663,7 +663,10 @@ pub async fn accounts_list(state: State<'_, AppState>) -> Result<AccountsState, 
 }
 
 #[tauri::command]
-pub async fn accounts_select(state: State<'_, AppState>, email: String) -> Result<(), String> {
+pub async fn accounts_select(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<AccountsState, String> {
     let exists = state
         .db
         .with_accounts(|repo| repo.get(&email))
@@ -674,13 +677,20 @@ pub async fn accounts_select(state: State<'_, AppState>, email: String) -> Resul
     }
 
     let mut config = state.config.lock().await;
-    config.gmail_account = Some(email);
+    config.gmail_account = Some(email.clone());
     state
         .db
         .with_config(|repo| config.save(&repo))
         .map_err(|error| error.to_string())?;
     drop(config);
-    publish_all_rule_sets(&state).await
+    let accounts = state
+        .db
+        .with_accounts(|repo| repo.list())
+        .map_err(|error| error.to_string())?;
+    Ok(AccountsState {
+        accounts,
+        active_email: Some(email),
+    })
 }
 
 #[tauri::command]
@@ -1321,7 +1331,6 @@ pub async fn workflow_message_get(
 #[tauri::command]
 pub async fn workflow_retry_now(state: State<'_, AppState>, run_id: i64) -> Result<bool, String> {
     let account_email = active_account(&*state.config.lock().await)?;
-    publish_current_rule_set(&state, &account_email).await?;
     post_office_core::workflow::retry_now(&state.db, &account_email, run_id)
         .map_err(|error| error.to_string())
 }

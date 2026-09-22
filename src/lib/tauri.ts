@@ -41,7 +41,7 @@ export async function accountsList(): Promise<AccountsState> {
   return invoke("accounts_list");
 }
 
-export async function accountsSelect(email: string): Promise<void> {
+export async function accountsSelect(email: string): Promise<AccountsState> {
   return invoke("accounts_select", { email });
 }
 

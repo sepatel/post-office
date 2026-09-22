@@ -83,8 +83,8 @@ fn main() {
                 .with_accounts(|repo| repo.list())
                 .expect("Failed to load accounts for workflow migration")
             {
-                post_office_core::workflow::publish_rule_set(&db, &account.email, &config)
-                    .expect("Failed to import rule set into message workflow");
+                post_office_core::workflow::ensure_rule_set(&db, &account.email, &config)
+                    .expect("Failed to initialize message workflow rule set");
             }
             let config_arc = Arc::new(Mutex::new(config.clone()));
             let inference_runtime = InferenceRuntime::default();

@@ -1,11 +1,14 @@
 use reqwest::Client;
 use serde::de::DeserializeOwned;
+use std::time::Duration;
 
 use super::auth::GmailAuth;
 use super::models::*;
 use crate::GmailError;
 
 const BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_RATE_LIMIT_RETRIES: u8 = 3;
 
 #[derive(Clone)]
 pub struct GmailClient {
@@ -16,7 +19,10 @@ pub struct GmailClient {
 impl GmailClient {
     pub fn new(auth: GmailAuth) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("Gmail HTTP client configuration is valid"),
             auth,
         }
     }
@@ -27,7 +33,7 @@ impl GmailClient {
         path: &str,
         body: Option<&(impl serde::Serialize + Send)>,
     ) -> Result<T, GmailError> {
-        let response = self.send(method, path, body).await?;
+        let response = self.send(method, path, body, 0).await?;
 
         // Some Gmail mutations (e.g. modify/batchModify) can reply with no body.
         // Treat an empty body as `null` so callers that don't need the payload
@@ -52,6 +58,7 @@ impl GmailClient {
         method: reqwest::Method,
         path: &str,
         body: Option<&(impl serde::Serialize + Send)>,
+        rate_limit_retries: u8,
     ) -> Result<reqwest::Response, GmailError> {
         if self.auth.is_expired() {
             self.auth.refresh(&self.http).await?;
@@ -82,6 +89,12 @@ impl GmailClient {
         }
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES {
+                return Err(GmailError::Api {
+                    code: response.status().as_u16(),
+                    message: response.text().await.unwrap_or_default(),
+                });
+            }
             let retry_after = response
                 .headers()
                 .get("Retry-After")
@@ -95,15 +108,21 @@ impl GmailClient {
                 "Gmail rate limited; waiting before retry"
             );
             tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
-            return Box::pin(self.send(method, path, body)).await;
+            return Box::pin(self.send(method, path, body, rate_limit_retries + 1)).await;
         }
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             let body_text = response.text().await.unwrap_or_default();
             if is_rate_limit_error(&body_text) {
+                if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES {
+                    return Err(GmailError::Api {
+                        code: reqwest::StatusCode::FORBIDDEN.as_u16(),
+                        message: body_text,
+                    });
+                }
                 tracing::warn!(path, "Gmail quota exceeded; waiting before retry");
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                return Box::pin(self.send(method, path, body)).await;
+                return Box::pin(self.send(method, path, body, rate_limit_retries + 1)).await;
             }
             return Err(GmailError::Api {
                 code: reqwest::StatusCode::FORBIDDEN.as_u16(),

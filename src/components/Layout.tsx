@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Link, NavLink, Outlet } from "react-router-dom";
+import { Component, useEffect, useRef, useState, type ReactNode } from "react";
+import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import AccountSwitcher from "./AccountSwitcher";
 import ThemeToggle from "./ThemeToggle";
 import { processingPause, processingResume, processingStatus, workflowQueueSummary, type WorkflowQueueSummary } from "../lib/tauri";
@@ -17,21 +17,57 @@ function count(summary: WorkflowQueueSummary | null, state: string) {
   return summary?.counts.find((entry) => entry.state === state)?.count ?? 0;
 }
 
+class RouteErrorBoundary extends Component<{ children: ReactNode; resetKey: string }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidUpdate(previousProps: Readonly<{ children: ReactNode; resetKey: string }>) {
+    if (previousProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: null });
+    }
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div role="alert" className="mx-auto max-w-xl rounded-2xl border border-red-200 bg-red-50 p-6 dark:border-red-900/60 dark:bg-red-950/30">
+        <h1 className="text-lg font-semibold text-red-950 dark:text-red-100">This screen could not be displayed</h1>
+        <p className="mt-2 break-words text-sm text-red-700 dark:text-red-200">{this.state.error.message}</p>
+        <Link to="/queue" className="mt-4 inline-block rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Return to queue</Link>
+      </div>
+    );
+  }
+}
+
 export default function Layout() {
-  const { activeEmail, accounts, connection, refreshAccountList } = useGate();
+  const { activeEmail, accounts, connection } = useGate();
+  const location = useLocation();
   const [summary, setSummary] = useState<WorkflowQueueSummary | null>(null);
   const [paused, setPaused] = useState(false);
   const [changingPause, setChangingPause] = useState(false);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const loading = useRef(false);
 
   async function load() {
-    const [nextSummary, status] = await Promise.all([workflowQueueSummary(), processingStatus() as Promise<{ paused: boolean }>]);
-    setSummary(nextSummary);
-    setPaused(status.paused);
-    void refreshAccountList().catch(() => undefined);
+    if (loading.current) return;
+    loading.current = true;
+    try {
+      const [nextSummary, status] = await Promise.all([workflowQueueSummary(), processingStatus() as Promise<{ paused: boolean }>]);
+      setSummary(nextSummary);
+      setPaused(status.paused);
+      setLoadError(null);
+    } catch (error) {
+      setLoadError(error);
+    } finally {
+      loading.current = false;
+    }
   }
 
   useEffect(() => {
-    void load().catch(() => undefined);
+    void load();
     const timer = window.setInterval(() => void load(), 10_000);
     return () => window.clearInterval(timer);
   }, [activeEmail]);
@@ -42,6 +78,8 @@ export default function Layout() {
       if (paused) await processingResume();
       else await processingPause();
       await load();
+    } catch (error) {
+      setLoadError(error);
     } finally {
       setChangingPause(false);
     }
@@ -103,12 +141,13 @@ export default function Layout() {
               {healthLabel}
             </div>
             <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">{active} active · {count(summary, "completed")} completed</p>
+            {loadError !== null && <p className="mt-2 text-[11px] text-red-700 dark:text-red-300">Queue status is temporarily unavailable.</p>}
             <button type="button" onClick={() => void togglePause()} disabled={changingPause} className={`mt-3 w-full rounded-lg px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 ${paused ? "bg-emerald-600 hover:bg-emerald-700" : "bg-amber-600 hover:bg-amber-700"}`}>{changingPause ? "Updating…" : paused ? "Resume worker" : "Pause worker"}</button>
           </div>
           <div className="mt-3"><ThemeToggle /></div>
         </div>
       </aside>
-      <main className="min-w-0 flex-1 overflow-auto p-6 lg:p-8"><Outlet /></main>
+      <main className="min-w-0 flex-1 overflow-auto p-6 lg:p-8"><RouteErrorBoundary resetKey={location.pathname}><Outlet /></RouteErrorBoundary></main>
     </div>
   );
 }

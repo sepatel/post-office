@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
@@ -12,6 +12,7 @@ import {
 import { useGate } from "../lib/gate";
 import { useToast } from "../lib/toast";
 import ConnectionStatus from "../components/ConnectionStatus";
+import LoadError from "../components/LoadError";
 import InferenceStudio, {
   type InferenceConfig,
 } from "../components/InferenceStudio";
@@ -34,6 +35,8 @@ export default function Settings() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const request = useRef(0);
   const tab: SettingsTab = searchParams.get("tab") === "mailbox" ? "mailbox" : "inference";
 
   useEffect(() => {
@@ -41,12 +44,19 @@ export default function Settings() {
   }, []);
 
   async function loadConfig() {
-    try {
-      const next = (await configGet()) as Config;
-      setConfig(next);
-      await refreshAccounts();
-    } catch (error) {
-      console.error("Failed to load config:", error);
+    const version = ++request.current;
+    const [configResult, accountsResult] = await Promise.allSettled([
+      configGet() as Promise<Config>,
+      refreshAccounts(),
+    ]);
+    if (version !== request.current) return;
+    if (configResult.status === "fulfilled") setConfig(configResult.value);
+    const errors = [configResult, accountsResult]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => String(result.reason));
+    setLoadError(errors.length > 0 ? errors.join(" ") : null);
+    if (configResult.status === "rejected") {
+      setConfig(null);
     }
   }
 
@@ -126,7 +136,8 @@ export default function Settings() {
   }
 
   if (!config) {
-    return <div className="text-gray-400 dark:text-gray-500">Loading settings…</div>;
+    if (loadError) return <LoadError title="Could not load settings" error={loadError} onRetry={() => void loadConfig()} />;
+    return <div className="text-gray-400 dark:text-gray-500">Loading settings...</div>;
   }
 
   const erroredAccounts = accounts.filter((account) => account.status === "error");
@@ -154,6 +165,8 @@ export default function Settings() {
           </button>
         )}
       </div>
+
+      {loadError && <div className="mb-6"><LoadError title="Some account data could not be refreshed" error={loadError} onRetry={() => void loadConfig()} /></div>}
 
       <div className="mb-7 flex max-w-xl gap-1 rounded-xl border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
         <TabButton active={tab === "inference"} onClick={() => selectTab("inference")}>

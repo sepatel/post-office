@@ -11,6 +11,8 @@ import {
   type LlmRoutingPolicy,
   type WorkflowRuleSetStatus,
 } from "../lib/tauri";
+import { useGate } from "../lib/gate";
+import LoadError from "../components/LoadError";
 
 interface Rule {
   id: number;
@@ -36,24 +38,39 @@ export default function Rules() {
   const [backupStatus, setBackupStatus] = useState<string | null>(null);
   const [backupBusy, setBackupBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const request = useRef(0);
   const navigate = useNavigate();
+  const { activeEmail } = useGate();
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   async function load() {
-    const [loaded, config, versions] = await Promise.all([
+    const version = ++request.current;
+    setLoading(true);
+    const [rulesResult, configResult, snapshotsResult] = await Promise.allSettled([
       rulesList() as Promise<Rule[]>,
       configGet() as Promise<{ llm_routing_policies: LlmRoutingPolicy[] }>,
       workflowRuleSetStatus(),
     ]);
-    setRules(loaded.map((rule) => ({
-      ...rule,
-      policyName: policyDisplayName(rule.inference_policy, config.llm_routing_policies ?? []),
-    })));
-    setSnapshots(versions);
+    if (version !== request.current) return;
+    const policies = configResult.status === "fulfilled" ? configResult.value.llm_routing_policies ?? [] : [];
+    if (rulesResult.status === "fulfilled") {
+      setRules(rulesResult.value.map((rule) => ({
+        ...rule,
+        policyName: policyDisplayName(rule.inference_policy, policies),
+      })));
+    }
+    if (snapshotsResult.status === "fulfilled") setSnapshots(snapshotsResult.value);
+    const errors = [rulesResult, configResult, snapshotsResult]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => String(result.reason));
+    setLoadError(errors.length > 0 ? errors.join(" ") : null);
+    setLoading(false);
   }
 
   useEffect(() => {
-    void load().catch(() => undefined);
-  }, []);
+    void load();
+  }, [activeEmail]);
 
   async function moveRule(index: number, direction: -1 | 1) {
     const nextIndex = index + direction;
@@ -119,6 +136,8 @@ export default function Rules() {
         </div>
       </header>
 
+      {loadError && <div className="mb-6"><LoadError title="Could not load all rule data" error={loadError} onRetry={() => void load()} /></div>}
+
       <section className="mb-6 grid gap-4 sm:grid-cols-2">
         <div className="rounded-2xl border border-blue-200 bg-blue-50 p-5 dark:border-blue-900/70 dark:bg-blue-950/30">
           <p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-600 dark:text-blue-300">Current blueprint</p>
@@ -134,9 +153,11 @@ export default function Rules() {
 
       {backupStatus && <div className="mb-4 rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">{backupStatus}</div>}
 
-      {rules.length === 0 ? (
+      {loading && <div className="rounded-2xl border border-gray-200 bg-white p-12 text-center text-sm text-gray-400 dark:border-gray-700 dark:bg-gray-800">Loading rules...</div>}
+
+      {!loading && rules.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-gray-300 p-12 text-center dark:border-gray-700"><p className="text-lg font-medium">No rules yet</p><p className="mt-1 text-sm text-gray-500">Create a blueprint for new arrivals.</p></div>
-      ) : (
+      ) : !loading && (
         <div className="space-y-3">
           {rules.map((rule, index) => (
             <article key={rule.id} className="flex flex-wrap items-start gap-4 rounded-2xl border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-700 dark:bg-gray-800">

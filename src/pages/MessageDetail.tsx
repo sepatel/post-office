@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   workflowMessageGet,
@@ -7,6 +7,7 @@ import {
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import { useGate } from "../lib/gate";
+import LoadError from "../components/LoadError";
 
 function title(kind: string): string {
   return kind.replace(/_/g, " ").replace(/\b\w/g, (letter: string) => letter.toUpperCase());
@@ -133,17 +134,27 @@ export default function MessageDetail() {
   const messageId = Number(id);
   const [detail, setDetail] = useState<WorkflowMessageDetail | null | undefined>(undefined);
   const [retrying, setRetrying] = useState(false);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const request = useRef(0);
 
   async function load() {
+    const version = ++request.current;
+    setLoadError(null);
     if (!Number.isSafeInteger(messageId)) {
       setDetail(null);
       return;
     }
-    setDetail(await workflowMessageGet(messageId));
+    setDetail(undefined);
+    try {
+      const next = await workflowMessageGet(messageId);
+      if (version === request.current) setDetail(next);
+    } catch (error) {
+      if (version === request.current) setLoadError(error);
+    }
   }
 
   useEffect(() => {
-    void load().catch(() => setDetail(null));
+    void load();
   }, [messageId, activeEmail]);
 
   async function retry() {
@@ -152,12 +163,15 @@ export default function MessageDetail() {
     try {
       await workflowRetryNow(detail.run_id);
       await load();
+    } catch (error) {
+      setLoadError(error);
     } finally {
       setRetrying(false);
     }
   }
 
-  if (detail === undefined) return <div className="p-8 text-sm text-gray-400">Loading message…</div>;
+  if (loadError !== null) return <LoadError title="Could not load this message" error={loadError} onRetry={() => void load()} />;
+  if (detail === undefined) return <div className="p-8 text-sm text-gray-400">Loading message...</div>;
   if (detail === null) return <div className="p-8 text-sm text-gray-400">Message not found for this account.</div>;
 
   const retryable = detail.state === "needs_attention" || detail.state === "retry_wait";

@@ -10,6 +10,7 @@ import {
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import { useGate } from "../lib/gate";
+import LoadError from "../components/LoadError";
 
 const states: Array<{ id: WorkflowRunState; label: string }> = [
   { id: "needs_attention", label: "Needs attention" },
@@ -52,30 +53,60 @@ export default function Queue() {
   const [activeState, setActiveState] = useState<WorkflowRunState>("processing");
   const [loading, setLoading] = useState(true);
   const [retrying, setRetrying] = useState<number | null>(null);
+  const [loadError, setLoadError] = useState<unknown>(null);
   const initialized = useRef(false);
+  const activeStateRef = useRef(activeState);
+  const loadingRequest = useRef(false);
+  const requestVersion = useRef(0);
 
   async function load() {
+    requestVersion.current += 1;
+    if (loadingRequest.current) return;
+    loadingRequest.current = true;
     try {
-      const nextSummary = await workflowQueueSummary();
-      if (!initialized.current) {
-        initialized.current = true;
-        if (count(nextSummary, "needs_attention") > 0) setActiveState("needs_attention");
+      while (true) {
+        const version = requestVersion.current;
+        try {
+          const nextSummary = await workflowQueueSummary();
+          let nextState = activeStateRef.current;
+          if (!initialized.current) {
+            initialized.current = true;
+            if (count(nextSummary, "needs_attention") > 0) {
+              nextState = "needs_attention";
+              activeStateRef.current = nextState;
+              setActiveState(nextState);
+            }
+          }
+          const nextItems = await workflowMessagesList(nextState, 0, 100);
+          if (version === requestVersion.current) {
+            setSummary(nextSummary);
+            setItems(nextItems);
+            setLoadError(null);
+            setLoading(false);
+            break;
+          }
+        } catch (error) {
+          if (version === requestVersion.current) {
+            setLoadError(error);
+            setLoading(false);
+            break;
+          }
+        }
       }
-      const nextItems = await workflowMessagesList(activeState, 0, 100);
-      setSummary(nextSummary);
-      setItems(nextItems);
     } finally {
-      setLoading(false);
+      loadingRequest.current = false;
     }
   }
 
   useEffect(() => {
     initialized.current = false;
     setLoading(true);
+    setLoadError(null);
   }, [activeEmail]);
 
   useEffect(() => {
-    void load().catch(() => setLoading(false));
+    activeStateRef.current = activeState;
+    void load();
     const timer = window.setInterval(() => void load(), 5_000);
     return () => window.clearInterval(timer);
   }, [activeEmail, activeState]);
@@ -85,6 +116,8 @@ export default function Queue() {
     try {
       await workflowRetryNow(item.run_id);
       await load();
+    } catch (error) {
+      setLoadError(error);
     } finally {
       setRetrying(null);
     }
@@ -112,6 +145,8 @@ export default function Queue() {
           Browse messages
         </Link>
       </header>
+
+      {loadError !== null && <LoadError title="Could not load the queue" error={loadError} onRetry={() => { setLoading(true); void load(); }} />}
 
       <section className="rounded-2xl border border-gray-200 bg-white shadow-sm dark:border-gray-700 dark:bg-gray-800">
         <div className="flex overflow-x-auto border-b border-gray-200 px-2 dark:border-gray-700">

@@ -455,7 +455,7 @@ impl LlmSnapshot {
     }
 }
 
-/// Publishes the latest rules for every unfinished run that has not been leased.
+/// Publishes a changed ruleset snapshot and moves unleased unfinished work to it.
 pub fn publish_rule_set(
     db: &Database,
     account_email: &str,
@@ -486,7 +486,7 @@ pub fn publish_rule_set(
             .active_rule_set(account_email)?
             .is_some_and(|current| current.rules_json == serialized)
         {
-            repo.rebind_unfinished_runs(account_email).map(|_| ())
+            Ok(())
         } else {
             repo.activate_rule_set(account_email, &serialized)
                 .map(|_| ())
@@ -494,7 +494,8 @@ pub fn publish_rule_set(
     })
 }
 
-fn ensure_rule_set(
+/// Creates the first ruleset snapshot for an account without rewriting existing work.
+pub fn ensure_rule_set(
     db: &Database,
     account_email: &str,
     config: &AppConfig,
@@ -1274,6 +1275,8 @@ pub fn new_lease_token() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn message_with_labels(labels: &[&str]) -> Message {
@@ -1411,5 +1414,63 @@ mod tests {
         assert_eq!(summary.automatic_retry_scheduled_count, 6);
         assert_eq!(summary.manual_retry_requested_count, 3);
         assert!(summary.historical_retry_policy);
+    }
+
+    #[test]
+    fn ensuring_an_existing_rule_set_preserves_unfinished_runs() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        let (message_id, version) = db
+            .with_workflow(|repo| {
+                repo.initialize_mailbox("test@example.com", "100")?;
+                let original = repo.activate_rule_set("test@example.com", r#"{"rules":[]}"#)?;
+                repo.enqueue_arrivals("test@example.com", "101", &["message-1".into()])?;
+                let run = repo.claim_next("test@example.com", "lease-1")?.unwrap();
+                repo.retry_run(run.id, "lease-1", "decision failed", 60)?;
+                Ok::<_, rusqlite::Error>((run.message_id, original.version))
+            })
+            .unwrap();
+        ensure_rule_set(&db, "test@example.com", &AppConfig::default()).unwrap();
+        db.with_workflow(|repo| {
+            let stored = repo
+                .run_for_message("test@example.com", message_id)?
+                .unwrap();
+            assert_eq!(stored.rule_set_version, version);
+            assert_eq!(stored.state, "retry_wait");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn republishing_unchanged_rules_preserves_unfinished_runs() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        let config = AppConfig::default();
+        db.migrate().unwrap();
+        publish_rule_set(&db, "test@example.com", &config).unwrap();
+        let (message_id, version) = db
+            .with_workflow(|repo| {
+                repo.initialize_mailbox("test@example.com", "100")?;
+                repo.enqueue_arrivals("test@example.com", "101", &["message-1".into()])?;
+                let run = repo.claim_next("test@example.com", "lease-1")?.unwrap();
+                repo.retry_run(run.id, "lease-1", "decision failed", 60)?;
+                let stored = repo
+                    .run_for_message("test@example.com", run.message_id)?
+                    .unwrap();
+                Ok::<_, rusqlite::Error>((stored.message_id, stored.rule_set_version))
+            })
+            .unwrap();
+
+        publish_rule_set(&db, "test@example.com", &config).unwrap();
+
+        db.with_workflow(|repo| {
+            let stored = repo
+                .run_for_message("test@example.com", message_id)?
+                .unwrap();
+            assert_eq!(stored.rule_set_version, version);
+            assert_eq!(stored.state, "retry_wait");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
     }
 }

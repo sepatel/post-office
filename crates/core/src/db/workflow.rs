@@ -80,23 +80,6 @@ impl<'a> WorkflowRepository<'a> {
         )
     }
 
-    pub fn rebind_unfinished_runs(&self, account_email: &str) -> Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
-        let rule_set_id = tx
-            .query_row(
-                "SELECT id FROM workflow_rule_sets WHERE account_email = ?1 AND active = 1",
-                [account_email],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        let Some(rule_set_id) = rule_set_id else {
-            return Ok(0);
-        };
-        let changed = rebind_unfinished_runs(&tx, account_email, rule_set_id)?;
-        tx.commit()?;
-        Ok(changed)
-    }
-
     /// Records arrivals before moving the Gmail cursor. Replaying a page is safe:
     /// message identity and the run identity both have unique constraints.
     pub fn enqueue_arrivals(

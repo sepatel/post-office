@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   historyList,
   historySearch,
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import PipelineDryRunDialog from "../components/PipelineDryRunDialog";
+import LoadError from "../components/LoadError";
+import { useGate } from "../lib/gate";
 
 interface HistoryEntry {
   id: number;
@@ -97,31 +99,49 @@ export default function History() {
   const [searchQuery, setSearchQuery] = useState("");
   const [page, setPage] = useState(0);
   const [dryRunEmailId, setDryRunEmailId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const request = useRef(0);
+  const { activeEmail } = useGate();
   const perPage = 20;
 
   useEffect(() => {
-    loadEntries();
-  }, [page]);
+    void loadEntries();
+  }, [page, activeEmail]);
 
   async function loadEntries() {
+    const version = ++request.current;
+    setLoading(true);
     try {
       const e = (await historyList(page, perPage)) as HistoryEntry[];
-      setEntries(e);
-    } catch (e) {
-      console.error("Failed to load history:", e);
+      if (version === request.current) {
+        setEntries(e);
+        setLoadError(null);
+      }
+    } catch (error) {
+      if (version === request.current) setLoadError(error);
+    } finally {
+      if (version === request.current) setLoading(false);
     }
   }
 
   async function handleSearch() {
     if (!searchQuery.trim()) {
-      loadEntries();
+      void loadEntries();
       return;
     }
+    const version = ++request.current;
+    setLoading(true);
     try {
       const e = (await historySearch(searchQuery)) as HistoryEntry[];
-      setEntries(e);
-    } catch (e) {
-      console.error("Failed to search history:", e);
+      if (version === request.current) {
+        setEntries(e);
+        setLoadError(null);
+      }
+    } catch (error) {
+      if (version === request.current) setLoadError(error);
+    } finally {
+      if (version === request.current) setLoading(false);
     }
   }
 
@@ -131,6 +151,8 @@ export default function History() {
         <p className="text-xs font-semibold uppercase tracking-[0.18em] text-gray-400">Read-only legacy data</p>
         <h2 className="mt-1 text-2xl font-bold">Legacy archive</h2>
       </div>
+
+      {loadError !== null && <div className="mb-4"><LoadError title="Could not load the archive" error={loadError} onRetry={() => void loadEntries()} /></div>}
 
       <div className="flex gap-2 mb-4">
         <input
@@ -174,14 +196,19 @@ export default function History() {
             </tr>
           </thead>
           <tbody>
-            {entries.length === 0 && (
+            {loading && (
+              <tr>
+                <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-gray-500">Loading archive...</td>
+              </tr>
+            )}
+            {!loading && entries.length === 0 && (
               <tr>
                 <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-gray-500">
                   No history yet
                 </td>
               </tr>
             )}
-            {entries.map((entry) => (
+            {!loading && entries.map((entry) => (
               <tr
                 key={entry.id}
                 className="border-b border-gray-200 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors"

@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { processingPause, processingResume, processingStatus, workflowEndpointStatus, workflowQueueSummary, type WorkflowEndpointStatus, type WorkflowQueueSummary } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import { useGate } from "../lib/gate";
+import LoadError from "../components/LoadError";
 
 const trackedStates = ["needs_attention", "processing", "retry_wait", "queued", "completed", "resolved_externally"];
 
@@ -10,28 +11,51 @@ export default function Operations() {
   const [summary, setSummary] = useState<WorkflowQueueSummary | null>(null);
   const [endpoints, setEndpoints] = useState<WorkflowEndpointStatus[]>([]);
   const [paused, setPaused] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const loading = useRef(false);
+  const request = useRef(0);
 
   async function load() {
-    const [nextSummary, status, nextEndpoints] = await Promise.all([
-      workflowQueueSummary(),
-      processingStatus() as Promise<{ paused: boolean }>,
-      workflowEndpointStatus(),
-    ]);
-    setSummary(nextSummary);
-    setPaused(status.paused);
-    setEndpoints(nextEndpoints);
+    request.current += 1;
+    if (loading.current) return;
+    loading.current = true;
+    try {
+      while (true) {
+        const version = request.current;
+        const [summaryResult, statusResult, endpointsResult] = await Promise.allSettled([
+          workflowQueueSummary(),
+          processingStatus() as Promise<{ paused: boolean }>,
+          workflowEndpointStatus(),
+        ]);
+        if (version !== request.current) continue;
+        if (summaryResult.status === "fulfilled") setSummary(summaryResult.value);
+        if (statusResult.status === "fulfilled") setPaused(statusResult.value.paused);
+        if (endpointsResult.status === "fulfilled") setEndpoints(endpointsResult.value);
+        const errors = [summaryResult, statusResult, endpointsResult]
+          .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+          .map((result) => String(result.reason));
+        setLoadError(errors.length > 0 ? errors.join(" ") : null);
+        break;
+      }
+    } finally {
+      loading.current = false;
+    }
   }
 
   useEffect(() => {
-    void load().catch(() => setSummary(null));
+    void load();
     const timer = window.setInterval(() => void load(), 10_000);
     return () => window.clearInterval(timer);
   }, [activeEmail]);
 
   async function togglePause() {
-    if (paused) await processingResume();
-    else await processingPause();
-    await load();
+    try {
+      if (paused) await processingResume();
+      else await processingPause();
+      await load();
+    } catch (error) {
+      setLoadError(String(error));
+    }
   }
 
   const count = (state: string) => summary?.counts.find((entry) => entry.state === state)?.count ?? 0;
@@ -45,6 +69,7 @@ export default function Operations() {
         </div>
         <button type="button" onClick={() => void togglePause()} className={`rounded-lg px-4 py-2 text-sm font-medium text-white ${paused ? "bg-emerald-600 hover:bg-emerald-700" : "bg-amber-600 hover:bg-amber-700"}`}>{paused ? "Resume worker" : "Pause worker"}</button>
       </header>
+      {loadError && <div className="mb-6"><LoadError title="Could not load all operational data" error={loadError} onRetry={() => void load()} /></div>}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {trackedStates.map((state) => <div key={state} className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-700 dark:bg-gray-800"><p className="text-sm capitalize text-gray-500 dark:text-gray-400">{state.replace(/_/g, " ")}</p><p className="mt-2 text-3xl font-semibold tabular-nums">{count(state)}</p></div>)}
       </div>
