@@ -32,13 +32,14 @@ busy lane. A run owns a lease token only while its current preparation or
 decision stage is active and moves through `queued`, `processing`,
 `retry_wait`, `completed`, `needs_attention`, or `resolved_externally`.
 
-Each run references an immutable ruleset snapshot containing:
+Each run references a ruleset snapshot containing:
 
 - rules, ordering, actions, choices, and learned memories;
 - the routing-policy and provider configuration used for its decisions.
 
-Editing a rule, memory, or LLM configuration publishes a new snapshot. New
-messages use it; existing runs keep their original behavior.
+Editing a rule, memory, or LLM configuration publishes a new snapshot. Queued,
+retrying, and attention-needed runs switch to it before their next step. A run
+that already holds a lease finishes its current step before it adopts changes.
 
 ## Rule Chain
 

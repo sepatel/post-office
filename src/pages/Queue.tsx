@@ -4,7 +4,6 @@ import {
   workflowMessagesList,
   workflowQueueSummary,
   workflowRetryNow,
-  workflowRetryWithCurrentRules,
   type WorkflowQueueItem,
   type WorkflowQueueSummary,
   type WorkflowRunState,
@@ -14,7 +13,7 @@ import { useGate } from "../lib/gate";
 
 const states: Array<{ id: WorkflowRunState; label: string }> = [
   { id: "needs_attention", label: "Needs attention" },
-  { id: "processing", label: "Processing" },
+  { id: "processing", label: "Leased" },
   { id: "retry_wait", label: "Retry waiting" },
   { id: "queued", label: "Queued" },
   { id: "completed", label: "Completed" },
@@ -85,16 +84,6 @@ export default function Queue() {
     setRetrying(item.run_id);
     try {
       await workflowRetryNow(item.run_id);
-      await load();
-    } finally {
-      setRetrying(null);
-    }
-  }
-
-  async function retryWithCurrentRules(item: WorkflowQueueItem) {
-    setRetrying(item.run_id);
-    try {
-      await workflowRetryWithCurrentRules(item.run_id);
       await load();
     } finally {
       setRetrying(null);
@@ -177,7 +166,8 @@ export default function Queue() {
                   <span>Message #{item.message_id}</span>
                   <span>v{item.rule_set_version}</span>
                   {item.next_rule_name && <span>Rule {item.next_rule_index + 1}: {item.next_rule_name}</span>}
-                  {item.next_model && <span>Model lane: {item.next_model}</span>}
+                  {item.next_endpoint && <span>Endpoint: {item.next_endpoint}</span>}
+                  {item.next_model && <span>Model: {item.next_model}</span>}
                   <span>{formatLocalDateTime(item.created_at, "-")}</span>
                 </div>
                 {((item.state === "needs_attention" || item.state === "retry_wait") ? item.last_error : item.preview) && (
@@ -200,21 +190,11 @@ export default function Queue() {
                 {(item.state === "needs_attention" || item.state === "retry_wait") && (
                   <button
                     type="button"
-                    onClick={() => void retryWithCurrentRules(item)}
-                    disabled={retrying === item.run_id}
-                    className="rounded-lg border border-blue-300 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/30"
-                  >
-                    {retrying === item.run_id ? "Queuing…" : "Retry with current rules"}
-                  </button>
-                )}
-                {(item.state === "needs_attention" || item.state === "retry_wait") && (
-                  <button
-                    type="button"
                     onClick={() => void retry(item)}
                     disabled={retrying === item.run_id}
                     className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
                   >
-                    {retrying === item.run_id ? "Queuing…" : "Retry"}
+                    {retrying === item.run_id ? "Queuing…" : "Retry with latest rules"}
                   </button>
                 )}
                 <Link

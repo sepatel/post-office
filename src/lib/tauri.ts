@@ -470,10 +470,6 @@ export async function workflowRetryNow(runId: number): Promise<boolean> {
   return invoke("workflow_retry_now", { runId });
 }
 
-export async function workflowRetryWithCurrentRules(runId: number): Promise<boolean> {
-  return invoke("workflow_retry_with_current_rules", { runId });
-}
-
 export interface WorkflowRuleSetStatus {
   version: number;
   active: boolean;

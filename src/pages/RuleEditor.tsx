@@ -421,13 +421,14 @@ export default function RuleEditor() {
         };
       });
 
+    const automatic = decisionMode === "automatic";
     return {
       name,
       description: description || null,
       conditions: normalizedConditions,
-      prompt,
-      choices: normalizeLabelValues(choices, "choice"),
-      choose_from_all_labels: chooseFromAllLabels,
+      prompt: automatic ? "" : prompt,
+      choices: automatic ? [] : normalizeLabelValues(choices, "choice"),
+      choose_from_all_labels: automatic ? false : chooseFromAllLabels,
       actions: normalizeLabelValues(actions, "action"),
       priority,
       enabled,
@@ -511,6 +512,11 @@ export default function RuleEditor() {
     }
     if (normalizedChoices.length > 0) {
       setChoices((prev) => [...prev, ...normalizedChoices]);
+    }
+    if (normalizedChoices.length > 0) {
+      setDecisionMode("classify");
+    } else if (proposal.prompt?.trim()) {
+      setDecisionMode("match");
     }
     if (normalizedConditions.length > 0) {
       setConditions((prev) => [...prev, ...normalizedConditions]);
@@ -612,7 +618,7 @@ export default function RuleEditor() {
 
         {isEdit && activeTab === "activity" && (
           <div className="mb-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-100">
-            This rule publishes a new snapshot for future arrivals. Production outcomes belong to each message run in the <Link to="/queue" className="font-semibold underline">Queue</Link>.
+            Saving applies this rule to every unfinished message. Production outcomes belong to each message run in the <Link to="/queue" className="font-semibold underline">Queue</Link>.
           </div>
         )}
 

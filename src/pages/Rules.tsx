@@ -109,7 +109,7 @@ export default function Rules() {
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-blue-600 dark:text-blue-300">Automation blueprint</p>
           <h1 className="mt-1 text-3xl font-semibold tracking-tight">Rules</h1>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">Changes publish a new snapshot for future arrivals. Active messages finish against the snapshot they entered with.</p>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">Changes apply to every unfinished message. A message already in a leased step finishes that step safely.</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <button type="button" onClick={() => void exportBackup()} disabled={backupBusy} className="rounded-lg border border-gray-300 px-3 py-2 text-sm font-medium hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:hover:bg-gray-800">Export</button>
@@ -123,12 +123,12 @@ export default function Rules() {
         <div className="rounded-2xl border border-blue-200 bg-blue-50 p-5 dark:border-blue-900/70 dark:bg-blue-950/30">
           <p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-600 dark:text-blue-300">Current blueprint</p>
           <p className="mt-2 text-2xl font-semibold">Ruleset v{active?.version ?? "-"}</p>
-          <p className="mt-1 text-sm text-blue-800/80 dark:text-blue-200/80">New arrivals enter this version.</p>
+          <p className="mt-1 text-sm text-blue-800/80 dark:text-blue-200/80">New and unfinished messages use this version.</p>
         </div>
         <div className="rounded-2xl border border-gray-200 bg-white p-5 dark:border-gray-700 dark:bg-gray-800">
-          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">Work on older snapshots</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">Leased work on older rules</p>
           <p className="mt-2 text-2xl font-semibold">{olderActive}</p>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">These messages remain deterministic while the rules evolve.</p>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">These messages complete their current step before adopting changes.</p>
         </div>
       </section>
 

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, Result, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -164,6 +164,10 @@ impl Database {
                 "../../../../migrations/023_workflow_model_route.sql"
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (23)", [])?;
+        }
+        if !migration_applied(&transaction, 24)? {
+            migrate_model_lane_capacities(&transaction)?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (24)", [])?;
         }
         transaction.commit()
     }
@@ -511,6 +515,37 @@ fn has_table(transaction: &Transaction<'_>, table: &str) -> Result<bool> {
         .map(|value| value.is_some())
 }
 
+fn migrate_model_lane_capacities(transaction: &Transaction<'_>) -> Result<()> {
+    let providers = transaction
+        .query_row(
+            "SELECT value FROM config WHERE key = 'llm.providers'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(providers) = providers {
+        if let Ok(mut providers) =
+            serde_json::from_str::<Vec<crate::llm::LlmProviderProfile>>(&providers)
+        {
+            for provider in &mut providers {
+                provider.max_concurrent_requests = 1;
+            }
+            let providers = serde_json::to_string(&providers)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            transaction.execute(
+                "UPDATE config SET value = ?2, updated_at = datetime('now') WHERE key = ?1",
+                params!["llm.providers", providers],
+            )?;
+        }
+    }
+    transaction.execute(
+        "INSERT INTO config (key, value, updated_at) VALUES (?1, '1', datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = datetime('now')",
+        ["llm.legacy_max_concurrent_requests"],
+    )?;
+    Ok(())
+}
+
 fn has_column(transaction: &Transaction<'_>, table: &str, column: &str) -> Result<bool> {
     let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement
@@ -551,6 +586,8 @@ mod tests {
     use std::path::Path;
 
     use super::Database;
+    use crate::config::AppConfig;
+    use crate::llm::{LlmProviderProfile, ReasoningEffort};
 
     #[test]
     fn migrations_are_applied_once() {
@@ -636,5 +673,44 @@ mod tests {
         assert_eq!(accounts[0].email, "recover@example.com");
         db.with_accounts(|repo| repo.add("new@example.com"))
             .unwrap();
+    }
+
+    #[test]
+    fn lane_capacity_migration_resets_existing_provider_limits() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        let config = AppConfig {
+            llm_legacy_max_concurrent_requests: 4,
+            llm_providers: vec![LlmProviderProfile {
+                id: "taxonomy".into(),
+                name: "Taxonomy".into(),
+                base_url: "http://localhost:4000/v1".into(),
+                model: "taxonomy".into(),
+                api_key_ref: "taxonomy".into(),
+                quality_tier: "balanced".into(),
+                privacy_status: "local".into(),
+                input_cost_per_million_usd: 0.0,
+                output_cost_per_million_usd: 0.0,
+                timeout_secs: 30,
+                context_window_tokens: 8_192,
+                max_concurrent_requests: 4,
+                output_tokens_per_second: 0.0,
+                chat_reasoning_effort: ReasoningEffort::ServerDefault,
+                enabled: true,
+            }],
+            ..AppConfig::default()
+        };
+        db.with_config(|repo| config.save(&repo)).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM schema_migrations WHERE version = 24", [])
+            .unwrap();
+
+        db.migrate().unwrap();
+
+        let config = db.with_config(|repo| AppConfig::load(&repo));
+        assert_eq!(config.llm_legacy_max_concurrent_requests, 1);
+        assert_eq!(config.llm_providers[0].max_concurrent_requests, 1);
     }
 }

@@ -3,7 +3,6 @@ import { Link, useParams } from "react-router-dom";
 import {
   workflowMessageGet,
   workflowRetryNow,
-  workflowRetryWithCurrentRules,
   type WorkflowMessageDetail,
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
@@ -158,17 +157,6 @@ export default function MessageDetail() {
     }
   }
 
-  async function retryWithCurrentRules() {
-    if (!detail) return;
-    setRetrying(true);
-    try {
-      await workflowRetryWithCurrentRules(detail.run_id);
-      await load();
-    } finally {
-      setRetrying(false);
-    }
-  }
-
   if (detail === undefined) return <div className="p-8 text-sm text-gray-400">Loading message…</div>;
   if (detail === null) return <div className="p-8 text-sm text-gray-400">Message not found for this account.</div>;
 
@@ -184,7 +172,7 @@ export default function MessageDetail() {
             <h1 className="mt-1 break-words text-3xl font-semibold tracking-tight">{detail.subject || "Untitled message"}</h1>
             <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">{detail.sender || "Unknown sender"} · received {formatLocalDateTime(detail.created_at, "-")}</p>
           </div>
-          {retryable && <div className="flex flex-col items-end gap-2 text-right"><button type="button" onClick={() => void retryWithCurrentRules()} disabled={retrying} className="rounded-lg border border-blue-300 px-4 py-2 text-sm font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/30">{retrying ? "Queuing…" : "Retry with current rules"}</button><button type="button" onClick={() => void retry()} disabled={retrying} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">Run manual retry</button><p className="max-w-xs text-xs text-gray-500 dark:text-gray-400">Uses the latest rule settings from this point. Manual retry keeps this run’s pinned rules.</p></div>}
+          {retryable && <div className="text-right"><button type="button" onClick={() => void retry()} disabled={retrying} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">{retrying ? "Queuing…" : "Retry with latest rules"}</button><p className="mt-1 max-w-xs text-xs text-gray-500 dark:text-gray-400">Uses the latest rule settings from this point.</p></div>}
         </div>
         <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-3 border-t border-gray-100 pt-5 text-sm dark:border-gray-700 sm:grid-cols-5">
           <div><span className="block text-xs text-gray-500">State</span><span className="font-medium">{title(detail.state)}</span></div>

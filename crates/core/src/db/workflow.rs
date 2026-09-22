@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 use serde::Serialize;
 
 pub const MAX_ATTEMPTS: i64 = 3;
@@ -70,6 +70,7 @@ impl<'a> WorkflowRepository<'a> {
             params![account_email, version, rules_json],
         )?;
         let id = tx.last_insert_rowid();
+        rebind_unfinished_runs(&tx, account_email, id)?;
         tx.commit()?;
         self.conn.query_row(
             "SELECT id, account_email, version, rules_json, created_at
@@ -77,6 +78,23 @@ impl<'a> WorkflowRepository<'a> {
             [id],
             map_rule_set,
         )
+    }
+
+    pub fn rebind_unfinished_runs(&self, account_email: &str) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let rule_set_id = tx
+            .query_row(
+                "SELECT id FROM workflow_rule_sets WHERE account_email = ?1 AND active = 1",
+                [account_email],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(rule_set_id) = rule_set_id else {
+            return Ok(0);
+        };
+        let changed = rebind_unfinished_runs(&tx, account_email, rule_set_id)?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Records arrivals before moving the Gmail cursor. Replaying a page is safe:
@@ -280,6 +298,10 @@ impl<'a> WorkflowRepository<'a> {
             "UPDATE workflow_runs
              SET state = 'queued', route_provider_id = NULL, route_endpoint = NULL,
                  route_model = NULL, route_max_concurrent_requests = NULL,
+                 rule_set_id = COALESCE((
+                     SELECT id FROM workflow_rule_sets
+                     WHERE account_email = workflow_runs.account_email AND active = 1
+                 ), rule_set_id),
                  lease_token = NULL, lease_until = NULL, last_error = NULL,
                  updated_at = datetime('now')
              WHERE id = ?1 AND state = 'processing' AND lease_token = ?2",
@@ -463,9 +485,13 @@ impl<'a> WorkflowRepository<'a> {
                      WHEN manual_retry = 1 OR attempt_count + 1 >= ?4 THEN next_attempt_at
                      ELSE datetime('now', '+' || ?3 || ' seconds')
                  END,
-                  lease_token = NULL, lease_until = NULL, manual_retry = 0, last_error = ?5,
-                  route_provider_id = NULL, route_endpoint = NULL, route_model = NULL,
-                  route_max_concurrent_requests = NULL, updated_at = datetime('now')
+                   lease_token = NULL, lease_until = NULL, manual_retry = 0, last_error = ?5,
+                   route_provider_id = NULL, route_endpoint = NULL, route_model = NULL,
+                   route_max_concurrent_requests = NULL,
+                   rule_set_id = COALESCE((
+                       SELECT id FROM workflow_rule_sets
+                       WHERE account_email = workflow_runs.account_email AND active = 1
+                   ), rule_set_id), updated_at = datetime('now')
              WHERE id = ?1 AND state = 'processing' AND lease_token = ?2",
             params![
                 run_id,
@@ -653,7 +679,12 @@ impl<'a> WorkflowRepository<'a> {
         if continue_chain {
             tx.execute(
                 "UPDATE workflow_runs
-                 SET next_rule_index = ?3, updated_at = datetime('now')
+                  SET next_rule_index = ?3,
+                      rule_set_id = COALESCE((
+                          SELECT id FROM workflow_rule_sets
+                          WHERE account_email = workflow_runs.account_email AND active = 1
+                      ), rule_set_id),
+                      updated_at = datetime('now')
                  WHERE id = ?1 AND lease_token = ?2",
                 params![run_id, lease_token, next_rule_index],
             )?;
@@ -777,46 +808,21 @@ impl<'a> WorkflowRepository<'a> {
 
     pub fn retry_now(&self, account_email: &str, run_id: i64) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
-        let changed = tx.execute(
-            "UPDATE workflow_runs
-             SET state = 'queued', next_attempt_at = datetime('now'), lease_token = NULL,
-                  lease_until = NULL, manual_retry = 1, route_provider_id = NULL,
-                  route_endpoint = NULL, route_model = NULL,
-                  route_max_concurrent_requests = NULL, updated_at = datetime('now')
-             WHERE id = ?1 AND account_email = ?2
-               AND state IN ('retry_wait', 'needs_attention')",
-            params![run_id, account_email],
-        )?;
-        if changed > 0 {
-            tx.execute(
-                "INSERT INTO workflow_events (account_email, message_id, run_id, kind, detail)
-                 SELECT account_email, message_id, id, 'retry_requested', 'Manual retry requested'
-                 FROM workflow_runs WHERE id = ?1",
-                [run_id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(changed > 0)
-    }
-
-    pub fn retry_with_current_rule_set(&self, account_email: &str, run_id: i64) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
-        let active_rule_set = tx
+        let rule_set_id = tx
             .query_row(
-                "SELECT id, version FROM workflow_rule_sets
-                 WHERE account_email = ?1 AND active = 1",
+                "SELECT id FROM workflow_rule_sets WHERE account_email = ?1 AND active = 1",
                 [account_email],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        let Some((rule_set_id, version)) = active_rule_set else {
+        let Some(rule_set_id) = rule_set_id else {
             return Ok(false);
         };
         let changed = tx.execute(
             "UPDATE workflow_runs
-             SET rule_set_id = ?3, state = 'queued', next_attempt_at = datetime('now'),
-                 lease_token = NULL, lease_until = NULL, manual_retry = 1,
-                 route_provider_id = NULL, route_endpoint = NULL, route_model = NULL,
+             SET rule_set_id = ?3, state = 'queued', next_attempt_at = datetime('now'), lease_token = NULL,
+                 lease_until = NULL, manual_retry = 1, route_provider_id = NULL,
+                 route_endpoint = NULL, route_model = NULL,
                  route_max_concurrent_requests = NULL, updated_at = datetime('now')
              WHERE id = ?1 AND account_email = ?2
                AND state IN ('retry_wait', 'needs_attention')",
@@ -825,12 +831,9 @@ impl<'a> WorkflowRepository<'a> {
         if changed > 0 {
             tx.execute(
                 "INSERT INTO workflow_events (account_email, message_id, run_id, kind, detail)
-                 SELECT account_email, message_id, id, 'retry_current_rules_requested', ?2
+                 SELECT account_email, message_id, id, 'retry_requested', 'Manual retry requested'
                  FROM workflow_runs WHERE id = ?1",
-                params![
-                    run_id,
-                    format!("Manual retry using current rule set v{version}")
-                ],
+                [run_id],
             )?;
         }
         tx.commit()?;
@@ -1039,6 +1042,21 @@ impl<'a> WorkflowRepository<'a> {
         })?;
         rows.collect()
     }
+}
+
+fn rebind_unfinished_runs(
+    transaction: &Transaction<'_>,
+    account_email: &str,
+    rule_set_id: i64,
+) -> Result<usize> {
+    transaction.execute(
+        "UPDATE workflow_runs
+         SET rule_set_id = ?2, route_provider_id = NULL, route_endpoint = NULL,
+             route_model = NULL, route_max_concurrent_requests = NULL, updated_at = datetime('now')
+         WHERE account_email = ?1
+           AND state IN ('queued', 'retry_wait', 'needs_attention')",
+        params![account_email, rule_set_id],
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1440,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_with_current_rule_set_rebinds_an_eligible_run() {
+    fn activating_a_rule_set_rebinds_unfinished_runs() {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
         db.with_workflow(|repo| {
@@ -1452,19 +1470,24 @@ mod tests {
             repo.retry_run(run.id, "lease-1", "decision failed", 60)?;
             let current = repo.activate_rule_set("test@example.com", r#"{"rules":["current"]}"#)?;
 
-            assert!(repo.retry_with_current_rule_set("test@example.com", run.id)?);
-
             let stored = repo
                 .run_for_message("test@example.com", run.message_id)?
                 .unwrap();
             assert_eq!(stored.rule_set_version, current.version);
             assert_ne!(stored.rule_set_version, original.version);
-            assert_eq!(stored.state, "queued");
+            assert_eq!(stored.state, "retry_wait");
             assert!(stored.route_endpoint.is_none());
+            assert!(repo.retry_now("test@example.com", run.id)?);
+
+            let stored = repo
+                .run_for_message("test@example.com", run.message_id)?
+                .unwrap();
+            assert_eq!(stored.rule_set_version, current.version);
+            assert_eq!(stored.state, "queued");
             assert!(repo
                 .events(run.id)?
                 .iter()
-                .any(|event| event.kind == "retry_current_rules_requested"));
+                .any(|event| event.kind == "retry_requested"));
             Ok::<(), rusqlite::Error>(())
         })
         .unwrap();

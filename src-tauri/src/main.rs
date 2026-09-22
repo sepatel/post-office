@@ -158,7 +158,6 @@ fn main() {
             commands::workflow_messages_list,
             commands::workflow_message_get,
             commands::workflow_retry_now,
-            commands::workflow_retry_with_current_rules,
             commands::workflow_rule_set_status,
             commands::workflow_endpoint_status,
             commands::history_list,

@@ -1321,18 +1321,8 @@ pub async fn workflow_message_get(
 #[tauri::command]
 pub async fn workflow_retry_now(state: State<'_, AppState>, run_id: i64) -> Result<bool, String> {
     let account_email = active_account(&*state.config.lock().await)?;
-    post_office_core::workflow::retry_now(&state.db, &account_email, run_id)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub async fn workflow_retry_with_current_rules(
-    state: State<'_, AppState>,
-    run_id: i64,
-) -> Result<bool, String> {
-    let account_email = active_account(&*state.config.lock().await)?;
     publish_current_rule_set(&state, &account_email).await?;
-    post_office_core::workflow::retry_with_current_rule_set(&state.db, &account_email, run_id)
+    post_office_core::workflow::retry_now(&state.db, &account_email, run_id)
         .map_err(|error| error.to_string())
 }
 

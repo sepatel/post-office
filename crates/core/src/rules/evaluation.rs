@@ -132,12 +132,11 @@ fn decision_context(
     rule: &Rule,
     labels: &[Label],
 ) -> Option<DecisionContext> {
-    let has_instruction = !rule.prompt.trim().is_empty();
     let menu = choice_catalog(rule, labels);
-    // A menu explicitly asks for inference, even without an instruction.
-    if !has_instruction && menu.is_empty() {
+    if !crate::rules::engine::needs_llm_decision(rule, labels) {
         return None;
     }
+    let has_instruction = !rule.prompt.trim().is_empty();
     let system_prompt = decision_prompt(&menu, has_instruction);
     let reserved_completion_tokens = llm.decision_context_reserve_tokens(rule.decision_max_tokens);
     let budget = llm

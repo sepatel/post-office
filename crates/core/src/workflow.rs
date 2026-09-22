@@ -17,7 +17,7 @@ use crate::llm::{
     InferenceRouter, InferenceRuntime, LlmProviderProfile, LlmRoutingPolicy, ReasoningEffort,
 };
 use crate::rules::actions::resolve_actions;
-use crate::rules::engine::{choice_catalog, resolve_rule, Outcome, Resolved};
+use crate::rules::engine::{needs_llm_decision, resolve_rule, Outcome, Resolved};
 use crate::rules::matcher;
 use crate::rules::models::Rule;
 
@@ -182,14 +182,6 @@ pub fn message_detail(
 
 pub fn retry_now(db: &Database, account_email: &str, run_id: i64) -> Result<bool, rusqlite::Error> {
     db.with_workflow(|repo| repo.retry_now(account_email, run_id))
-}
-
-pub fn retry_with_current_rule_set(
-    db: &Database,
-    account_email: &str,
-    run_id: i64,
-) -> Result<bool, rusqlite::Error> {
-    db.with_workflow(|repo| repo.retry_with_current_rule_set(account_email, run_id))
 }
 
 pub fn rule_set_status(
@@ -463,8 +455,7 @@ impl LlmSnapshot {
     }
 }
 
-/// Publishes a full immutable rule-set snapshot. Existing runs retain their
-/// referenced snapshot while messages that arrive after an edit use this one.
+/// Publishes the latest rules for every unfinished run that has not been leased.
 pub fn publish_rule_set(
     db: &Database,
     account_email: &str,
@@ -495,7 +486,7 @@ pub fn publish_rule_set(
             .active_rule_set(account_email)?
             .is_some_and(|current| current.rules_json == serialized)
         {
-            Ok(())
+            repo.rebind_unfinished_runs(account_email).map(|_| ())
         } else {
             repo.activate_rule_set(account_email, &serialized)
                 .map(|_| ())
@@ -814,7 +805,7 @@ pub async fn prepare_run(
             continue;
         }
 
-        if rule.prompt.trim().is_empty() && choice_catalog(rule, &labels).is_empty() {
+        if !needs_llm_decision(rule, &labels) {
             let resolved =
                 resolve_rule(&llm, rule, &message, &rule_snapshot.memories, &labels).await?;
             persist_decision(db, &run, rule, rule_index, &labels, &resolved)?;
@@ -900,6 +891,10 @@ pub async fn process_routed_run(
         return Ok(());
     };
     let rule = &rule_snapshot.rule;
+    if !needs_llm_decision(rule, &labels) {
+        db.with_workflow(|repo| repo.yield_run(run.id, &run.lease_token))?;
+        return Ok(());
+    }
     let (route_endpoint, route_model) = match (&run.route_endpoint, &run.route_model) {
         (Some(endpoint), Some(model)) => (endpoint, model),
         _ => {
