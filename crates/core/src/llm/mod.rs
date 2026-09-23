@@ -5,7 +5,8 @@ pub mod runtime;
 
 pub use client::LlmClient;
 pub use router::{
-    InferenceRouter, LlmProviderProfile, LlmRoutingPolicy, PrivacyRequirement, ReasoningEffort,
+    configure_runtime, InferenceRouter, LlmProviderProfile, LlmRoutingPolicy, PrivacyRequirement,
+    ReasoningEffort,
 };
 pub use runtime::InferenceRuntime;
 

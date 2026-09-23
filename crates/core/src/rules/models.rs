@@ -37,7 +37,7 @@ fn default_inference_policy() -> String {
 }
 
 fn default_decision_reasoning_effort() -> ReasoningEffort {
-    ReasoningEffort::ServerDefault
+    ReasoningEffort::Off
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

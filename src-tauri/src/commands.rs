@@ -25,6 +25,7 @@ use std::time::Duration;
 use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
+use tauri_plugin_notification::NotificationExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -44,6 +45,7 @@ pub fn spawn_message_workflow_worker(
     inference_runtime: post_office_core::llm::InferenceRuntime,
 ) {
     tauri::async_runtime::spawn(async move {
+        let mut attention_counts = HashMap::<String, i64>::new();
         loop {
             let cfg = config.lock().await.clone();
             let accounts = db
@@ -58,46 +60,217 @@ pub fn spawn_message_workflow_worker(
                 let account_email = account.email;
                 let processing_state =
                     processing_state_for(&processing_states, &db, &account_email);
-                let workflow_running = {
+                let (
+                    paused,
+                    stop_requested,
+                    stop_requested_flag,
+                    workflow_running,
+                    workflow_active_runs,
+                ) = {
                     let processing = processing_state.lock().await;
-                    if processing.paused.load(Ordering::Relaxed)
-                        || processing.stop_requested.load(Ordering::Relaxed)
-                    {
-                        continue;
-                    }
-                    processing.workflow_running.clone()
+                    (
+                        processing.paused.load(Ordering::Relaxed),
+                        processing.stop_requested.load(Ordering::Relaxed),
+                        processing.stop_requested.clone(),
+                        processing.workflow_running.clone(),
+                        processing.workflow_active_runs.clone(),
+                    )
                 };
-                if workflow_running.swap(true, Ordering::Relaxed) {
+                if paused || stop_requested {
                     continue;
+                }
+                if workflow_active_runs.fetch_add(1, Ordering::AcqRel) == 0 {
+                    workflow_running.store(true, Ordering::Release);
                 }
                 let auth = match load_gmail_auth_for_account(&app, &cfg, &account_email) {
                     Ok(auth) => auth,
                     Err(error) => {
+                        let _ = db.with_accounts(|repo| repo.record_error(&account_email, &error));
                         tracing::warn!(
                             "Message workflow could not load Gmail credentials for {}: {}",
                             account_email,
                             error
                         );
-                        workflow_running.store(false, Ordering::Relaxed);
+                        if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            workflow_running.store(false, Ordering::Release);
+                        }
                         continue;
                     }
                 };
+                if stop_requested_flag.load(Ordering::Acquire) {
+                    if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        workflow_running.store(false, Ordering::Release);
+                    }
+                    continue;
+                }
                 let mut gmail = GmailClient::new(auth);
-                match post_office_core::workflow::process_pending_runs(
-                    &db,
-                    &account_email,
-                    &mut gmail,
-                    &cfg,
-                    inference_runtime.clone(),
-                )
-                .await
-                {
-                    Ok(count) => processed |= count > 0,
-                    Err(error) => {
-                        tracing::warn!("Message workflow failed for {}: {}", account_email, error)
+
+                let lease_token = post_office_core::workflow::new_lease_token();
+                let next_run =
+                    db.with_workflow(|repo| repo.claim_next_unrouted(&account_email, &lease_token));
+                match next_run {
+                    Ok(Some(run)) => {
+                        processed = true;
+                        if workflow_active_runs.fetch_add(1, Ordering::AcqRel) == 0 {
+                            workflow_running.store(true, Ordering::Release);
+                        }
+                        let result = post_office_core::workflow::prepare_run(
+                            &db,
+                            &mut gmail,
+                            &cfg,
+                            inference_runtime.clone(),
+                            run,
+                        )
+                        .await;
+                        if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            workflow_running.store(false, Ordering::Release);
+                        }
+                        if let Err(error) = result {
+                            tracing::warn!(
+                                "Message workflow preparation failed for {}: {}",
+                                account_email,
+                                error
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        "Message workflow could not claim preparation work for {}: {}",
+                        account_email,
+                        error
+                    ),
+                }
+
+                if stop_requested_flag.load(Ordering::Acquire) {
+                    if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        workflow_running.store(false, Ordering::Release);
+                    }
+                    continue;
+                }
+
+                let routes = db.with_workflow(|repo| repo.ready_routes(&account_email));
+                match routes {
+                    Ok(routes) => {
+                        for route in routes {
+                            while let Some(permit) = inference_runtime.try_acquire(
+                                &route.endpoint,
+                                &route.model,
+                                route.max_concurrent_requests,
+                            ) {
+                                let lease_token = post_office_core::workflow::new_lease_token();
+                                let run = match db.with_workflow(|repo| {
+                                    repo.claim_next_for_route(
+                                        &account_email,
+                                        &route.endpoint,
+                                        &route.model,
+                                        &lease_token,
+                                    )
+                                }) {
+                                    Ok(Some(run)) => run,
+                                    Ok(None) => break,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            "Message workflow could not claim routed work for {}: {}",
+                                            account_email,
+                                            error
+                                        );
+                                        break;
+                                    }
+                                };
+                                processed = true;
+                                if workflow_active_runs.fetch_add(1, Ordering::AcqRel) == 0 {
+                                    workflow_running.store(true, Ordering::Release);
+                                }
+                                let task_db = Arc::clone(&db);
+                                let task_config = cfg.clone();
+                                let task_runtime = inference_runtime.clone();
+                                let task_gmail = gmail.clone();
+                                let task_route = route.clone();
+                                let task_running = workflow_running.clone();
+                                let task_active_runs = workflow_active_runs.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    let mut task_gmail = task_gmail;
+                                    let decision_runtime = task_runtime.clone();
+                                    let renewal_run = run.clone();
+                                    let decision = task_runtime.with_reservation(
+                                        &task_route.endpoint,
+                                        &task_route.model,
+                                        permit,
+                                        post_office_core::workflow::process_routed_run(
+                                            &task_db,
+                                            &mut task_gmail,
+                                            &task_config,
+                                            decision_runtime,
+                                            run,
+                                        ),
+                                    );
+                                    tokio::pin!(decision);
+                                    let mut lease_renewal =
+                                        tokio::time::interval(Duration::from_secs(60));
+                                    lease_renewal.tick().await;
+                                    let result = loop {
+                                        tokio::select! {
+                                            result = &mut decision => break result,
+                                            _ = lease_renewal.tick() => {
+                                                if !task_db.with_workflow(|repo| {
+                                                    repo.renew_lease(
+                                                        renewal_run.id,
+                                                        &renewal_run.lease_token,
+                                                    )
+                                                }).unwrap_or(false) {
+                                                    tracing::warn!("Message workflow lost its decision lease");
+                                                }
+                                            }
+                                        }
+                                    };
+                                    if let Err(error) = result {
+                                        tracing::warn!(
+                                            "Message workflow decision failed: {}",
+                                            error
+                                        );
+                                    }
+                                    if task_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                        task_running.store(false, Ordering::Release);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        "Message workflow could not inspect routed work for {}: {}",
+                        account_email,
+                        error
+                    ),
+                }
+                if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    workflow_running.store(false, Ordering::Release);
+                }
+
+                let attention = db
+                    .with_workflow(|repo| repo.state_counts(&account_email))
+                    .ok()
+                    .and_then(|counts| {
+                        counts
+                            .into_iter()
+                            .find(|entry| entry.state == "needs_attention")
+                            .map(|entry| entry.count)
+                    })
+                    .unwrap_or(0);
+                if let Some(previous) = attention_counts.insert(account_email.clone(), attention) {
+                    if attention > previous {
+                        let _ = app
+                            .notification()
+                            .builder()
+                            .title("Post Office needs attention")
+                            .body(format!(
+                                "{} message{} need attention in {}",
+                                attention,
+                                if attention == 1 { "" } else { "s" },
+                                account_email
+                            ))
+                            .show();
                     }
                 }
-                workflow_running.store(false, Ordering::Relaxed);
             }
 
             if !processed {
@@ -202,7 +375,7 @@ async fn publish_all_rule_sets(state: &AppState) -> Result<(), String> {
 }
 
 fn default_decision_reasoning_effort() -> post_office_core::llm::ReasoningEffort {
-    post_office_core::llm::ReasoningEffort::ServerDefault
+    post_office_core::llm::ReasoningEffort::Off
 }
 
 #[derive(Debug, Serialize)]
@@ -490,7 +663,10 @@ pub async fn accounts_list(state: State<'_, AppState>) -> Result<AccountsState, 
 }
 
 #[tauri::command]
-pub async fn accounts_select(state: State<'_, AppState>, email: String) -> Result<(), String> {
+pub async fn accounts_select(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<AccountsState, String> {
     let exists = state
         .db
         .with_accounts(|repo| repo.get(&email))
@@ -501,13 +677,20 @@ pub async fn accounts_select(state: State<'_, AppState>, email: String) -> Resul
     }
 
     let mut config = state.config.lock().await;
-    config.gmail_account = Some(email);
+    config.gmail_account = Some(email.clone());
     state
         .db
         .with_config(|repo| config.save(&repo))
         .map_err(|error| error.to_string())?;
     drop(config);
-    publish_all_rule_sets(&state).await
+    let accounts = state
+        .db
+        .with_accounts(|repo| repo.list())
+        .map_err(|error| error.to_string())?;
+    Ok(AccountsState {
+        accounts,
+        active_email: Some(email),
+    })
 }
 
 #[tauri::command]
@@ -569,12 +752,12 @@ pub async fn accounts_remove(
     state.inference_runtime.cancel_all();
     let stopped = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let running = processing_state
+            let active_runs = processing_state
                 .lock()
                 .await
-                .workflow_running
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if !running {
+                .workflow_active_runs
+                .load(std::sync::atomic::Ordering::Acquire);
+            if active_runs == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -665,10 +848,14 @@ pub async fn llm_config_set(
     config.llm_providers = update.providers;
     config.llm_routing_policies = update.routing_policies;
     config.llm_default_policy = update.default_policy;
+    let updated_config = config.clone();
     state
         .db
         .with_config(|repo| config.save(&repo))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    drop(config);
+    post_office_core::llm::configure_runtime(&updated_config, &state.inference_runtime);
+    publish_all_rule_sets(&state).await
 }
 
 #[tauri::command]
@@ -1102,6 +1289,69 @@ pub async fn rules_apply(
     _message_id: String,
 ) -> Result<ApplyResult, String> {
     Err("Direct Gmail application was removed. Queue a message run instead.".into())
+}
+
+#[tauri::command]
+pub async fn workflow_queue_summary(
+    state: State<'_, AppState>,
+) -> Result<post_office_core::workflow::QueueSummary, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::queue_summary(&state.db, &account_email)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_messages_list(
+    state: State<'_, AppState>,
+    run_state: Option<String>,
+    page: u32,
+    per_page: u32,
+) -> Result<Vec<post_office_core::workflow::QueueItem>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::queue_items(
+        &state.db,
+        &account_email,
+        run_state.as_deref(),
+        page,
+        per_page,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_message_get(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> Result<Option<post_office_core::workflow::MessageDetail>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::message_detail(&state.db, &account_email, message_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_retry_now(state: State<'_, AppState>, run_id: i64) -> Result<bool, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::retry_now(&state.db, &account_email, run_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_rule_set_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::workflow::WorkflowRuleSetStatus>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::rule_set_status(&state.db, &account_email)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn workflow_endpoint_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::llm_endpoint_status::LlmEndpointStatus>, String> {
+    state
+        .db
+        .with_llm_endpoint_status(|repo| repo.list())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1583,6 +1833,7 @@ pub async fn llm_provider_test(
                 .trim()
                 .trim_end_matches('/')
                 .to_ascii_lowercase(),
+            &provider.model,
             provider.max_concurrent_requests as usize,
         )
         .await;

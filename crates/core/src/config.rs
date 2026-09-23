@@ -49,7 +49,7 @@ impl Default for AppConfig {
             llm_api_key: "ollama".into(),
             llm_default_model: "llama3".into(),
             llm_temperature: 0.3,
-            llm_max_tokens: 8_192,
+            llm_max_tokens: 1_024,
             llm_timeout_secs: 30,
             llm_context_window_tokens: 8_192,
             llm_legacy_max_concurrent_requests: 1,
@@ -100,7 +100,7 @@ impl AppConfig {
             llm_api_key: get("llm.api_key", &Self::default().llm_api_key),
             llm_default_model: get("llm.default_model", &Self::default().llm_default_model),
             llm_temperature: get("llm.temperature", "0.3").parse().unwrap_or(0.3),
-            llm_max_tokens: get("llm.max_tokens", "8192").parse().unwrap_or(8_192),
+            llm_max_tokens: get("llm.max_tokens", "1024").parse().unwrap_or(1_024),
             llm_timeout_secs: get("llm.timeout_secs", "30").parse().unwrap_or(30),
             llm_context_window_tokens: get("llm.context_window_tokens", "8192")
                 .parse()
@@ -296,6 +296,18 @@ mod tests {
         assert_eq!(
             loaded.llm_routing_policies[0].candidate_provider_ids,
             ["travel"]
+        );
+    }
+
+    #[test]
+    fn defaults_to_a_modest_decision_budget() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+
+        assert_eq!(AppConfig::default().llm_max_tokens, 1_024);
+        assert_eq!(
+            db.with_config(|repo| AppConfig::load(&repo)).llm_max_tokens,
+            1_024
         );
     }
 }

@@ -1,309 +1,153 @@
-import { useEffect, useState } from "react";
-import { Outlet, NavLink } from "react-router-dom";
-import ThemeToggle from "./ThemeToggle";
+import { Component, useEffect, useRef, useState, type ReactNode } from "react";
+import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import AccountSwitcher from "./AccountSwitcher";
+import ThemeToggle from "./ThemeToggle";
+import { processingPause, processingResume, processingStatus, workflowQueueSummary, type WorkflowQueueSummary } from "../lib/tauri";
 import { useGate } from "../lib/gate";
-import { formatLocalDateTime } from "../lib/datetime";
-import {
-  onBackfillProgress,
-  onCycleProgress,
-  onSyncProgress,
-  processingPause,
-  processingResume,
-  processingStatus,
-  type OpProgress,
-} from "../lib/tauri";
 
 const navItems = [
-  { to: "/", label: "Dashboard" },
+  { to: "/queue", label: "Queue" },
+  { to: "/messages", label: "Messages" },
   { to: "/rules", label: "Rules" },
-  { to: "/history", label: "History" },
+  { to: "/operations", label: "Operations" },
   { to: "/settings", label: "Settings" },
 ];
 
-interface ProcessingStatus {
-  paused: boolean;
-  polling_enabled: boolean;
-  last_successful: string | null;
-  last_cycle_count: number;
-  last_cycle_error: string | null;
-  current_progress: OpProgress | null;
-  backfill_running: boolean;
-  backfill_cancel_requested: boolean;
+function count(summary: WorkflowQueueSummary | null, state: string) {
+  return summary?.counts.find((entry) => entry.state === state)?.count ?? 0;
 }
 
-function isTerminalPhase(phase: string): boolean {
-  return phase === "idle" || phase === "error" || phase === "stopped";
-}
+class RouteErrorBoundary extends Component<{ children: ReactNode; resetKey: string }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
 
-function isActiveProgress(progress: OpProgress | null | undefined): progress is OpProgress {
-  return Boolean(progress && !isTerminalPhase(progress.phase));
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidUpdate(previousProps: Readonly<{ children: ReactNode; resetKey: string }>) {
+    if (previousProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: null });
+    }
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div role="alert" className="mx-auto max-w-xl rounded-2xl border border-red-200 bg-red-50 p-6 dark:border-red-900/60 dark:bg-red-950/30">
+        <h1 className="text-lg font-semibold text-red-950 dark:text-red-100">This screen could not be displayed</h1>
+        <p className="mt-2 break-words text-sm text-red-700 dark:text-red-200">{this.state.error.message}</p>
+        <Link to="/queue" className="mt-4 inline-block rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Return to queue</Link>
+      </div>
+    );
+  }
 }
 
 export default function Layout() {
-  const { connection, activeEmail } = useGate();
-  const [status, setStatus] = useState<ProcessingStatus | null>(null);
-  const [cycle, setCycle] = useState<OpProgress | null>(null);
-  const [backfill, setBackfill] = useState<OpProgress | null>(null);
-  const [sync, setSync] = useState<OpProgress | null>(null);
-  const [togglingPause, setTogglingPause] = useState(false);
+  const { activeEmail, accounts, connection } = useGate();
+  const location = useLocation();
+  const [summary, setSummary] = useState<WorkflowQueueSummary | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [changingPause, setChangingPause] = useState(false);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const loading = useRef(false);
 
-  async function loadStatus() {
+  async function load() {
+    if (loading.current) return;
+    loading.current = true;
     try {
-      const next = (await processingStatus()) as ProcessingStatus;
-      setStatus(next);
-
-      if (isActiveProgress(next.current_progress)) {
-        if (next.current_progress.source === "backfill") {
-          setBackfill(next.current_progress);
-          setSync(null);
-          setCycle(null);
-        } else if (next.current_progress.source === "sync") {
-          setSync(next.current_progress);
-          setBackfill(null);
-          setCycle(null);
-        } else {
-          setCycle(next.current_progress);
-          setBackfill(null);
-          setSync(null);
-        }
-      } else {
-        setCycle(null);
-        setBackfill(null);
-        setSync(null);
-      }
-    } catch {
-      /* keep previous value */
+      const [nextSummary, status] = await Promise.all([workflowQueueSummary(), processingStatus() as Promise<{ paused: boolean }>]);
+      setSummary(nextSummary);
+      setPaused(status.paused);
+      setLoadError(null);
+    } catch (error) {
+      setLoadError(error);
+    } finally {
+      loading.current = false;
     }
   }
 
   useEffect(() => {
-    loadStatus();
-    const interval = setInterval(loadStatus, 30000);
-
-    const unlisteners = Promise.all([
-      onCycleProgress((p) => {
-        if (p.account_email && p.account_email !== activeEmail) return;
-        setCycle(isTerminalPhase(p.phase) ? null : p);
-        if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
-          window.setTimeout(() => {
-            void loadStatus();
-          }, 750);
-        }
-        if (isTerminalPhase(p.phase)) loadStatus();
-      }),
-      onBackfillProgress((p) => {
-        if (p.account_email && p.account_email !== activeEmail) return;
-        setBackfill(isTerminalPhase(p.phase) ? null : p);
-        if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
-          window.setTimeout(() => {
-            void loadStatus();
-          }, 750);
-        }
-        if (isTerminalPhase(p.phase)) loadStatus();
-      }),
-      onSyncProgress((p) => {
-        if (p.account_email && p.account_email !== activeEmail) return;
-        setSync(isTerminalPhase(p.phase) ? null : p);
-        if (!isTerminalPhase(p.phase) && p.total != null && p.processed >= p.total) {
-          window.setTimeout(() => {
-            void loadStatus();
-          }, 750);
-        }
-        if (isTerminalPhase(p.phase)) loadStatus();
-      }),
-    ]);
-
-    return () => {
-      clearInterval(interval);
-      unlisteners.then(([a, b, c]) => {
-        a();
-        b();
-        c();
-      });
-    };
+    void load();
+    const timer = window.setInterval(() => void load(), 10_000);
+    return () => window.clearInterval(timer);
   }, [activeEmail]);
 
   async function togglePause() {
-    if (!status) return;
-    setTogglingPause(true);
+    setChangingPause(true);
     try {
-      if (status.paused) {
-        await processingResume();
-      } else {
-        await processingPause();
-      }
-      await loadStatus();
+      if (paused) await processingResume();
+      else await processingPause();
+      await load();
+    } catch (error) {
+      setLoadError(error);
     } finally {
-      setTogglingPause(false);
+      setChangingPause(false);
     }
   }
 
-  const mailboxSummary =
-    connection && connection.connected && !connection.error
-      ? connection.messagesTotal != null || connection.threadsTotal != null
-        ? `${connection.messagesTotal?.toLocaleString() ?? "?"} messages${connection.threadsTotal != null ? ` • ${connection.threadsTotal.toLocaleString()} threads` : ""}`
-        : "Account verified"
-      : null;
-
+  const attention = count(summary, "needs_attention");
+  const active = count(summary, "processing") + count(summary, "retry_wait") + count(summary, "queued");
+  const erroredAccounts = accounts.filter((account) => account.status === "error");
+  const gmailNeedsAttention = Boolean(connection?.error) || erroredAccounts.length > 0;
+  const gmailLabel = erroredAccounts.length > 1
+    ? `${erroredAccounts.length} Gmail accounts need reconnecting`
+    : "Gmail needs reconnecting";
+  const healthLabel = paused
+    ? "Worker paused"
+    : attention > 0
+      ? "Attention needed"
+      : gmailNeedsAttention
+        ? "Gmail needs attention"
+        : "Automation healthy";
+  const healthTone = paused
+    ? "bg-amber-500"
+    : attention > 0 || gmailNeedsAttention
+      ? "bg-red-500"
+      : "bg-emerald-500";
   return (
-    <div className="flex h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 transition-colors">
-      <nav className="w-56 bg-gray-100 dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col">
-        <div className="p-4 border-b border-gray-200 dark:border-gray-700">
+    <div className="flex min-h-screen bg-gray-50 text-gray-900 transition-colors dark:bg-gray-900 dark:text-gray-100">
+      <aside className="sticky top-0 flex h-screen w-64 shrink-0 flex-col border-r border-gray-200 bg-gray-100 dark:border-gray-700 dark:bg-gray-800">
+        <div className="border-b border-gray-200 p-4 dark:border-gray-700">
           <div data-tauri-drag-region className="h-2" />
           <AccountSwitcher />
         </div>
-        <div className="flex-1 p-2">
+        <nav className="flex-1 p-3">
+          <p className="px-3 pb-2 pt-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-400">Assembly line</p>
           {navItems.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
-              end={item.to === "/"}
-              className={({ isActive }) =>
-                `block px-3 py-2 rounded mb-1 text-sm transition-colors ${
-                  isActive
-                    ? "bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white"
-                    : "text-gray-500 dark:text-gray-400 hover:bg-gray-200/50 dark:hover:bg-gray-700/50 hover:text-gray-900 dark:hover:text-white"
-                }`
-              }
+              className={({ isActive }) => `mb-1 flex items-center justify-between rounded-lg px-3 py-2 text-sm font-medium transition-colors ${isActive ? "bg-white text-gray-950 shadow-sm dark:bg-gray-700 dark:text-white" : "text-gray-500 hover:bg-gray-200/70 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white"}`}
             >
-              {item.label}
+              <span>{item.label}</span>
+              {item.to === "/queue" && attention > 0 && <span className="rounded-full bg-red-600 px-1.5 py-0.5 text-[11px] font-semibold text-white">{attention}</span>}
             </NavLink>
           ))}
-
-          <div className="mt-3 px-2">
-            <NavProcessingStatus
-              cycle={cycle}
-              backfill={backfill}
-              sync={sync}
-              status={status}
-            />
-            <button
-              onClick={togglePause}
-              disabled={togglingPause || !status?.polling_enabled}
-              className={`mt-2 w-full px-3 py-2 rounded text-xs font-medium transition-colors disabled:opacity-50 ${
-                status?.paused
-                  ? "bg-green-600 hover:bg-green-700 text-white"
-                  : "bg-yellow-600 hover:bg-yellow-700 text-white"
-              }`}
-            >
-              {togglingPause ? "Working…" : status?.paused ? "Resume" : "Pause"}
-            </button>
-          </div>
-        </div>
-        <div className="p-3 border-t border-gray-200 dark:border-gray-700 space-y-3">
-          {mailboxSummary && (
-            <div className="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
-              {mailboxSummary}
-            </div>
+          <NavLink to="/legacy-history" className="mt-4 block px-3 py-2 text-xs text-gray-400 hover:text-gray-700 dark:hover:text-gray-200">Legacy archive</NavLink>
+        </nav>
+        <div className="border-t border-gray-200 p-3 dark:border-gray-700">
+          {gmailNeedsAttention && (
+            <Link to="/settings?tab=mailbox" className="mb-3 block rounded-xl border border-red-200 bg-red-50 p-3 text-red-900 transition-colors hover:bg-red-100 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-100 dark:hover:bg-red-950/50">
+              <div className="flex items-center gap-2 text-xs font-semibold">
+                <span className="h-2 w-2 rounded-full bg-red-500" />
+                {gmailLabel}
+              </div>
+              <p className="mt-1 text-[11px] text-red-700 dark:text-red-200">Open Mailbox settings to reconnect.</p>
+            </Link>
           )}
-          <ThemeToggle />
+          <div className="rounded-xl border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-900/30">
+            <div className="flex items-center gap-2 text-xs font-medium">
+              <span className={`h-2 w-2 rounded-full ${healthTone}`} />
+              {healthLabel}
+            </div>
+            <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">{active} active · {count(summary, "completed")} completed</p>
+            {loadError !== null && <p className="mt-2 text-[11px] text-red-700 dark:text-red-300">Queue status is temporarily unavailable.</p>}
+            <button type="button" onClick={() => void togglePause()} disabled={changingPause} className={`mt-3 w-full rounded-lg px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 ${paused ? "bg-emerald-600 hover:bg-emerald-700" : "bg-amber-600 hover:bg-amber-700"}`}>{changingPause ? "Updating…" : paused ? "Resume worker" : "Pause worker"}</button>
+          </div>
+          <div className="mt-3"><ThemeToggle /></div>
         </div>
-      </nav>
-      <main className="flex-1 overflow-auto p-6">
-        <Outlet />
-      </main>
-    </div>
-  );
-}
-
-function NavProcessingStatus({
-  cycle,
-  backfill,
-  sync,
-  status,
-}: {
-  cycle: OpProgress | null;
-  backfill: OpProgress | null;
-  sync: OpProgress | null;
-  status: ProcessingStatus | null;
-}) {
-  const fallback = isActiveProgress(status?.current_progress)
-    ? status.current_progress
-    : null;
-  const op = isActiveProgress(backfill)
-    ? backfill
-    : isActiveProgress(sync)
-      ? sync
-      : isActiveProgress(cycle)
-        ? cycle
-        : fallback;
-  const active = isActiveProgress(op);
-  const paused = status?.paused ?? false;
-  const pollingEnabled = status?.polling_enabled ?? true;
-
-  const label = !active
-    ? !pollingEnabled
-      ? "Disabled"
-      : paused
-        ? "Paused"
-        : "Running"
-    : op.source === "backfill"
-      ? "Backfilling"
-      : op.source === "sync"
-        ? "Syncing"
-        : op.phase === "fetching"
-        ? "Fetching"
-        : "Processing";
-
-  const pct =
-    active && op.total != null
-      ? Math.min(100, Math.round((op.processed / Math.max(op.total, 1)) * 100))
-      : undefined;
-  const count =
-    active && op.total != null
-      ? `${op.processed}/${op.total}`
-      : active && op.processed > 0
-        ? `${op.processed}`
-        : "";
-
-  const dotColor = !active
-    ? !pollingEnabled
-      ? "bg-gray-400"
-      : paused
-        ? "bg-yellow-500"
-        : "bg-green-500"
-      : "bg-blue-500 animate-pulse";
-
-  const detail = active && op.detail
-    ? op.detail
-    : status?.last_cycle_error
-      ? `Last failure: ${status.last_cycle_error}`
-      : status
-        ? `Last cycle: ${status.last_cycle_count} email${status.last_cycle_count === 1 ? "" : "s"}`
-        : "";
-
-  return (
-    <div className="bg-gray-200/70 dark:bg-gray-700/50 border border-gray-300 dark:border-gray-600 rounded p-2">
-      <div className="flex items-center gap-2 text-xs font-medium text-gray-700 dark:text-gray-100">
-        <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${dotColor}`} />
-        <span>{label}</span>
-        {count && (
-          <span className="ml-auto tabular-nums text-[11px] text-gray-500 dark:text-gray-300">
-            {count}
-          </span>
-        )}
-      </div>
-      <div className="mt-2 h-1.5 bg-gray-300 dark:bg-gray-600 rounded overflow-hidden">
-        {active && pct != null ? (
-          <div
-            className="h-full bg-blue-500 transition-all"
-            style={{ width: `${pct}%` }}
-          />
-        ) : active ? (
-          <div className="h-full w-1/3 bg-blue-500 rounded animate-pulse" />
-        ) : null}
-      </div>
-      {detail && (
-        <div className="mt-2 text-[11px] leading-snug text-gray-500 dark:text-gray-300 line-clamp-2">
-          {detail}
-        </div>
-      )}
-      {status?.last_successful && (
-        <div className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
-          Last at: {formatLocalDateTime(status.last_successful, "Never")}
-        </div>
-      )}
+      </aside>
+      <main className="min-w-0 flex-1 overflow-auto p-6 lg:p-8"><RouteErrorBoundary resetKey={location.pathname}><Outlet /></RouteErrorBoundary></main>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,7 @@ pub struct ProcessingState {
     pub backfill_cancel_requested: Arc<AtomicBool>,
     pub inference_retry_running: Arc<AtomicBool>,
     pub workflow_running: Arc<AtomicBool>,
+    pub workflow_active_runs: Arc<AtomicUsize>,
     // The resume floor advances after every completed live message.
     pub last_processed: Option<chrono::DateTime<Utc>>,
     pub last_successful: Option<chrono::DateTime<Utc>>,
@@ -89,6 +90,7 @@ impl ProcessingState {
             backfill_cancel_requested: Arc::new(AtomicBool::new(false)),
             inference_retry_running: Arc::new(AtomicBool::new(false)),
             workflow_running: Arc::new(AtomicBool::new(false)),
+            workflow_active_runs: Arc::new(AtomicUsize::new(0)),
             last_processed: None,
             last_successful: None,
             emails_processed_today: 0,

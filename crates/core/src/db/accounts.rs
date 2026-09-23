@@ -93,7 +93,8 @@ impl<'a> AccountRepository<'a> {
 
     pub fn record_error(&self, email: &str, error: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE accounts SET last_error = ?2, updated_at = datetime('now') WHERE email = ?1",
+            "UPDATE accounts SET last_error = ?2, updated_at = datetime('now')
+             WHERE email = ?1 AND last_error IS NOT ?2",
             params![email, error],
         )?;
         Ok(())

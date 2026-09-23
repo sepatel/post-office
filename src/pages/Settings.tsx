@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   configGet,
   configSet,
@@ -11,6 +12,7 @@ import {
 import { useGate } from "../lib/gate";
 import { useToast } from "../lib/toast";
 import ConnectionStatus from "../components/ConnectionStatus";
+import LoadError from "../components/LoadError";
 import InferenceStudio, {
   type InferenceConfig,
 } from "../components/InferenceStudio";
@@ -30,21 +32,31 @@ export default function Settings() {
   const { connection, accounts, activeEmail, refreshAccounts } = useGate();
   const toast = useToast();
   const [config, setConfig] = useState<Config | null>(null);
-  const [tab, setTab] = useState<SettingsTab>("inference");
+  const [searchParams, setSearchParams] = useSearchParams();
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const request = useRef(0);
+  const tab: SettingsTab = searchParams.get("tab") === "mailbox" ? "mailbox" : "inference";
 
   useEffect(() => {
     void loadConfig();
   }, []);
 
   async function loadConfig() {
-    try {
-      const next = (await configGet()) as Config;
-      setConfig(next);
-      await refreshAccounts();
-    } catch (error) {
-      console.error("Failed to load config:", error);
+    const version = ++request.current;
+    const [configResult, accountsResult] = await Promise.allSettled([
+      configGet() as Promise<Config>,
+      refreshAccounts(),
+    ]);
+    if (version !== request.current) return;
+    if (configResult.status === "fulfilled") setConfig(configResult.value);
+    const errors = [configResult, accountsResult]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => String(result.reason));
+    setLoadError(errors.length > 0 ? errors.join(" ") : null);
+    if (configResult.status === "rejected") {
+      setConfig(null);
     }
   }
 
@@ -75,6 +87,13 @@ export default function Settings() {
     } finally {
       setConnecting(false);
     }
+  }
+
+  function selectTab(nextTab: SettingsTab) {
+    const nextParams = new URLSearchParams(searchParams);
+    if (nextTab === "mailbox") nextParams.set("tab", nextTab);
+    else nextParams.delete("tab");
+    setSearchParams(nextParams);
   }
 
   async function disconnectGmail() {
@@ -117,11 +136,12 @@ export default function Settings() {
   }
 
   if (!config) {
-    return <div className="text-gray-400 dark:text-gray-500">Loading settings…</div>;
+    if (loadError) return <LoadError title="Could not load settings" error={loadError} onRetry={() => void loadConfig()} />;
+    return <div className="text-gray-400 dark:text-gray-500">Loading settings...</div>;
   }
 
-  const needsReconnect = Boolean(connection?.connected && connection?.error);
-  const showConnectButton = true;
+  const erroredAccounts = accounts.filter((account) => account.status === "error");
+  const needsReconnect = Boolean(connection?.error) || erroredAccounts.length > 0;
 
   return (
     <div className="max-w-6xl">
@@ -146,11 +166,13 @@ export default function Settings() {
         )}
       </div>
 
+      {loadError && <div className="mb-6"><LoadError title="Some account data could not be refreshed" error={loadError} onRetry={() => void loadConfig()} /></div>}
+
       <div className="mb-7 flex max-w-xl gap-1 rounded-xl border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
-        <TabButton active={tab === "inference"} onClick={() => setTab("inference")}>
+        <TabButton active={tab === "inference"} onClick={() => selectTab("inference")}>
           Inference
         </TabButton>
-        <TabButton active={tab === "mailbox"} onClick={() => setTab("mailbox")}>
+        <TabButton active={tab === "mailbox"} onClick={() => selectTab("mailbox")}>
           Mailbox
         </TabButton>
       </div>
@@ -170,20 +192,22 @@ export default function Settings() {
               <ConnectionStatus
                 connection={connection}
                 checking={connecting}
-                onReconnect={connectGmail}
               />
+              {erroredAccounts.length > 0 && !connection?.error && (
+                <p className="mt-3 text-sm text-red-600 dark:text-red-400">
+                  Reconnect {erroredAccounts.map((account) => account.email).join(", ")} to resume processing.
+                </p>
+              )}
               <div className="mt-4 flex flex-wrap items-center gap-3">
-                {showConnectButton && (
-                  <button
-                    type="button"
-                    onClick={connectGmail}
-                    disabled={connecting}
-                    className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
-                  >
-                    {connecting ? "Waiting for browser…" : needsReconnect ? "Reconnect Gmail" : "Add Gmail account"}
-                  </button>
-                )}
-                  {activeEmail && (
+                <button
+                  type="button"
+                  onClick={() => void connectGmail()}
+                  disabled={connecting}
+                  className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  {connecting ? "Waiting for browser…" : needsReconnect ? "Reconnect Gmail" : "Add Gmail account"}
+                </button>
+                {activeEmail && (
                   <button
                     type="button"
                     onClick={disconnectGmail}
@@ -223,6 +247,16 @@ export default function Settings() {
                   >
                     {account.paused ? "Resume" : "Pause"}
                   </button>
+                  {account.status === "error" && (
+                    <button
+                      type="button"
+                      onClick={() => void connectGmail()}
+                      disabled={connecting}
+                      className="rounded-lg px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50 dark:text-red-300 dark:hover:bg-red-950/30"
+                    >
+                      Reconnect
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => void moveAccount(index, -1)}

@@ -196,7 +196,7 @@ export default function PipelineDryRunDialog({
           requests but does not change Gmail, history, or recovery jobs.
         </p>
         <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
-          Rule decisions run one message at a time, so this matches the processing pipeline.
+          This dry run evaluates one message at a time. Production work is scheduled independently for each model lane.
         </p>
         <p className="mt-1 break-all text-xs text-gray-400 dark:text-gray-500">Message {emailId}</p>
 
@@ -237,8 +237,8 @@ export default function PipelineDryRunDialog({
               decisionEstimate.max_concurrent_requests !== null && (
                 <p className="mt-1 text-xs text-blue-700 dark:text-blue-300">
                   {decisionEstimate.available_request_slots === 0
-                    ? "Waiting for another model request to release the shared request slot."
-                    : `${decisionEstimate.available_request_slots} of ${decisionEstimate.max_concurrent_requests} model request slots available when this evaluation started.`}
+                    ? "Waiting for another request to release this model lane."
+                    : `${decisionEstimate.available_request_slots} of ${decisionEstimate.max_concurrent_requests} request slots available for this model when evaluation started.`}
                 </p>
               )}
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-blue-100 dark:bg-blue-900/60">

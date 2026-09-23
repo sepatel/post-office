@@ -127,7 +127,7 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
   const [providerKey, setProviderKey] = useState(config.llm_api_key);
   const [legacyApiKey, setLegacyApiKey] = useState(config.llm_api_key);
-  const [defaultMaxTokens, setDefaultMaxTokens] = useState(config.llm_max_tokens ?? 8192);
+  const [defaultMaxTokens, setDefaultMaxTokens] = useState(config.llm_max_tokens ?? 1024);
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, LlmTestResult>>({});
   const [providerStatuses, setProviderStatuses] = useState<Record<string, LlmProviderStatus>>({});
@@ -293,7 +293,7 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
       )
         ? selectedPolicyId
         : routingPolicies[0]?.id ?? "default";
-      const clampedMaxTokens = Math.min(8192, Math.max(64, Math.round(defaultMaxTokens) || 8192));
+      const clampedMaxTokens = Math.min(8192, Math.max(64, Math.round(defaultMaxTokens) || 1024));
       await llmConfigSet({
         base_url: legacy.base_url,
         api_key: legacyApiKey,
@@ -409,7 +409,7 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
         </p>
         <h3 className="mt-1 text-lg font-semibold">Default completion budget</h3>
         <p className="mt-1 max-w-2xl text-sm text-gray-500 dark:text-gray-400">
-          Used when a rule has no per-rule override. Thinking tokens count toward this cap, so it bounds reasoning plus the final answer. Capped at 8,192 tokens so one request cannot exhaust a llama.cpp slot.
+          Used when a rule has no per-rule override. New rules disable thinking, so 1,024 tokens is enough for a final choice. Thinking tokens count toward this cap when enabled.
         </p>
         <div className="mt-3 flex max-w-xs flex-col gap-1">
           <label className="text-xs font-medium text-gray-500 dark:text-gray-400">Default output tokens (64–8192)</label>
@@ -488,7 +488,7 @@ export default function InferenceStudio({ config, onConfigChange }: Props) {
                     <span>{formatCost(provider)}</span>
                     <span>{provider.timeout_secs}s timeout</span>
                     <span>{formatTokens(provider.context_window_tokens)} context</span>
-                    <span>{provider.max_concurrent_requests} shared request slots</span>
+                    <span>{provider.max_concurrent_requests} model request slots</span>
                     {provider.output_tokens_per_second > 0 && <span>~{provider.output_tokens_per_second} output tok/s</span>}
                     <span>{provider.id === "legacy" ? "Compatibility endpoint" : `Key: ${provider.api_key_ref || provider.id}`}</span>
                   </div>
@@ -769,7 +769,7 @@ function ProviderForm({
           <button type="button" onClick={() => set({ max_concurrent_requests: 4, chat_reasoning_effort: "server_default" })} className="rounded-full border border-gray-300 px-3 py-1 text-xs font-medium text-gray-700 hover:bg-white dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800">Hosted API</button>
         </div>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <Field label="Shared request limit">
+          <Field label="Model request limit">
             <input type="number" min="1" max="10" value={draft.max_concurrent_requests} onChange={(e) => set({ max_concurrent_requests: Math.max(1, Number(e.target.value)) })} className={inputClass} />
           </Field>
           <Field label="Output tokens / second">
@@ -779,7 +779,7 @@ function ProviderForm({
             <Dropdown value={draft.chat_reasoning_effort} options={REASONING_OPTIONS} onChange={(value) => set({ chat_reasoning_effort: value })} />
           </Field>
         </div>
-        <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">Processing runs one email at a time, oldest first. Set output tokens per second from a typical generation; zero hides time estimates. The app shares this endpoint's request limit across rules and accounts. Local concurrency above one requires llama.cpp slots and KV-cache headroom.</p>
+        <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">Each endpoint and model pair has its own queue across rules and accounts. New models start with one request slot, so work for an idle model can proceed while another model is busy. Set output tokens per second from a typical generation; zero hides time estimates.</p>
       </div>
       <div className="rounded-xl bg-gray-50 p-3 dark:bg-gray-900/60">
         <Field label="API key">
@@ -957,7 +957,7 @@ function newProvider(): ProviderProfile {
     output_cost_per_million_usd: 0,
     timeout_secs: 30,
     context_window_tokens: 8192,
-    max_concurrent_requests: 4,
+    max_concurrent_requests: 1,
     output_tokens_per_second: 0,
     chat_reasoning_effort: "server_default",
     enabled: true,

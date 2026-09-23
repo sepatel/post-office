@@ -16,7 +16,14 @@ function statusLabel(status: string): string {
 }
 
 export default function AccountSwitcher() {
-  const { activeEmail, accounts, refreshAccounts, selectAccount } = useGate();
+  const {
+    activeEmail,
+    accounts,
+    refreshAccountList,
+    selectAccount,
+    switchingEmail,
+    accountError,
+  } = useGate();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -38,7 +45,7 @@ export default function AccountSwitcher() {
   }
 
   function handleMenuKeyDown(event: React.KeyboardEvent) {
-    const items = itemRefs.current.filter((item): item is HTMLButtonElement => item !== null);
+    const items = itemRefs.current.filter((item): item is HTMLButtonElement => item !== null && !item.disabled);
     const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
     if (event.key === "Escape") {
       event.preventDefault();
@@ -63,8 +70,12 @@ export default function AccountSwitcher() {
   }
 
   async function chooseAccount(email: string) {
-    await selectAccount(email);
-    setOpen(false);
+    try {
+      await selectAccount(email);
+      setOpen(false);
+    } catch {
+      // The visible menu retains the error from the gate and lets the user retry.
+    }
   }
 
   return (
@@ -75,10 +86,11 @@ export default function AccountSwitcher() {
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => {
-          if (!open) void refreshAccounts();
+          if (!open) void refreshAccountList().catch(() => undefined);
           setOpen((value) => !value);
         }}
-        className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-gray-200/70 dark:hover:bg-gray-700/70"
+        disabled={switchingEmail !== null}
+        className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-gray-200/70 disabled:opacity-50 dark:hover:bg-gray-700/70"
         title="Switch Gmail account"
       >
         <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${statusTone[active?.status ?? ""] ?? "bg-amber-500"}`} />
@@ -100,6 +112,7 @@ export default function AccountSwitcher() {
           <div className="px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-400 dark:text-gray-500">
             Accounts
           </div>
+          {accountError && <p role="alert" className="mx-3 mb-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-200">{accountError}</p>}
           {accounts.map((account, index) => (
             <button
               key={account.email}
@@ -108,12 +121,13 @@ export default function AccountSwitcher() {
               role="menuitemradio"
               aria-checked={account.email === activeEmail}
               onClick={() => void chooseAccount(account.email)}
-              className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-gray-100 dark:hover:bg-gray-700"
+              disabled={switchingEmail !== null || account.email === activeEmail}
+              className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-gray-100 disabled:opacity-50 dark:hover:bg-gray-700"
             >
               <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${statusTone[account.status] ?? "bg-amber-500"}`} />
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm text-gray-900 dark:text-gray-100">{account.email}</span>
-                <span className="block text-xs text-gray-500 dark:text-gray-400">{statusLabel(account.status)}</span>
+                <span className="block text-xs text-gray-500 dark:text-gray-400">{switchingEmail === account.email ? "Switching..." : statusLabel(account.status)}</span>
               </span>
               {index < 3 && (
                 <kbd className="rounded border border-gray-300 px-1.5 py-0.5 text-[10px] text-gray-500 dark:border-gray-600 dark:text-gray-300">
@@ -128,14 +142,14 @@ export default function AccountSwitcher() {
           <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
           <button
             type="button"
-            onClick={() => { setOpen(false); navigate("/settings"); }}
+            onClick={() => { setOpen(false); navigate("/settings?tab=mailbox"); }}
             className="w-full px-3 py-2 text-left text-sm text-blue-600 hover:bg-gray-100 dark:text-blue-300 dark:hover:bg-gray-700"
           >
             Add account
           </button>
           <button
             type="button"
-            onClick={() => { setOpen(false); navigate("/settings"); }}
+            onClick={() => { setOpen(false); navigate("/settings?tab=mailbox"); }}
             className="w-full px-3 py-2 text-left text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
           >
             Manage accounts

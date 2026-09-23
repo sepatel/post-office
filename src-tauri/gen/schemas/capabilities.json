@@ -1,1 +1,1 @@
-{}
+{"main":{"identifier":"main","description":"Permissions for the primary Post Office window.","remote":{"urls":["http://localhost:1420/*"]},"local":true,"windows":["main"],"permissions":["core:default","notification:allow-is-permission-granted"]}}

@@ -25,24 +25,30 @@ of truth.
 
 ## Runs
 
-Runs are processed serially for an account by a durable worker. A run owns a
-lease token and moves through `queued`, `processing`, `retry_wait`, `completed`,
-or `needs_attention`.
+The durable worker prepares runs in queue order, then dispatches each LLM
+decision through its endpoint/model lane. A lane uses its configured request
+limit, defaulting to one; work for another idle model does not wait behind a
+busy lane. A run owns a lease token only while its current preparation or
+decision stage is active and moves through `queued`, `processing`,
+`retry_wait`, `completed`, `needs_attention`, or `resolved_externally`.
 
-Each run references an immutable ruleset snapshot containing:
+Each run references a ruleset snapshot containing:
 
 - rules, ordering, actions, choices, and learned memories;
 - the routing-policy and provider configuration used for its decisions.
 
-Editing a rule, memory, or LLM configuration publishes a new snapshot. New
-messages use it; existing runs keep their original behavior.
+Editing a rule, memory, or LLM configuration publishes a new snapshot. Queued,
+retrying, and attention-needed runs switch to it before their next step. A run
+that already holds a lease finishes its current step before it adopts changes.
 
 ## Rule Chain
 
 The worker evaluates one message through the ruleset in priority order.
 Condition skips and LLM decisions are written to `workflow_steps`. A `NO_MATCH`
 advances to the next rule. A match normally completes the run; a rule with
-`continue_after_match` advances after its action is confirmed.
+`continue_after_match` advances after its action is confirmed. Each decision
+returns to the queue before its next rule, so a message moving from taxonomy to
+the default model never blocks unrelated default-model work.
 
 Labels planned by a confirmed earlier action update the local message snapshot
 before the next rule runs. Lower-priority rules therefore see the result within
@@ -55,8 +61,22 @@ action plan stores resolved Gmail label IDs rather than rule text. If a Gmail
 request fails after it may have reached Gmail, the worker fetches the message
 and verifies the desired labels before retrying.
 
-Decision and action failures retry with a finite budget. Exhausted work moves to
-`needs_attention`; it never returns to the arrival queue.
+Decision and action failures receive at most three automatic attempts, including
+the first attempt. Exhausted work moves to `needs_attention`; it never returns
+to the arrival queue.
+
+Before a manual retry resumes work, the worker fetches the current Gmail message.
+Messages deleted, moved to Trash, or archived outside Post Office end as
+`resolved_externally`. If Gmail already reflects a persisted action plan, the
+plan is confirmed without sending the mutation again.
+
+Queue Retry is one human-requested probe, not a new automatic retry cycle. A
+failed probe returns directly to `needs_attention`.
+
+Connection failures open a five-minute circuit for the shared LLM endpoint.
+Messages routed to that endpoint then move to `needs_attention` without making
+their own connection attempts. A successful human-requested probe closes the
+circuit.
 
 External services cannot provide exactly-once delivery across a process crash.
 The workflow instead provides exactly-once logical progression: only one

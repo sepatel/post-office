@@ -23,7 +23,11 @@ fn default_backup_app() -> String {
     BACKUP_APP.into()
 }
 
-fn default_reasoning_effort() -> ReasoningEffort {
+fn default_decision_reasoning_effort() -> ReasoningEffort {
+    ReasoningEffort::Off
+}
+
+fn default_chat_reasoning_effort() -> ReasoningEffort {
     ReasoningEffort::ServerDefault
 }
 
@@ -60,7 +64,7 @@ pub struct BackupRule {
     pub enabled: bool,
     #[serde(default = "default_policy_id")]
     pub inference_policy: String,
-    #[serde(default = "default_reasoning_effort")]
+    #[serde(default = "default_decision_reasoning_effort")]
     pub decision_reasoning_effort: ReasoningEffort,
     #[serde(default)]
     pub decision_max_tokens: Option<u32>,
@@ -98,7 +102,7 @@ pub struct BackupLlmLegacy {
     pub legacy_max_concurrent_requests: u8,
     #[serde(default)]
     pub legacy_output_tokens_per_second: f64,
-    #[serde(default = "default_reasoning_effort")]
+    #[serde(default = "default_chat_reasoning_effort")]
     pub legacy_chat_reasoning_effort: ReasoningEffort,
     #[serde(default)]
     pub legacy_name: String,

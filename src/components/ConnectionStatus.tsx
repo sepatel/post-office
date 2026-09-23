@@ -12,11 +12,9 @@ function Dot({ color }: { color: string }) {
 export default function ConnectionStatus({
   connection,
   checking,
-  onReconnect,
 }: {
   connection: GmailConnection | null;
   checking?: boolean;
-  onReconnect?: () => void;
 }) {
   if (checking || connection === null) {
     return (
@@ -27,30 +25,20 @@ export default function ConnectionStatus({
     );
   }
 
+  if (connection.error) {
+    return (
+      <div className="flex items-start gap-2 text-sm text-red-600 dark:text-red-400">
+        <Dot color="bg-red-500" />
+        <span>Gmail needs reconnecting: {connection.error}</span>
+      </div>
+    );
+  }
+
   if (!connection.connected) {
     return (
       <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400">
         <Dot color="bg-red-500" />
         <span>Gmail not connected</span>
-      </div>
-    );
-  }
-
-  if (connection.error) {
-    return (
-      <div className="flex items-center gap-2 text-sm text-amber-600 dark:text-amber-400">
-        <Dot color="bg-amber-500" />
-        <span>
-          Gmail auth expired
-          {onReconnect && (
-            <button
-              onClick={onReconnect}
-              className="ml-2 underline hover:no-underline"
-            >
-              Reconnect
-            </button>
-          )}
-        </span>
       </div>
     );
   }

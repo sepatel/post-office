@@ -83,11 +83,12 @@ fn main() {
                 .with_accounts(|repo| repo.list())
                 .expect("Failed to load accounts for workflow migration")
             {
-                post_office_core::workflow::publish_rule_set(&db, &account.email, &config)
-                    .expect("Failed to import rule set into message workflow");
+                post_office_core::workflow::ensure_rule_set(&db, &account.email, &config)
+                    .expect("Failed to initialize message workflow rule set");
             }
             let config_arc = Arc::new(Mutex::new(config.clone()));
             let inference_runtime = InferenceRuntime::default();
+            post_office_core::llm::configure_runtime(&config, &inference_runtime);
             let processing_states =
                 Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let sync_trigger = sync_runtime::spawn(
@@ -153,6 +154,12 @@ fn main() {
             commands::rules_test,
             commands::rules_apply,
             commands::evaluate_messages,
+            commands::workflow_queue_summary,
+            commands::workflow_messages_list,
+            commands::workflow_message_get,
+            commands::workflow_retry_now,
+            commands::workflow_rule_set_status,
+            commands::workflow_endpoint_status,
             commands::history_list,
             commands::rules_metrics,
             commands::rule_roi_metrics,

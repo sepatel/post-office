@@ -1,16 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   rulesCreate,
   rulesUpdate,
   rulesDelete,
   rulesList,
   ruleApplyProposal,
-  ruleMetrics,
-  ruleRequestMetrics,
   gmailRecentMessages,
   rulesTest,
-  rulesApply,
   evaluateMessages,
   configGet,
   gmailListLabels,
@@ -21,16 +18,12 @@ import {
   type MemoryInput,
   type MemoryEntry,
   type RecentMessage,
-  type RuleMetrics,
-  type RuleRequestMetrics,
   type TestResult,
-  type ApplyResult,
   type EvaluationVerdict,
 } from "../lib/tauri";
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import RuleChatPanel from "../components/RuleChatPanel";
-import RuleActivity from "../components/RuleActivity";
 import ConditionBuilder, {
   Condition,
   normalizeConditionLabelIds as normalizeConditionLabelIdsRecursive,
@@ -119,7 +112,7 @@ export default function RuleEditor() {
   const [priority, setPriority] = useState(0);
   const [enabled, setEnabled] = useState(true);
   const [inferencePolicy, setInferencePolicy] = useState("default");
-  const [decisionReasoningEffort, setDecisionReasoningEffort] = useState("server_default");
+  const [decisionReasoningEffort, setDecisionReasoningEffort] = useState("off");
   const [decisionMaxTokens, setDecisionMaxTokens] = useState("server_default");
   const [chooseFromAllLabels, setChooseFromAllLabels] = useState(false);
   const [continueAfterMatch, setContinueAfterMatch] = useState(false);
@@ -137,17 +130,12 @@ export default function RuleEditor() {
   const [recentMessages, setRecentMessages] = useState<RecentMessage[]>([]);
   const [selectedMessageId, setSelectedMessageId] = useState("");
   const [testResult, setTestResult] = useState<TestResult | null>(null);
-  const [applyResult, setApplyResult] = useState<ApplyResult | null>(null);
   const [testing, setTesting] = useState(false);
-  const [applying, setApplying] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [evaluationResults, setEvaluationResults] = useState<EvaluationVerdict[] | null>(null);
   const [evaluatingMessages, setEvaluatingMessages] = useState(false);
-  const [applyingEvaluationId, setApplyingEvaluationId] = useState<string | null>(null);
   const [pendingMemories, setPendingMemories] = useState<MemoryInput[]>([]);
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
-  const [metrics, setMetrics] = useState<RuleMetrics | null>(null);
-  const [requestMetrics, setRequestMetrics] = useState<RuleRequestMetrics | null>(null);
   const [gmailLabels, setGmailLabels] = useState<GmailLabel[]>([]);
   const [labelsError, setLabelsError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<RuleTab>("build");
@@ -223,11 +211,8 @@ export default function RuleEditor() {
   useEffect(() => {
     if (isEdit) {
       loadRule();
-      loadMetrics();
       loadMemories();
     } else {
-      setMetrics(null);
-      setRequestMetrics(null);
       setMemories([]);
     }
   }, [id]);
@@ -336,7 +321,7 @@ export default function RuleEditor() {
         setPriority(rule.priority);
         setEnabled(rule.enabled);
         setInferencePolicy(rule.inference_policy || "default");
-        setDecisionReasoningEffort(rule.decision_reasoning_effort || "server_default");
+        setDecisionReasoningEffort(rule.decision_reasoning_effort || "off");
         setDecisionMaxTokens(rule.decision_max_tokens?.toString() || "server_default");
         setChooseFromAllLabels(rule.choose_from_all_labels || false);
         setContinueAfterMatch(rule.continue_after_match || false);
@@ -362,17 +347,6 @@ export default function RuleEditor() {
       }
     } catch (e) {
       console.error("Failed to load routing policies:", e);
-    }
-  }
-
-  async function loadMetrics() {
-    if (!isEdit) return;
-    try {
-      const [all, requests] = await Promise.all([ruleMetrics(), ruleRequestMetrics()]);
-      setMetrics(all.find((m) => m.rule_id === ruleId) ?? null);
-      setRequestMetrics(requests.find((m) => m.rule_id === ruleId) ?? null);
-    } catch (e) {
-      console.error("Failed to load rule metrics:", e);
     }
   }
 
@@ -447,13 +421,14 @@ export default function RuleEditor() {
         };
       });
 
+    const automatic = decisionMode === "automatic";
     return {
       name,
       description: description || null,
       conditions: normalizedConditions,
-      prompt,
-      choices: normalizeLabelValues(choices, "choice"),
-      choose_from_all_labels: chooseFromAllLabels,
+      prompt: automatic ? "" : prompt,
+      choices: automatic ? [] : normalizeLabelValues(choices, "choice"),
+      choose_from_all_labels: automatic ? false : chooseFromAllLabels,
       actions: normalizeLabelValues(actions, "action"),
       priority,
       enabled,
@@ -538,6 +513,11 @@ export default function RuleEditor() {
     if (normalizedChoices.length > 0) {
       setChoices((prev) => [...prev, ...normalizedChoices]);
     }
+    if (normalizedChoices.length > 0) {
+      setDecisionMode("classify");
+    } else if (proposal.prompt?.trim()) {
+      setDecisionMode("match");
+    }
     if (normalizedConditions.length > 0) {
       setConditions((prev) => [...prev, ...normalizedConditions]);
     }
@@ -547,7 +527,6 @@ export default function RuleEditor() {
       );
     }
     setTestResult(null);
-    setApplyResult(null);
     setEvaluationResults(null);
     toast.success("Proposal applied to draft. Save to persist.");
   }
@@ -559,7 +538,6 @@ export default function RuleEditor() {
       setRecentMessages(msgs);
       if (msgs.length > 0) setSelectedMessageId(msgs[0].id);
       setTestResult(null);
-      setApplyResult(null);
     } catch (e) {
       setLoadError(String(e));
       console.error("Failed to load messages:", e);
@@ -570,7 +548,6 @@ export default function RuleEditor() {
     if (!selectedMessageId) return;
     setTesting(true);
     setTestResult(null);
-    setApplyResult(null);
     try {
       const result = await rulesTest(buildRulePayload(), selectedMessageId);
       setTestResult(result);
@@ -580,22 +557,6 @@ export default function RuleEditor() {
       console.error("Failed to test rule:", e);
     } finally {
       setTesting(false);
-    }
-  }
-
-  async function handleApply() {
-    if (!selectedMessageId) return;
-    setApplying(true);
-    setApplyResult(null);
-    try {
-      const result = await rulesApply(buildRulePayload(), selectedMessageId);
-      setApplyResult(result);
-    } catch (e) {
-      const msg = typeof e === "string" ? e : String(e);
-      toast.error(msg);
-      console.error("Failed to apply rule:", e);
-    } finally {
-      setApplying(false);
     }
   }
 
@@ -615,20 +576,6 @@ export default function RuleEditor() {
       console.error("Failed to evaluate messages:", e);
     } finally {
       setEvaluatingMessages(false);
-    }
-  }
-
-  async function handleApplyEvaluation(verdict: EvaluationVerdict) {
-    setApplyingEvaluationId(verdict.email_id);
-    try {
-      await rulesApply(buildRulePayload(), verdict.email_id);
-      toast.success(`Applied to ${verdict.email_id.slice(0, 8)}…`);
-    } catch (e) {
-      const msg = typeof e === "string" ? e : String(e);
-      toast.error(msg);
-      console.error("Failed to apply rule:", e);
-    } finally {
-      setApplyingEvaluationId(null);
     }
   }
 
@@ -670,25 +617,8 @@ export default function RuleEditor() {
       </nav>
 
         {isEdit && activeTab === "activity" && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
-            <MetricCard
-              label="Last 24h"
-              checked={metrics?.checked_24h ?? 0}
-              succeeded={metrics?.succeeded_24h ?? 0}
-              requests={requestMetrics?.requests_24h ?? 0}
-              emails={requestMetrics?.emails_24h ?? 0}
-              totalTokens={requestMetrics?.total_tokens_24h ?? 0}
-              avgDurationMs={requestMetrics?.avg_duration_24h_ms ?? 0}
-            />
-            <MetricCard
-              label="Last 7d"
-              checked={metrics?.checked_7d ?? 0}
-              succeeded={metrics?.succeeded_7d ?? 0}
-              requests={requestMetrics?.requests_7d ?? 0}
-              emails={requestMetrics?.emails_7d ?? 0}
-              totalTokens={requestMetrics?.total_tokens_7d ?? 0}
-              avgDurationMs={requestMetrics?.avg_duration_7d_ms ?? 0}
-            />
+          <div className="mb-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-100">
+            Saving applies this rule to every unfinished message. Production outcomes belong to each message run in the <Link to="/queue" className="font-semibold underline">Queue</Link>.
           </div>
         )}
 
@@ -986,7 +916,7 @@ export default function RuleEditor() {
             className="w-full"
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Thinking-enabled decisions run one message at a time so the model can finish with a choice.
+            Leave this off for fast, reliable classification. Thinking consumes the completion budget before the final choice.
           </p>
         </div>}
 
@@ -1001,7 +931,7 @@ export default function RuleEditor() {
             className="w-full"
           />
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-            Server default uses the default completion budget (up to 8,192 tokens for thinking plus the answer). A fixed budget bounds latency and cost.
+            Server default uses the 1,024-token decision budget. A fixed budget bounds latency and cost.
           </p>
         </div>}
 
@@ -1141,11 +1071,11 @@ export default function RuleEditor() {
               {testing ? "Testing…" : "Run test"}
             </button>
             <button
-              onClick={handleApply}
-              disabled={!selectedMessageId || applying || testResult?.matched === false || testResult?.indeterminate}
+              disabled
+              title="Production changes are performed only by queued message runs."
               className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-3 py-1 rounded text-sm transition-colors"
             >
-              {applying ? "Applying…" : "Apply to this message"}
+              Queue-only production actions
             </button>
           </div>
 
@@ -1252,37 +1182,6 @@ export default function RuleEditor() {
             </div>
           )}
 
-          {applyResult && (
-            <div className="text-sm rounded border border-gray-200 dark:border-gray-700 p-3 bg-gray-50 dark:bg-gray-800/50 mt-2">
-              {applyResult.matched ? (
-                <>
-                  <div className="text-green-600 dark:text-green-400 font-medium mb-1">
-                    Applied
-                  </div>
-                  <div>
-                    <span className="text-gray-500 dark:text-gray-400">
-                      Actions:{" "}
-                    </span>
-                    <span className="text-blue-600 dark:text-blue-300">
-                      {applyResult.applied
-                        .map((a) => renderActionDisplay(a, labelNameById, labelIdByName))
-                        .join(", ") || "none"}
-                    </span>
-                  </div>
-                </>
-              ) : (
-                <div className="text-gray-500 dark:text-gray-400">
-                  Rule did not match this message — nothing applied.
-                </div>
-              )}
-              {applyResult.error && (
-                <p className="text-xs text-red-600 dark:text-red-400 mt-1">
-                  {applyResult.error}
-                </p>
-              )}
-            </div>
-          )}
-
           <div className="border-t border-gray-200 dark:border-gray-700 pt-4 mt-4">
             <div className="flex items-center justify-between mb-2">
               <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-200">
@@ -1298,14 +1197,14 @@ export default function RuleEditor() {
             </div>
             <p className="text-xs text-gray-400 dark:text-gray-500 mb-2">
               Runs the rule across loaded messages sequentially, one email at a time
-              (structured-action rules need no LLM call). Apply the ones you like.
+              (structured-action rules need no LLM call). This is a simulation only;
+              production actions run through the message queue.
             </p>
 
             {evaluationResults && (
               <div className="space-y-2">
                 {evaluationResults.map((v) => {
                   const msg = recentMessages.find((m) => m.id === v.email_id);
-                  const canApply = v.matched && v.actions.length > 0;
                   return (
                     <div
                       key={v.email_id}
@@ -1352,11 +1251,11 @@ export default function RuleEditor() {
                         )}
                       </div>
                       <button
-                        onClick={() => handleApplyEvaluation(v)}
-                        disabled={!canApply || applyingEvaluationId === v.email_id}
+                        disabled
+                        title="Production changes are performed only by queued message runs."
                         className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-2 py-1 rounded text-xs transition-colors"
                       >
-                        {applyingEvaluationId === v.email_id ? "Applying…" : "Apply"}
+                        Queue-only
                       </button>
                     </div>
                   );
@@ -1366,7 +1265,13 @@ export default function RuleEditor() {
           </div>
         </div>}
 
-        {activeTab === "activity" && isEdit && <RuleActivity ruleId={ruleId} />}
+        {activeTab === "activity" && isEdit && (
+          <div className="rounded-2xl border border-gray-200 bg-white p-8 text-center dark:border-gray-700 dark:bg-gray-800">
+            <h3 className="text-lg font-semibold">Execution lives with each message</h3>
+            <p className="mx-auto mt-2 max-w-md text-sm text-gray-500 dark:text-gray-400">Inspect a queued message to see the ruleset snapshot, decisions, actions, and retries that produced its outcome.</p>
+            <Link to="/queue" className="mt-5 inline-flex rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Open Queue</Link>
+          </div>
+        )}
 
         {activeTab === "learn" && (
           isEdit ? <div className="h-[38rem]"><RuleChatPanel ruleId={ruleId} ruleName={name || "Untitled rule"} onApplyProposal={applyChatProposalToDraft} /></div> : <div className="rounded-2xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400">Save the rule before tuning it with chat.</div>
@@ -1463,58 +1368,4 @@ function renderActionDisplay(
   return action.kind === "remove_label"
     ? `Remove label "${labelName}"`
     : `Add label "${labelName}"`;
-}
-
-function MetricCard({
-  label,
-  checked,
-  succeeded,
-  requests,
-  emails,
-  totalTokens,
-  avgDurationMs,
-}: {
-  label: string;
-  checked: number;
-  succeeded: number;
-  requests: number;
-  emails: number;
-  totalTokens: number;
-  avgDurationMs: number;
-}) {
-  const successRate = ratePercent(succeeded, checked);
-  const avgDurationSeconds = avgDurationMs / 1000;
-
-  return (
-    <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2">
-      <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">{label}</div>
-      <div className="text-sm text-gray-700 dark:text-gray-200">
-        {checked} checked • {succeeded} success
-      </div>
-      <div className={`text-xs mt-1 ${successRateTone(successRate)}`}>
-        {successRate}% success
-      </div>
-      {requests > 0 && (
-        <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-          {requests} request{requests === 1 ? "" : "s"} · {emails} email{emails === 1 ? "" : "s"}
-        </div>
-      )}
-      {requests > 0 && (
-        <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-          {avgDurationSeconds.toFixed(1)} s/request · {totalTokens.toLocaleString()} tokens
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ratePercent(part: number, whole: number): number {
-  if (whole === 0) return 0;
-  return Math.round((part / whole) * 100);
-}
-
-function successRateTone(rate: number): string {
-  if (rate >= 80) return "text-green-600 dark:text-green-400";
-  if (rate >= 50) return "text-yellow-600 dark:text-yellow-400";
-  return "text-red-600 dark:text-red-400";
 }
