@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import {
   workflowMessageGet,
   workflowRetryNow,
+  type WorkflowLlmAttempt,
   type WorkflowMessageDetail,
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
@@ -37,13 +38,33 @@ function ruleContext(detail: WorkflowMessageDetail): string | null {
   }
   const rule = detail.current_rule;
   if (!rule) return null;
-  const route = rule.providers
+  if (!rule.route) return `Rule ${rule.rule_index + 1} of ${rule.rule_count}: ${rule.rule_name} · No LLM`;
+  const providers = rule.route.providers
     .map((provider) => {
       const model = provider.model ? ` / ${provider.model}` : "";
       return `${provider.name}${model}${provider.enabled ? "" : " (disabled)"}`;
     })
     .join(" -> ");
-  return `Rule ${rule.rule_index + 1} of ${rule.rule_count}: ${rule.rule_name} · ${rule.policy_name}${route ? ` · ${route}` : ""}`;
+  return `Rule ${rule.rule_index + 1} of ${rule.rule_count}: ${rule.rule_name} · ${rule.route.policy_name}${providers ? ` · ${providers}` : ""}`;
+}
+
+function tokenBreakdown(prompt: number | null, completion: number | null): string | null {
+  return prompt != null && completion != null ? `${prompt.toLocaleString()} in / ${completion.toLocaleString()} out` : null;
+}
+
+function attemptUsage(attempt: WorkflowLlmAttempt): string | null {
+  const duration = attempt.duration_ms != null ? `${(attempt.duration_ms / 1000).toFixed(1)}s` : null;
+  const breakdown = tokenBreakdown(attempt.prompt_tokens, attempt.completion_tokens);
+  const tokens = attempt.total_tokens != null ? `${attempt.total_tokens.toLocaleString()} tokens${breakdown ? ` (${breakdown})` : ""}` : null;
+  return [duration, tokens].filter(Boolean).join(" · ") || null;
+}
+
+function TokenSummary({ attempts }: { attempts: WorkflowLlmAttempt[] }) {
+  const metered = attempts.filter((attempt) => attempt.total_tokens != null);
+  if (metered.length === 0) return <span className="font-medium">-</span>;
+  const sum = (pick: (attempt: WorkflowLlmAttempt) => number | null) => metered.reduce((total, attempt) => total + (pick(attempt) ?? 0), 0);
+  const breakdown = tokenBreakdown(sum((attempt) => attempt.prompt_tokens), sum((attempt) => attempt.completion_tokens));
+  return <><span className="font-medium">{sum((attempt) => attempt.total_tokens).toLocaleString()}</span>{breakdown && <span className="block text-xs text-gray-500">{breakdown}</span>}</>;
 }
 
 function Timeline({ detail }: { detail: WorkflowMessageDetail }) {
@@ -93,7 +114,7 @@ function Timeline({ detail }: { detail: WorkflowMessageDetail }) {
       at: attempt.created_at,
       key: `llm-${attempt.id}`,
       title: `${failed ? "Failed" : "Completed"} LLM decision${attempt.rule_name ? ` · ${attempt.rule_name}` : ""}${provider ? ` · ${provider}` : ""}${attempt.model ? ` / ${attempt.model}` : ""}`,
-      detail: errorSummary(attempt.error) || (attempt.duration_ms != null ? `${(attempt.duration_ms / 1000).toFixed(1)}s` : null),
+      detail: errorSummary(attempt.error) || attemptUsage(attempt),
       technicalDetail: attempt.error && errorSummary(attempt.error) !== attempt.error ? attempt.error : null,
       tone: failed ? "bg-red-500" : "bg-indigo-500",
     });
@@ -188,15 +209,16 @@ export default function MessageDetail() {
           </div>
           {retryable && <div className="text-right"><button type="button" onClick={() => void retry()} disabled={retrying} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">{retrying ? "Queuing…" : "Retry with latest rules"}</button><p className="mt-1 max-w-xs text-xs text-gray-500 dark:text-gray-400">Uses the latest rule settings from this point.</p></div>}
         </div>
-        <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-3 border-t border-gray-100 pt-5 text-sm dark:border-gray-700 sm:grid-cols-5">
+        <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-3 border-t border-gray-100 pt-5 text-sm dark:border-gray-700 sm:grid-cols-6">
           <div><span className="block text-xs text-gray-500">State</span><span className="font-medium">{title(detail.state)}</span></div>
           <div><span className="block text-xs text-gray-500">Ruleset</span><span className="font-medium">v{detail.rule_set_version}</span></div>
           <div><span className="block text-xs text-gray-500">Automatic attempts</span><span className="font-medium">{detail.retry_summary.automatic_attempt_count} recorded</span><span className="block text-xs text-gray-500">Current limit: {detail.retry_summary.automatic_attempt_limit}</span></div>
           <div><span className="block text-xs text-gray-500">Manual retries</span><span className="font-medium">{detail.retry_summary.manual_retry_requested_count} requested</span></div>
+          <div><span className="block text-xs text-gray-500">LLM tokens</span><TokenSummary attempts={detail.llm_attempts} /></div>
           <div><span className="block text-xs text-gray-500">Run</span><span className="font-medium">#{detail.run_id}</span></div>
         </div>
         {messageUnavailable && <section className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/60 dark:bg-amber-950/20"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-amber-800 dark:text-amber-200">{retryable ? "Blocked before rules" : "Waiting for Gmail message"}</p><p className="mt-1 text-sm text-amber-900 dark:text-amber-100">No rule or model has been attempted because Post Office could not retrieve the Gmail message.</p></section>}
-        {!messageUnavailable && detail.current_rule && <section className="mt-4 rounded-xl border border-blue-100 bg-blue-50/70 p-4 dark:border-blue-900/60 dark:bg-blue-950/20"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-700 dark:text-blue-300">{retryable ? "Blocked at" : "Current rule"}</p><p className="mt-1 font-medium text-gray-900 dark:text-gray-100">Rule {detail.current_rule.rule_index + 1} of {detail.current_rule.rule_count}: {detail.current_rule.rule_name}</p><p className="mt-1 text-sm text-gray-600 dark:text-gray-300">Policy: {detail.current_rule.policy_name}</p><div className="mt-3 flex flex-wrap gap-2">{detail.current_rule.providers.map((provider) => <div key={provider.id} className="max-w-full rounded-lg border border-blue-200 bg-white px-3 py-2 text-xs dark:border-blue-900/70 dark:bg-gray-900"><p className="font-medium text-gray-800 dark:text-gray-100">{provider.name}{provider.model ? ` / ${provider.model}` : ""}{!provider.enabled && " (disabled)"}</p>{provider.endpoint && <p className="mt-1 break-all text-gray-500 dark:text-gray-400">{provider.endpoint}</p>}</div>)}</div></section>}
+        {!messageUnavailable && detail.current_rule && <section className="mt-4 rounded-xl border border-blue-100 bg-blue-50/70 p-4 dark:border-blue-900/60 dark:bg-blue-950/20"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-700 dark:text-blue-300">{retryable ? "Blocked at" : "Current rule"}</p><p className="mt-1 font-medium text-gray-900 dark:text-gray-100">Rule {detail.current_rule.rule_index + 1} of {detail.current_rule.rule_count}: {detail.current_rule.rule_name}</p>{detail.current_rule.route ? <><p className="mt-1 text-sm text-gray-600 dark:text-gray-300">Policy: {detail.current_rule.route.policy_name}</p><div className="mt-3 flex flex-wrap gap-2">{detail.current_rule.route.providers.map((provider) => <div key={provider.id} className="max-w-full rounded-lg border border-blue-200 bg-white px-3 py-2 text-xs dark:border-blue-900/70 dark:bg-gray-900"><p className="font-medium text-gray-800 dark:text-gray-100">{provider.name}{provider.model ? ` / ${provider.model}` : ""}{!provider.enabled && " (disabled)"}</p>{provider.endpoint && <p className="mt-1 break-all text-gray-500 dark:text-gray-400">{provider.endpoint}</p>}</div>)}</div></> : <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">No LLM · runs fixed actions</p>}</section>}
         {detail.retry_summary.historical_retry_policy && <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">This run preserves {detail.retry_summary.automatic_retry_scheduled_count} scheduled automatic retries from the previous retry policy. The current {detail.retry_summary.automatic_attempt_limit}-attempt limit is tracked separately.</p>}
         {detail.last_error && <div className="mt-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-200"><p>{errorSummary(detail.last_error)}</p>{errorSummary(detail.last_error) !== detail.last_error && <details className="mt-2 text-xs"><summary className="cursor-pointer">Technical error</summary><pre className="mt-2 whitespace-pre-wrap">{detail.last_error}</pre></details>}</div>}
       </header>

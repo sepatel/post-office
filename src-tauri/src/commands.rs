@@ -1301,6 +1301,15 @@ pub async fn workflow_queue_summary(
 }
 
 #[tauri::command]
+pub async fn workflow_token_usage(
+    state: State<'_, AppState>,
+) -> Result<post_office_core::db::workflow::WorkflowTokenUsage, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    post_office_core::workflow::token_usage(&state.db, &account_email)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn workflow_messages_list(
     state: State<'_, AppState>,
     run_state: Option<String>,
@@ -1375,28 +1384,6 @@ pub async fn rules_metrics(
     state
         .db
         .with_history(|repo| repo.rules_metrics(&account_email))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn rule_roi_metrics(
-    state: State<'_, AppState>,
-) -> Result<Vec<post_office_core::db::llm_usage::RuleRoiMetrics>, String> {
-    let account_email = active_account(&*state.config.lock().await)?;
-    state
-        .db
-        .with_llm_usage(|repo| repo.rule_roi_metrics(&account_email))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn rule_request_metrics(
-    state: State<'_, AppState>,
-) -> Result<Vec<post_office_core::db::llm_requests::RuleRequestMetrics>, String> {
-    let account_email = active_account(&*state.config.lock().await)?;
-    state
-        .db
-        .with_llm_requests(|repo| repo.rule_metrics(&account_email))
         .map_err(|e| e.to_string())
 }
 

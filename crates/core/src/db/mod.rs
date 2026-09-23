@@ -9,8 +9,6 @@ pub mod inference;
 pub mod labels;
 pub mod llm_endpoint_status;
 pub mod llm_provider_status;
-pub mod llm_requests;
-pub mod llm_usage;
 pub mod rule_chat;
 pub mod rule_memory;
 pub mod rules;
@@ -169,6 +167,12 @@ impl Database {
             migrate_model_lane_capacities(&transaction)?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (24)", [])?;
         }
+        if !migration_applied(&transaction, 25)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/025_workflow_llm_tokens.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (25)", [])?;
+        }
         transaction.commit()
     }
 
@@ -223,23 +227,6 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let repo = rule_chat::RuleChatRepository::new(&conn);
         f(repo)
-    }
-
-    pub fn with_llm_usage<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(llm_usage::LlmUsageRepository<'_>) -> R,
-    {
-        let conn = self.conn.lock().unwrap();
-        let repo = llm_usage::LlmUsageRepository::new(&conn);
-        f(repo)
-    }
-
-    pub fn with_llm_requests<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(llm_requests::LlmRequestRepository<'_>) -> R,
-    {
-        let conn = self.conn.lock().unwrap();
-        f(llm_requests::LlmRequestRepository::new(&conn))
     }
 
     pub fn with_inference<F, R>(&self, f: F) -> R

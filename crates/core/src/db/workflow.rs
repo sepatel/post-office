@@ -417,36 +417,25 @@ impl<'a> WorkflowRepository<'a> {
         Ok(true)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Attempt telemetry is stored together to preserve the decision audit trail."
-    )]
-    pub fn record_llm_attempt(
-        &self,
-        run_id: i64,
-        rule_index: i64,
-        provider_id: Option<&str>,
-        provider_name: Option<&str>,
-        model: Option<&str>,
-        status: &str,
-        error: Option<&str>,
-        duration_ms: Option<i64>,
-        endpoint: Option<&str>,
-    ) -> Result<()> {
+    pub fn record_llm_attempt(&self, attempt: &NewLlmAttempt<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO workflow_llm_attempts (
-                 run_id, rule_index, provider_id, provider_name, model, status, error, duration_ms, endpoint
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 run_id, rule_index, provider_id, provider_name, model, status, error, duration_ms,
+                 endpoint, prompt_tokens, completion_tokens, total_tokens
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                run_id,
-                rule_index,
-                provider_id,
-                provider_name,
-                model,
-                status,
-                error,
-                duration_ms,
-                endpoint
+                attempt.run_id,
+                attempt.rule_index,
+                attempt.provider_id,
+                attempt.provider_name,
+                attempt.model,
+                attempt.status,
+                attempt.error,
+                attempt.duration_ms,
+                attempt.endpoint,
+                attempt.tokens.prompt_tokens,
+                attempt.tokens.completion_tokens,
+                attempt.tokens.total_tokens,
             ],
         )?;
         Ok(())
@@ -943,7 +932,8 @@ impl<'a> WorkflowRepository<'a> {
 
     pub fn llm_attempts(&self, run_id: i64) -> Result<Vec<WorkflowLlmAttempt>> {
         let mut statement = self.conn.prepare(
-            "SELECT id, rule_index, provider_id, provider_name, model, status, error, duration_ms, endpoint, created_at
+            "SELECT id, rule_index, provider_id, provider_name, model, status, error, duration_ms, endpoint,
+                    created_at, prompt_tokens, completion_tokens, total_tokens
              FROM workflow_llm_attempts WHERE run_id = ?1 ORDER BY id ASC",
         )?;
         let rows = statement.query_map([run_id], |row| {
@@ -959,9 +949,61 @@ impl<'a> WorkflowRepository<'a> {
                 duration_ms: row.get(7)?,
                 endpoint: row.get(8)?,
                 created_at: row.get(9)?,
+                tokens: TokenUsage {
+                    prompt_tokens: row.get(10)?,
+                    completion_tokens: row.get(11)?,
+                    total_tokens: row.get(12)?,
+                },
             })
         })?;
         rows.collect()
+    }
+
+    // Account-wide LLM token spend, overall and per provider/model.
+    pub fn token_usage(&self, account_email: &str) -> Result<WorkflowTokenUsage> {
+        const TOTALS: &str = "COUNT(*), COALESCE(SUM(a.prompt_tokens), 0),
+             COALESCE(SUM(a.completion_tokens), 0), COALESCE(SUM(a.total_tokens), 0)";
+        const FROM: &str = "FROM workflow_llm_attempts a
+             JOIN workflow_runs r ON r.id = a.run_id
+             WHERE r.account_email = ?1 AND a.status = 'succeeded'";
+        let totals = |row: &rusqlite::Row<'_>, offset: usize| -> rusqlite::Result<TokenTotals> {
+            Ok(TokenTotals {
+                requests: row.get(offset)?,
+                prompt_tokens: row.get(offset + 1)?,
+                completion_tokens: row.get(offset + 2)?,
+                total_tokens: row.get(offset + 3)?,
+            })
+        };
+        let window = |modifier: Option<&str>| {
+            let since = modifier.map_or(String::new(), |modifier| {
+                format!(" AND a.created_at >= datetime('now', '{modifier}')")
+            });
+            self.conn.query_row(
+                &format!("SELECT {TOTALS} {FROM}{since}"),
+                [account_email],
+                |row| totals(row, 0),
+            )
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT COALESCE(a.provider_name, a.provider_id), a.model, {TOTALS} {FROM}
+               AND a.created_at >= datetime('now', '-7 days')
+             GROUP BY 1, 2 ORDER BY 6 DESC"
+        ))?;
+        let by_model_7d = statement
+            .query_map([account_email], |row| {
+                Ok(ModelTokenTotals {
+                    provider: row.get(0)?,
+                    model: row.get(1)?,
+                    totals: totals(row, 2)?,
+                })
+            })?
+            .collect::<Result<_>>()?;
+        Ok(WorkflowTokenUsage {
+            last_24h: window(Some("-1 day"))?,
+            last_7d: window(Some("-7 days"))?,
+            all_time: window(None)?,
+            by_model_7d,
+        })
     }
 
     pub fn action_plans(&self, run_id: i64) -> Result<Vec<WorkflowActionPlan>> {
@@ -1152,6 +1194,70 @@ pub struct WorkflowLlmAttempt {
     pub duration_ms: Option<i64>,
     pub endpoint: Option<String>,
     pub created_at: String,
+    #[serde(flatten)]
+    pub tokens: TokenUsage,
+}
+
+pub struct NewLlmAttempt<'a> {
+    pub run_id: i64,
+    pub rule_index: i64,
+    pub provider_id: Option<&'a str>,
+    pub provider_name: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub endpoint: Option<&'a str>,
+    pub status: &'a str,
+    pub error: Option<&'a str>,
+    pub duration_ms: Option<i64>,
+    pub tokens: TokenUsage,
+}
+
+// Provider-reported usage; absent when the request failed or the provider
+// omitted it.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+
+impl TokenUsage {
+    pub fn reported(prompt: Option<u32>, completion: Option<u32>, total: Option<u32>) -> Self {
+        let prompt_tokens = prompt.map(i64::from);
+        let completion_tokens = completion.map(i64::from);
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: total.map(i64::from).or_else(|| {
+                prompt_tokens
+                    .zip(completion_tokens)
+                    .map(|(prompt, completion)| prompt + completion)
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenTotals {
+    pub requests: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelTokenTotals {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    #[serde(flatten)]
+    pub totals: TokenTotals,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowTokenUsage {
+    pub last_24h: TokenTotals,
+    pub last_7d: TokenTotals,
+    pub all_time: TokenTotals,
+    pub by_model_7d: Vec<ModelTokenTotals>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1259,7 +1365,59 @@ fn map_workflow_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRun> {
 mod tests {
     use std::path::Path;
 
+    use super::{NewLlmAttempt, TokenUsage};
     use crate::db::Database;
+
+    #[test]
+    fn token_usage_totals_succeeded_attempts_per_model() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        db.with_workflow(|repo| {
+            repo.initialize_mailbox("test@example.com", "100")?;
+            repo.activate_rule_set("test@example.com", r#"{"rules":[]}"#)?;
+            repo.enqueue_arrivals("test@example.com", "101", &["message-1".into()])?;
+            let run = repo.claim_next("test@example.com", "lease-1")?.unwrap();
+            let attempt = |model, status, tokens| NewLlmAttempt {
+                run_id: run.id,
+                rule_index: 0,
+                provider_id: Some("local"),
+                provider_name: Some("Local"),
+                model: Some(model),
+                endpoint: None,
+                status,
+                error: None,
+                duration_ms: Some(10),
+                tokens,
+            };
+            repo.record_llm_attempt(&attempt(
+                "small",
+                "succeeded",
+                TokenUsage::reported(Some(100), Some(20), None),
+            ))?;
+            repo.record_llm_attempt(&attempt(
+                "large",
+                "succeeded",
+                TokenUsage::reported(Some(300), Some(50), Some(360)),
+            ))?;
+            repo.record_llm_attempt(&attempt("large", "error", TokenUsage::default()))?;
+
+            let attempts = repo.llm_attempts(run.id)?;
+            assert_eq!(attempts[0].tokens.total_tokens, Some(120));
+            assert_eq!(attempts[2].tokens.total_tokens, None);
+
+            let usage = repo.token_usage("test@example.com")?;
+            assert_eq!(usage.last_24h.requests, 2);
+            assert_eq!(usage.last_24h.prompt_tokens, 400);
+            assert_eq!(usage.all_time.completion_tokens, 70);
+            assert_eq!(usage.last_7d.total_tokens, 480);
+            assert_eq!(usage.by_model_7d[0].model.as_deref(), Some("large"));
+            assert_eq!(usage.by_model_7d[0].totals.total_tokens, 360);
+            assert_eq!(usage.by_model_7d[1].provider.as_deref(), Some("Local"));
+            assert_eq!(repo.token_usage("other@example.com")?.all_time.requests, 0);
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn repeated_arrival_does_not_create_another_run() {
