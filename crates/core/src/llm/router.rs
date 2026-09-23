@@ -9,6 +9,7 @@ use super::{InferenceRuntime, LlmClient, LlmError, ProcessKind, ProcessRequest, 
 use crate::db::Database;
 
 const MAX_RETRIES_PER_PROVIDER: usize = 2;
+const ENDPOINT_UNAVAILABLE_SECS: i64 = 300;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
 /// Hard ceiling for rule decisions. llama.cpp slots must hold prompt plus
 /// thinking plus answer, so unbounded or very large caps can exhaust a slot
@@ -130,6 +131,17 @@ pub struct InferenceRouter {
     max_tokens: u32,
     database: Option<Database>,
     runtime: InferenceRuntime,
+    bypass_endpoint_circuit: bool,
+    fallback_disabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmProviderAttribution {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model: String,
+    pub endpoint: String,
+    pub max_concurrent_requests: usize,
 }
 
 impl InferenceRouter {
@@ -157,13 +169,13 @@ impl InferenceRouter {
             })
             .collect::<HashMap<_, _>>();
 
-        let endpoint_limits = profiles.values().filter(|profile| profile.enabled).fold(
+        let lane_limits = profiles.values().filter(|profile| profile.enabled).fold(
             HashMap::<String, usize>::new(),
             |mut limits, profile| {
-                let endpoint = endpoint_key(&profile.base_url);
+                let lane = InferenceRuntime::model_key(&profile.base_url, &profile.model);
                 let limit = profile.max_concurrent_requests.max(1) as usize;
                 limits
-                    .entry(endpoint)
+                    .entry(lane)
                     .and_modify(|existing| *existing = (*existing).min(limit))
                     .or_insert(limit);
                 limits
@@ -230,6 +242,10 @@ impl InferenceRouter {
                         Some(profile.id.clone()),
                     ))
                 };
+                let effective_max_concurrent_requests = lane_limits
+                    .get(&InferenceRuntime::model_key(&endpoint, &profile.model))
+                    .copied()
+                    .unwrap_or(1);
                 (
                     profile.id.clone(),
                     ProviderClient {
@@ -237,10 +253,7 @@ impl InferenceRouter {
                         client,
                         init_error,
                         endpoint: endpoint.clone(),
-                        effective_max_concurrent_requests: endpoint_limits
-                            .get(&endpoint)
-                            .copied()
-                            .unwrap_or(1),
+                        effective_max_concurrent_requests,
                     },
                 )
             })
@@ -257,12 +270,110 @@ impl InferenceRouter {
             max_tokens: config.llm_max_tokens,
             database: None,
             runtime,
+            bypass_endpoint_circuit: false,
+            fallback_disabled: false,
         }
     }
 
     pub fn with_database(mut self, database: Database) -> Self {
         self.database = Some(database);
         self
+    }
+
+    /// A human-requested retry gets one probe even while the endpoint circuit is open.
+    pub fn with_endpoint_circuit_bypass(mut self) -> Self {
+        self.bypass_endpoint_circuit = true;
+        self
+    }
+
+    pub fn without_fallback(mut self) -> Self {
+        self.fallback_disabled = true;
+        self
+    }
+
+    pub fn provider_attribution(&self, policy_id: &str) -> Option<LlmProviderAttribution> {
+        let policy = self.policy(policy_id);
+        policy
+            .candidate_provider_ids
+            .iter()
+            .find_map(|provider_id| {
+                let provider = self.providers.get(provider_id)?;
+                Some(LlmProviderAttribution {
+                    provider_id: provider.profile.id.clone(),
+                    provider_name: provider.profile.name.clone(),
+                    model: provider.profile.model.clone(),
+                    endpoint: provider.endpoint.clone(),
+                    max_concurrent_requests: provider.effective_max_concurrent_requests,
+                })
+            })
+    }
+
+    pub fn next_provider(&self, policy_id: &str) -> Result<LlmProviderAttribution, LlmError> {
+        let policy = self.policy(policy_id);
+        let (candidates, unavailable) = self.candidates(&policy);
+        let Some(provider) = candidates.into_iter().next() else {
+            let detail = if unavailable.is_empty() {
+                "no providers meet the policy requirements".to_string()
+            } else {
+                unavailable.join("; ")
+            };
+            return Err(LlmError::Routing(format!(
+                "policy '{}' has no eligible providers: {}",
+                policy.id, detail
+            )));
+        };
+        Ok(LlmProviderAttribution {
+            provider_id: provider.profile.id.clone(),
+            provider_name: provider.profile.name.clone(),
+            model: provider.profile.model.clone(),
+            endpoint: provider.endpoint.clone(),
+            max_concurrent_requests: provider.effective_max_concurrent_requests,
+        })
+    }
+
+    pub fn fallback_provider(
+        &self,
+        policy_id: &str,
+        current_provider_id: &str,
+    ) -> Option<LlmProviderAttribution> {
+        let policy = self.policy(policy_id);
+        if !policy.allow_fallback {
+            return None;
+        }
+        let current_index = policy
+            .candidate_provider_ids
+            .iter()
+            .position(|provider_id| provider_id == current_provider_id)?;
+        let (candidates, _) = self.candidates(&policy);
+        candidates
+            .into_iter()
+            .find(|provider| {
+                policy
+                    .candidate_provider_ids
+                    .iter()
+                    .position(|provider_id| provider_id == &provider.profile.id)
+                    .is_some_and(|index| index > current_index)
+            })
+            .map(|provider| LlmProviderAttribution {
+                provider_id: provider.profile.id.clone(),
+                provider_name: provider.profile.name.clone(),
+                model: provider.profile.model.clone(),
+                endpoint: provider.endpoint.clone(),
+                max_concurrent_requests: provider.effective_max_concurrent_requests,
+            })
+    }
+
+    pub fn endpoint_circuit_open(&self, policy_id: &str) -> bool {
+        if self.bypass_endpoint_circuit {
+            return false;
+        }
+        let policy = self.policy(policy_id);
+        policy.candidate_provider_ids.iter().any(|provider_id| {
+            self.providers
+                .get(provider_id)
+                .and_then(|provider| self.endpoint_unavailable_until(&provider.endpoint))
+                .is_some()
+        })
     }
 
     pub async fn process(
@@ -298,6 +409,17 @@ impl InferenceRouter {
 
         let mut failures = unavailable;
         for (index, provider) in candidates.iter().enumerate() {
+            if !self.bypass_endpoint_circuit {
+                if let Some(until) = self.endpoint_unavailable_until(&provider.endpoint) {
+                    failures.push(format!(
+                        "{} ({}): endpoint unavailable until {}",
+                        provider.profile.id,
+                        provider.profile.model,
+                        until.to_rfc3339()
+                    ));
+                    continue;
+                }
+            }
             let Some(client) = provider.client.as_ref() else {
                 failures.push(format!(
                     "{}: {}",
@@ -327,6 +449,7 @@ impl InferenceRouter {
                     Duration::from_secs(slot_timeout),
                     self.runtime.acquire(
                         &provider.endpoint,
+                        &provider.profile.model,
                         provider.effective_max_concurrent_requests,
                     ),
                 )
@@ -358,6 +481,7 @@ impl InferenceRouter {
                 match response {
                     Ok(response) => {
                         self.clear_rate_limit(&provider.profile.id);
+                        self.clear_endpoint_unavailable(&provider.endpoint);
                         return Ok(response);
                     }
                     Err(error) => {
@@ -370,14 +494,21 @@ impl InferenceRouter {
                             ));
                             break;
                         }
+                        let connection_error = is_connection_error(&error);
                         let retryable = is_retryable(&error);
+                        if connection_error {
+                            self.mark_endpoint_unavailable(
+                                &provider.endpoint,
+                                &describe_error(&error),
+                            );
+                        }
                         failures.push(format!(
                             "{} ({}): {}",
                             provider.profile.id,
                             provider.profile.model,
                             describe_error(&error)
                         ));
-                        if !retryable || attempt + 1 >= retries {
+                        if connection_error || !retryable || attempt + 1 >= retries {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(attempt as u32)))
@@ -386,7 +517,7 @@ impl InferenceRouter {
                 }
             }
 
-            if !policy.allow_fallback || index + 1 >= candidates.len() {
+            if self.fallback_disabled || !policy.allow_fallback || index + 1 >= candidates.len() {
                 break;
             }
         }
@@ -480,7 +611,7 @@ impl InferenceRouter {
         let capacity = provider.effective_max_concurrent_requests;
         Some((
             self.runtime
-                .available_permits(&provider.endpoint, capacity)
+                .available_permits(&provider.endpoint, &provider.profile.model, capacity)
                 .min(u32::MAX as usize) as u32,
             capacity.min(u32::MAX as usize) as u32,
         ))
@@ -564,6 +695,16 @@ impl InferenceRouter {
                 ));
                 continue;
             }
+            if !self.bypass_endpoint_circuit {
+                if let Some(until) = self.endpoint_unavailable_until(&provider.endpoint) {
+                    unavailable.push(format!(
+                        "{}: endpoint unavailable until {}",
+                        label,
+                        until.to_rfc3339()
+                    ));
+                    continue;
+                }
+            }
             candidates.push(provider);
         }
         (candidates, unavailable)
@@ -604,6 +745,46 @@ impl InferenceRouter {
             }
         }
     }
+
+    fn endpoint_unavailable_until(&self, endpoint: &str) -> Option<DateTime<Utc>> {
+        let status = self
+            .database
+            .as_ref()?
+            .with_llm_endpoint_status(|repo| repo.get(endpoint).ok().flatten())?;
+        status
+            .unavailable_until
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .filter(|until| *until > Utc::now())
+    }
+
+    fn mark_endpoint_unavailable(&self, endpoint: &str, error: &str) {
+        let Some(database) = &self.database else {
+            return;
+        };
+        let until = Utc::now() + chrono::Duration::seconds(ENDPOINT_UNAVAILABLE_SECS);
+        if let Err(error) = database.with_llm_endpoint_status(|repo| {
+            repo.mark_unavailable(endpoint, &until.to_rfc3339(), error)
+        }) {
+            tracing::warn!(
+                "Failed to open LLM endpoint circuit for {}: {}",
+                endpoint,
+                error
+            );
+        }
+    }
+
+    fn clear_endpoint_unavailable(&self, endpoint: &str) {
+        if let Some(database) = &self.database {
+            if let Err(error) = database.with_llm_endpoint_status(|repo| repo.clear(endpoint)) {
+                tracing::warn!(
+                    "Failed to close LLM endpoint circuit for {}: {}",
+                    endpoint,
+                    error
+                );
+            }
+        }
+    }
 }
 
 fn legacy_profile(config: &crate::config::AppConfig) -> LlmProviderProfile {
@@ -623,6 +804,32 @@ fn legacy_profile(config: &crate::config::AppConfig) -> LlmProviderProfile {
         output_tokens_per_second: config.llm_legacy_output_tokens_per_second,
         chat_reasoning_effort: config.llm_legacy_chat_reasoning_effort,
         enabled: config.llm_legacy_enabled,
+    }
+}
+
+pub fn configure_runtime(config: &crate::config::AppConfig, runtime: &InferenceRuntime) {
+    let mut profiles = config.llm_providers.clone();
+    if !profiles.iter().any(|profile| profile.id == "legacy") {
+        profiles.push(legacy_profile(config));
+    }
+
+    let limits = profiles.into_iter().filter(|profile| profile.enabled).fold(
+        HashMap::<String, (String, String, usize)>::new(),
+        |mut limits, profile| {
+            let endpoint = endpoint_key(&profile.base_url);
+            let model = profile.model.trim().to_string();
+            let key = InferenceRuntime::model_key(&endpoint, &model);
+            let limit = profile.max_concurrent_requests.max(1) as usize;
+            limits
+                .entry(key)
+                .and_modify(|entry| entry.2 = entry.2.min(limit))
+                .or_insert((endpoint, model, limit));
+            limits
+        },
+    );
+
+    for (_, (endpoint, model, limit)) in limits {
+        runtime.set_capacity(&endpoint, &model, limit);
     }
 }
 
@@ -682,6 +889,13 @@ fn is_retryable(error: &LlmError) -> bool {
         LlmError::NoResponse => true,
         LlmError::ParseError(_) | LlmError::Routing(_) | LlmError::Cancelled => false,
     }
+}
+
+fn is_connection_error(error: &LlmError) -> bool {
+    matches!(
+        error,
+        LlmError::Api(async_openai::error::OpenAIError::Reqwest(error)) if error.is_connect()
+    )
 }
 
 fn describe_error(error: &LlmError) -> String {
@@ -868,9 +1082,13 @@ mod tests {
         runtime.block_on(async {
             let runtime = InferenceRuntime::default();
             let endpoint = "http://shade:4000/v1";
-            let _permit = runtime.acquire(endpoint, 1).await;
-            assert_eq!(runtime.available_permits(endpoint, 1), 0);
-            assert_eq!(runtime.available_permits("http://other:4000/v1", 1), 1);
+            let _permit = runtime.acquire(endpoint, "taxonomy", 1).await;
+            assert_eq!(runtime.available_permits(endpoint, "taxonomy", 1), 0);
+            assert_eq!(
+                runtime.available_permits("http://other:4000/v1", "taxonomy", 1),
+                1
+            );
+            assert_eq!(runtime.available_permits(endpoint, "default", 1), 1);
         });
     }
 
@@ -919,6 +1137,26 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert!(unavailable.is_empty());
+    }
+
+    #[test]
+    fn endpoint_circuit_blocks_automatic_routing_but_not_a_manual_probe() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        db.with_llm_endpoint_status(|repo| {
+            repo.mark_unavailable(
+                "http://localhost:11434/v1",
+                &(Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                "connection refused",
+            )
+        })
+        .unwrap();
+        let router = InferenceRouter::from_config(&AppConfig::default()).with_database(db);
+
+        assert!(router.endpoint_circuit_open("default"));
+        assert!(!router
+            .with_endpoint_circuit_bypass()
+            .endpoint_circuit_open("default"));
     }
 
     #[test]

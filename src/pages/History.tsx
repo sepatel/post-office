@@ -1,13 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   historyList,
   historySearch,
-  inferenceJobsList,
-  inferenceJobRetry,
-  type InferenceJob,
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import PipelineDryRunDialog from "../components/PipelineDryRunDialog";
+import LoadError from "../components/LoadError";
+import { useGate } from "../lib/gate";
 
 interface HistoryEntry {
   id: number;
@@ -99,63 +98,61 @@ export default function History() {
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [page, setPage] = useState(0);
-  const [jobs, setJobs] = useState<InferenceJob[]>([]);
-  const [retryingJobId, setRetryingJobId] = useState<number | null>(null);
   const [dryRunEmailId, setDryRunEmailId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const request = useRef(0);
+  const { activeEmail } = useGate();
   const perPage = 20;
-  const activeJobs = jobs.filter((job) => ["pending", "running", "retrying"].includes(job.status));
-  const terminalJobs = jobs.filter((job) => !["pending", "running", "retrying", "succeeded"].includes(job.status));
 
   useEffect(() => {
-    loadEntries();
-    loadJobs();
-  }, [page]);
+    void loadEntries();
+  }, [page, activeEmail]);
 
   async function loadEntries() {
+    const version = ++request.current;
+    setLoading(true);
     try {
       const e = (await historyList(page, perPage)) as HistoryEntry[];
-      setEntries(e);
-    } catch (e) {
-      console.error("Failed to load history:", e);
+      if (version === request.current) {
+        setEntries(e);
+        setLoadError(null);
+      }
+    } catch (error) {
+      if (version === request.current) setLoadError(error);
+    } finally {
+      if (version === request.current) setLoading(false);
     }
   }
 
   async function handleSearch() {
     if (!searchQuery.trim()) {
-      loadEntries();
+      void loadEntries();
       return;
     }
+    const version = ++request.current;
+    setLoading(true);
     try {
       const e = (await historySearch(searchQuery)) as HistoryEntry[];
-      setEntries(e);
-    } catch (e) {
-      console.error("Failed to search history:", e);
-    }
-  }
-
-  async function loadJobs() {
-    try {
-      setJobs(await inferenceJobsList(0, 20));
-    } catch (e) {
-      console.error("Failed to load inference jobs:", e);
-    }
-  }
-
-  async function retryJob(jobId: number) {
-    setRetryingJobId(jobId);
-    try {
-      await inferenceJobRetry(jobId);
-      await loadJobs();
-    } catch (e) {
-      console.error("Failed to retry inference job:", e);
+      if (version === request.current) {
+        setEntries(e);
+        setLoadError(null);
+      }
+    } catch (error) {
+      if (version === request.current) setLoadError(error);
     } finally {
-      setRetryingJobId(null);
+      if (version === request.current) setLoading(false);
     }
   }
 
   return (
     <div>
-      <h2 className="text-2xl font-bold mb-6">History</h2>
+      <div className="mb-6">
+        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-gray-400">Read-only legacy data</p>
+        <h2 className="mt-1 text-2xl font-bold">Legacy archive</h2>
+      </div>
+
+      {loadError !== null && <div className="mb-4"><LoadError title="Could not load the archive" error={loadError} onRetry={() => void loadEntries()} /></div>}
 
       <div className="flex gap-2 mb-4">
         <input
@@ -173,92 +170,6 @@ export default function History() {
           Search
         </button>
       </div>
-
-      {activeJobs.length > 0 && (
-        <section className="mb-4 bg-white dark:bg-gray-800 rounded-lg border border-amber-200 dark:border-amber-800 overflow-hidden">
-          <div className="px-4 py-3 border-b border-amber-200 dark:border-amber-800">
-            <h3 className="font-semibold text-amber-800 dark:text-amber-200">
-              Inference queue
-            </h3>
-            <p className="text-xs text-amber-700 dark:text-amber-300 mt-1">
-              These messages are waiting to be retried automatically.
-            </p>
-          </div>
-          <div className="divide-y divide-gray-200 dark:divide-gray-700">
-            {activeJobs.map((job) => (
-              <div key={job.id} className="px-4 py-3 flex items-center gap-3 text-sm">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate">
-                    {job.email_id} {job.rule_id != null ? `• rule ${job.rule_id}` : ""}
-                  </div>
-                  <div className="text-xs text-gray-500 dark:text-gray-400">
-                    {job.status} • {job.attempt_count} attempt{job.attempt_count === 1 ? "" : "s"}
-                    {job.last_error ? ` • ${job.last_error}` : ""}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setDryRunEmailId(job.email_id)}
-                  className="px-2 py-1 text-xs font-medium text-blue-600 hover:underline dark:text-blue-300"
-                >
-                  Dry run
-                </button>
-                {!["pending", "running", "retrying"].includes(job.status) && (
-                  <button
-                    type="button"
-                    onClick={() => retryJob(job.id)}
-                    disabled={retryingJobId === job.id}
-                    className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-3 py-1 rounded text-xs"
-                  >
-                    {retryingJobId === job.id ? "Queued…" : "Retry"}
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {terminalJobs.length > 0 && (
-        <section className="mb-4 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-            <h3 className="font-semibold text-gray-800 dark:text-gray-200">Recovery outcomes</h3>
-            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              These messages are not actively queued. Inspect or retry them with current settings.
-            </p>
-          </div>
-          <div className="divide-y divide-gray-200 dark:divide-gray-700">
-            {terminalJobs.map((job) => (
-              <div key={job.id} className="px-4 py-3 flex items-center gap-3 text-sm">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate">
-                    {job.email_id} {job.rule_id != null ? `• rule ${job.rule_id}` : ""}
-                  </div>
-                  <div className="text-xs text-gray-500 dark:text-gray-400">
-                    {job.status} • {job.attempt_count} attempt{job.attempt_count === 1 ? "" : "s"}
-                    {job.last_error ? ` • ${job.last_error}` : ""}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setDryRunEmailId(job.email_id)}
-                  className="px-2 py-1 text-xs font-medium text-blue-600 hover:underline dark:text-blue-300"
-                >
-                  Dry run
-                </button>
-                <button
-                  type="button"
-                  onClick={() => retryJob(job.id)}
-                  disabled={retryingJobId === job.id}
-                  className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-3 py-1 rounded text-xs"
-                >
-                  {retryingJobId === job.id ? "Queued…" : "Retry now"}
-                </button>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
 
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
         <table className="w-full min-w-[80rem] table-fixed text-sm">
@@ -285,14 +196,19 @@ export default function History() {
             </tr>
           </thead>
           <tbody>
-            {entries.length === 0 && (
+            {loading && (
+              <tr>
+                <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-gray-500">Loading archive...</td>
+              </tr>
+            )}
+            {!loading && entries.length === 0 && (
               <tr>
                 <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-gray-500">
                   No history yet
                 </td>
               </tr>
             )}
-            {entries.map((entry) => (
+            {!loading && entries.map((entry) => (
               <tr
                 key={entry.id}
                 className="border-b border-gray-200 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors"

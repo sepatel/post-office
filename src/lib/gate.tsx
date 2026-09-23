@@ -1,5 +1,5 @@
 import { createContext, useContext } from "react";
-import type { Account, GmailConnection } from "./tauri";
+import type { Account, AccountsState, GmailConnection } from "./tauri";
 
 interface GateValue {
   connected: boolean;
@@ -7,6 +7,9 @@ interface GateValue {
   setConnection: (c: GmailConnection | null) => void;
   activeEmail: string | null;
   accounts: Account[];
+  switchingEmail: string | null;
+  accountError: string | null;
+  refreshAccountList: () => Promise<AccountsState>;
   refreshAccounts: () => Promise<void>;
   selectAccount: (email: string) => Promise<void>;
 }
@@ -17,6 +20,9 @@ export const GateContext = createContext<GateValue>({
   setConnection: () => {},
   activeEmail: null,
   accounts: [],
+  switchingEmail: null,
+  accountError: null,
+  refreshAccountList: async () => ({ accounts: [], active_email: null }),
   refreshAccounts: async () => {},
   selectAccount: async () => {},
 });

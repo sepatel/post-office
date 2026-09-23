@@ -117,6 +117,9 @@ pub enum RuleError {
     #[error(transparent)]
     Llm(#[from] crate::llm::LlmError),
 
+    #[error("{0}")]
+    IncompleteDecision(String),
+
     #[error("Rule prompt and context exceed the model input budget")]
     PromptTooLarge,
 }
@@ -523,6 +526,10 @@ pub fn choice_catalog(rule: &Rule, labels: &[Label]) -> Vec<Choice> {
         }
     }
     catalog
+}
+
+pub fn needs_llm_decision(rule: &Rule, labels: &[Label]) -> bool {
+    !rule.prompt.trim().is_empty() || !choice_catalog(rule, labels).is_empty()
 }
 
 fn choice_for(action: &Action, labels: &[Label]) -> Option<Choice> {
@@ -1249,6 +1256,26 @@ mod tests {
         rule.choose_from_all_labels = true;
 
         assert_eq!(choice_catalog(&rule, &labels).len(), 2);
+    }
+
+    #[test]
+    fn fixed_actions_do_not_need_an_llm_decision() {
+        let mut rule = rule_with_actions(vec![Action::Trash]);
+        rule.prompt.clear();
+        assert!(!needs_llm_decision(&rule, &[]));
+
+        rule.prompt = "Decide whether to trash this message.".into();
+        assert!(needs_llm_decision(&rule, &[]));
+
+        rule.prompt.clear();
+        rule.choices = vec![Action::Trash];
+        assert!(needs_llm_decision(&rule, &[]));
+
+        rule.choices = vec![Action::Label {
+            value: "Label_1".into(),
+        }];
+        assert!(!needs_llm_decision(&rule, &[]));
+        assert!(needs_llm_decision(&rule, &[label("Label_1", "Bills")]));
     }
 
     #[test]

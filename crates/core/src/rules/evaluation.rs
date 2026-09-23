@@ -74,6 +74,9 @@ pub async fn resolve_decision(
                 Ok(content) if !content.is_empty() => content,
                 Ok(_) => {
                     let diagnostic = missing_decision_diagnostic(&response);
+                    if let Some(error) = incomplete_decision_error(&response, &diagnostic) {
+                        return Err(error);
+                    }
                     return Ok(unparsed(response.content.clone(), &diagnostic, &response));
                 }
                 Err(diagnostic) => {
@@ -129,12 +132,11 @@ fn decision_context(
     rule: &Rule,
     labels: &[Label],
 ) -> Option<DecisionContext> {
-    let has_instruction = !rule.prompt.trim().is_empty();
     let menu = choice_catalog(rule, labels);
-    // A menu explicitly asks for inference, even without an instruction.
-    if !has_instruction && menu.is_empty() {
+    if !crate::rules::engine::needs_llm_decision(rule, labels) {
         return None;
     }
+    let has_instruction = !rule.prompt.trim().is_empty();
     let system_prompt = decision_prompt(&menu, has_instruction);
     let reserved_completion_tokens = llm.decision_context_reserve_tokens(rule.decision_max_tokens);
     let budget = llm
@@ -287,6 +289,14 @@ fn missing_decision_diagnostic(response: &crate::llm::ProcessResponse) -> String
     }
 }
 
+fn incomplete_decision_error(
+    response: &crate::llm::ProcessResponse,
+    diagnostic: &str,
+) -> Option<RuleError> {
+    (response.has_reasoning && response.finish_reason.as_deref() == Some("length"))
+        .then(|| RuleError::IncompleteDecision(diagnostic.to_string()))
+}
+
 fn build_decision_prompt(
     rule: &Rule,
     email: &Message,
@@ -413,6 +423,30 @@ mod tests {
         assert_eq!(
             strip_thinking_prefix("<think>considering the email"),
             Err("Model returned unfinished thinking without a final decision")
+        );
+    }
+
+    #[test]
+    fn capped_reasoning_is_a_provider_failure() {
+        let response = crate::llm::ProcessResponse {
+            content: String::new(),
+            finish_reason: Some("length".into()),
+            has_reasoning: true,
+            model: "test".into(),
+            provider_id: Some("test".into()),
+            prompt_tokens: None,
+            completion_tokens: Some(1_024),
+            tokens_used: None,
+            duration_ms: 0,
+            request_key: "test".into(),
+        };
+
+        let diagnostic = missing_decision_diagnostic(&response);
+        let error = incomplete_decision_error(&response, &diagnostic).expect("should fail over");
+
+        assert_eq!(
+            error.to_string(),
+            "Model returned reasoning without a final decision; output limit was reached"
         );
     }
 }
