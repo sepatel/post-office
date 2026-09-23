@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { processingPause, processingResume, processingStatus, workflowEndpointStatus, workflowQueueSummary, type WorkflowEndpointStatus, type WorkflowQueueSummary } from "../lib/tauri";
+import { processingPause, processingResume, processingStatus, workflowEndpointStatus, workflowQueueSummary, workflowTokenUsage, type TokenTotals, type WorkflowEndpointStatus, type WorkflowQueueSummary, type WorkflowTokenUsage } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import { useGate } from "../lib/gate";
 import LoadError from "../components/LoadError";
@@ -10,6 +10,7 @@ export default function Operations() {
   const { activeEmail } = useGate();
   const [summary, setSummary] = useState<WorkflowQueueSummary | null>(null);
   const [endpoints, setEndpoints] = useState<WorkflowEndpointStatus[]>([]);
+  const [tokens, setTokens] = useState<WorkflowTokenUsage | null>(null);
   const [paused, setPaused] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const loading = useRef(false);
@@ -22,16 +23,18 @@ export default function Operations() {
     try {
       while (true) {
         const version = request.current;
-        const [summaryResult, statusResult, endpointsResult] = await Promise.allSettled([
+        const [summaryResult, statusResult, endpointsResult, tokensResult] = await Promise.allSettled([
           workflowQueueSummary(),
           processingStatus() as Promise<{ paused: boolean }>,
           workflowEndpointStatus(),
+          workflowTokenUsage(),
         ]);
         if (version !== request.current) continue;
         if (summaryResult.status === "fulfilled") setSummary(summaryResult.value);
         if (statusResult.status === "fulfilled") setPaused(statusResult.value.paused);
         if (endpointsResult.status === "fulfilled") setEndpoints(endpointsResult.value);
-        const errors = [summaryResult, statusResult, endpointsResult]
+        if (tokensResult.status === "fulfilled") setTokens(tokensResult.value);
+        const errors = [summaryResult, statusResult, endpointsResult, tokensResult]
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")
           .map((result) => String(result.reason));
         setLoadError(errors.length > 0 ? errors.join(" ") : null);
@@ -74,6 +77,25 @@ export default function Operations() {
         {trackedStates.map((state) => <div key={state} className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-700 dark:bg-gray-800"><p className="text-sm capitalize text-gray-500 dark:text-gray-400">{state.replace(/_/g, " ")}</p><p className="mt-2 text-3xl font-semibold tabular-nums">{count(state)}</p></div>)}
       </div>
       <section className="mt-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-700 dark:bg-gray-800">
+        <h2 className="text-lg font-semibold">Token usage</h2>
+        <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">Provider-reported tokens for successful LLM decisions.</p>
+        <div className="mt-4 grid gap-4 sm:grid-cols-3">
+          <TokenCard label="Last 24 hours" totals={tokens?.last_24h} />
+          <TokenCard label="Last 7 days" totals={tokens?.last_7d} />
+          <TokenCard label="All time" totals={tokens?.all_time} />
+        </div>
+        {tokens && tokens.by_model_7d.length > 0 && (
+          <table className="mt-5 w-full text-left text-sm">
+            <thead className="text-xs text-gray-500"><tr><th className="py-2 font-medium">Model (last 7 days)</th><th className="py-2 text-right font-medium">Calls</th><th className="py-2 text-right font-medium">In</th><th className="py-2 text-right font-medium">Out</th><th className="py-2 text-right font-medium">Total</th></tr></thead>
+            <tbody className="divide-y divide-gray-100 tabular-nums dark:divide-gray-700">
+              {tokens.by_model_7d.map((row) => (
+                <tr key={`${row.provider}/${row.model}`}><td className="py-2">{row.provider ?? "Unknown"}{row.model ? ` / ${row.model}` : ""}</td><td className="py-2 text-right">{row.requests.toLocaleString()}</td><td className="py-2 text-right">{row.prompt_tokens.toLocaleString()}</td><td className="py-2 text-right">{row.completion_tokens.toLocaleString()}</td><td className="py-2 text-right font-medium">{row.total_tokens.toLocaleString()}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+      <section className="mt-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-700 dark:bg-gray-800">
         <h2 className="text-lg font-semibold">Gmail history cursor</h2>
         {summary?.mailbox ? <div className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><div><span className="block text-xs text-gray-500">Account</span>{summary.mailbox.account_email}</div><div><span className="block text-xs text-gray-500">Initialized</span>{formatLocalDateTime(summary.mailbox.initialized_at, "-")}</div><div><span className="block text-xs text-gray-500">Last updated</span>{formatLocalDateTime(summary.mailbox.updated_at, "-")}</div></div> : <p className="mt-3 text-sm text-gray-400">Waiting for the first Gmail history sync.</p>}
       </section>
@@ -93,6 +115,16 @@ export default function Operations() {
           </div>
         )}
       </section>
+    </div>
+  );
+}
+
+function TokenCard({ label, totals }: { label: string; totals: TokenTotals | undefined }) {
+  return (
+    <div className="rounded-xl border border-gray-100 bg-gray-50 p-4 dark:border-gray-700 dark:bg-gray-900/60">
+      <p className="text-sm text-gray-500 dark:text-gray-400">{label}</p>
+      <p className="mt-2 text-2xl font-semibold tabular-nums">{totals ? totals.total_tokens.toLocaleString() : "-"}</p>
+      {totals && <p className="mt-1 text-xs text-gray-500 tabular-nums dark:text-gray-400">{totals.prompt_tokens.toLocaleString()} in / {totals.completion_tokens.toLocaleString()} out · {totals.requests.toLocaleString()} call{totals.requests === 1 ? "" : "s"}</p>}
     </div>
   );
 }

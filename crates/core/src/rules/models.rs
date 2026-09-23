@@ -32,6 +32,14 @@ pub struct Rule {
     pub continue_after_match: bool,
 }
 
+impl Rule {
+    // Label-independent form of `engine::needs_llm_decision`, for describing a
+    // rule without a live Gmail label list.
+    pub fn asks_llm(&self) -> bool {
+        !self.prompt.trim().is_empty() || !self.choices.is_empty() || self.choose_from_all_labels
+    }
+}
+
 fn default_inference_policy() -> String {
     "default".into()
 }

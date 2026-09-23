@@ -19,6 +19,11 @@ export function policyDisplayName(
   return name ?? (id === "default" ? "Default" : id);
 }
 
+// Mirrors `Rule::asks_llm` in the core crate.
+export function usesLlm(rule: { prompt: string; choices: unknown[]; choose_from_all_labels: boolean }): boolean {
+  return rule.prompt.trim() !== "" || rule.choices.length > 0 || rule.choose_from_all_labels;
+}
+
 export async function configSet(key: string, value: string) {
   return invoke("config_set", { key, value });
 }
@@ -152,48 +157,6 @@ export interface RuleMetrics {
 
 export async function ruleMetrics(): Promise<RuleMetrics[]> {
   return invoke("rules_metrics");
-}
-
-export interface RuleRoiMetrics {
-  rule_id: number;
-  llm_checks_24h: number;
-  llm_successes_24h: number;
-  prompt_tokens_24h: number;
-  completion_tokens_24h: number;
-  total_tokens_24h: number;
-  estimated_cost_24h_usd: number;
-  avg_duration_24h_ms: number;
-  llm_checks_7d: number;
-  llm_successes_7d: number;
-  prompt_tokens_7d: number;
-  completion_tokens_7d: number;
-  total_tokens_7d: number;
-  estimated_cost_7d_usd: number;
-  avg_duration_7d_ms: number;
-}
-
-export async function ruleRoiMetrics(): Promise<RuleRoiMetrics[]> {
-  return invoke("rule_roi_metrics");
-}
-
-export interface RuleRequestMetrics {
-  rule_id: number;
-  requests_24h: number;
-  emails_24h: number;
-  prompt_tokens_24h: number;
-  completion_tokens_24h: number;
-  total_tokens_24h: number;
-  avg_duration_24h_ms: number;
-  requests_7d: number;
-  emails_7d: number;
-  prompt_tokens_7d: number;
-  completion_tokens_7d: number;
-  total_tokens_7d: number;
-  avg_duration_7d_ms: number;
-}
-
-export async function ruleRequestMetrics(): Promise<RuleRequestMetrics[]> {
-  return invoke("rule_request_metrics");
 }
 
 export interface ChatMessage {
@@ -391,6 +354,32 @@ export interface WorkflowLlmAttempt {
   duration_ms: number | null;
   endpoint: string | null;
   created_at: string;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+}
+
+export interface TokenTotals {
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface ModelTokenTotals extends TokenTotals {
+  provider: string | null;
+  model: string | null;
+}
+
+export interface WorkflowTokenUsage {
+  last_24h: TokenTotals;
+  last_7d: TokenTotals;
+  all_time: TokenTotals;
+  by_model_7d: ModelTokenTotals[];
+}
+
+export async function workflowTokenUsage(): Promise<WorkflowTokenUsage> {
+  return invoke("workflow_token_usage");
 }
 
 export interface WorkflowActionPlan {
@@ -423,13 +412,18 @@ export interface WorkflowRouteProvider {
   enabled: boolean;
 }
 
+export interface WorkflowRuleRoute {
+  policy_id: string;
+  policy_name: string;
+  providers: WorkflowRouteProvider[];
+}
+
 export interface WorkflowRuleContext {
   rule_index: number;
   rule_count: number;
   rule_name: string;
-  policy_id: string;
-  policy_name: string;
-  providers: WorkflowRouteProvider[];
+  /// Null when the rule never calls the LLM.
+  route: WorkflowRuleRoute | null;
 }
 
 export interface WorkflowRetrySummary {

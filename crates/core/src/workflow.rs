@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 use crate::db::workflow::{
-    ActionPlan, ClaimedRun, WorkflowActionPlan, WorkflowEvent, WorkflowLlmAttempt, WorkflowMailbox,
-    WorkflowRun, WorkflowStateCount, WorkflowStep, MAX_ATTEMPTS,
+    ActionPlan, ClaimedRun, NewLlmAttempt, TokenUsage, WorkflowActionPlan, WorkflowEvent,
+    WorkflowLlmAttempt, WorkflowMailbox, WorkflowRun, WorkflowStateCount, WorkflowStep,
+    WorkflowTokenUsage, MAX_ATTEMPTS,
 };
 use crate::db::Database;
 use crate::gmail::models::{HistoryRecord, Message};
@@ -82,6 +83,12 @@ pub struct WorkflowRuleContext {
     pub rule_index: i64,
     pub rule_count: usize,
     pub rule_name: String,
+    /// `None` when the rule never calls the LLM.
+    pub route: Option<WorkflowRuleRoute>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowRuleRoute {
     pub policy_id: String,
     pub policy_name: String,
     pub providers: Vec<WorkflowRouteProvider>,
@@ -126,6 +133,13 @@ pub fn queue_summary(db: &Database, account_email: &str) -> Result<QueueSummary,
             mailbox: repo.mailbox(account_email)?,
         })
     })
+}
+
+pub fn token_usage(
+    db: &Database,
+    account_email: &str,
+) -> Result<WorkflowTokenUsage, rusqlite::Error> {
+    db.with_workflow(|repo| repo.token_usage(account_email))
 }
 
 pub fn message_detail(
@@ -253,18 +267,27 @@ fn rule_name(snapshot: &RuleSetSnapshot, rule_index: i64) -> Option<String> {
 
 fn rule_context(snapshot: &RuleSetSnapshot, rule_index: i64) -> Option<WorkflowRuleContext> {
     let index = usize::try_from(rule_index).ok()?;
-    let rule = snapshot.rules.get(index)?;
+    let rule = &snapshot.rules.get(index)?.rule;
+    Some(WorkflowRuleContext {
+        rule_index,
+        rule_count: snapshot.rules.len(),
+        rule_name: rule.name.clone(),
+        route: rule
+            .asks_llm()
+            .then(|| rule_route(&snapshot.llm, &rule.inference_policy)),
+    })
+}
+
+fn rule_route(snapshot: &LlmSnapshot, policy_id: &str) -> WorkflowRuleRoute {
     let policy = snapshot
-        .llm
         .routing_policies
         .iter()
-        .find(|policy| policy.id == rule.rule.inference_policy)
+        .find(|policy| policy.id == policy_id)
         .or_else(|| {
             snapshot
-                .llm
                 .routing_policies
                 .iter()
-                .find(|policy| policy.id == snapshot.llm.default_policy)
+                .find(|policy| policy.id == snapshot.default_policy)
         });
     let (policy_id, policy_name, provider_ids) = policy
         .map(|policy| {
@@ -275,18 +298,14 @@ fn rule_context(snapshot: &RuleSetSnapshot, rule_index: i64) -> Option<WorkflowR
             )
         })
         .unwrap_or_else(|| ("default".into(), "Default".into(), vec!["legacy".into()]));
-
-    Some(WorkflowRuleContext {
-        rule_index,
-        rule_count: snapshot.rules.len(),
-        rule_name: rule.rule.name.clone(),
+    WorkflowRuleRoute {
         policy_id,
         policy_name,
         providers: provider_ids
             .iter()
-            .map(|provider_id| route_provider(&snapshot.llm, provider_id))
+            .map(|provider_id| route_provider(snapshot, provider_id))
             .collect(),
-    })
+    }
 }
 
 fn route_provider(snapshot: &LlmSnapshot, provider_id: &str) -> WorkflowRouteProvider {
@@ -942,17 +961,24 @@ pub async fn process_routed_run(
         (resolved.llm_provider.as_deref() == Some(value.provider_id.as_str()))
             .then_some(value.provider_name.as_str())
     });
-    record_decision_attempt(
-        db,
-        run.id,
-        run.next_rule_index,
-        &resolved,
-        "succeeded",
-        None,
-        started,
-        attribution.as_ref().map(|value| value.endpoint.as_str()),
-        provider_name,
-    )?;
+    db.with_workflow(|repo| {
+        repo.record_llm_attempt(&NewLlmAttempt {
+            run_id: run.id,
+            rule_index: run.next_rule_index,
+            provider_id: resolved.llm_provider.as_deref(),
+            provider_name,
+            model: resolved.llm_model.as_deref(),
+            endpoint: attribution.as_ref().map(|value| value.endpoint.as_str()),
+            status: "succeeded",
+            error: None,
+            duration_ms: Some(elapsed_ms(started)),
+            tokens: TokenUsage::reported(
+                resolved.prompt_tokens,
+                resolved.completion_tokens,
+                resolved.total_tokens,
+            ),
+        })
+    })?;
     persist_decision(db, &run, rule, run.next_rule_index, &labels, &resolved)?;
     Ok(())
 }
@@ -969,23 +995,24 @@ fn record_decision_error(
     let attribution = llm.provider_attribution(policy_id);
     let endpoint_circuit_open = llm.endpoint_circuit_open(policy_id);
     db.with_workflow(|repo| {
-        repo.record_llm_attempt(
-            run.id,
+        repo.record_llm_attempt(&NewLlmAttempt {
+            run_id: run.id,
             rule_index,
-            attribution.as_ref().map(|value| value.provider_id.as_str()),
-            attribution
+            provider_id: attribution.as_ref().map(|value| value.provider_id.as_str()),
+            provider_name: attribution
                 .as_ref()
                 .map(|value| value.provider_name.as_str()),
-            attribution.as_ref().map(|value| value.model.as_str()),
-            if endpoint_circuit_open {
+            model: attribution.as_ref().map(|value| value.model.as_str()),
+            endpoint: attribution.as_ref().map(|value| value.endpoint.as_str()),
+            status: if endpoint_circuit_open {
                 "blocked"
             } else {
                 "error"
             },
-            Some(&error),
-            None,
-            attribution.as_ref().map(|value| value.endpoint.as_str()),
-        )?;
+            error: Some(&error),
+            duration_ms: None,
+            tokens: TokenUsage::default(),
+        })?;
         if let Some(provider) = run
             .route_provider_id
             .as_deref()
@@ -1231,36 +1258,6 @@ fn apply_local_labels(message: &mut Message, action: &ActionPlan) {
     message.label_ids = labels.into_iter().collect();
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Decision telemetry carries all provider and timing fields as one durable attempt."
-)]
-fn record_decision_attempt(
-    db: &Arc<Database>,
-    run_id: i64,
-    rule_index: i64,
-    resolved: &Resolved,
-    status: &str,
-    error: Option<&str>,
-    started: Instant,
-    endpoint: Option<&str>,
-    provider_name: Option<&str>,
-) -> Result<(), rusqlite::Error> {
-    db.with_workflow(|repo| {
-        repo.record_llm_attempt(
-            run_id,
-            rule_index,
-            resolved.llm_provider.as_deref(),
-            provider_name,
-            resolved.llm_model.as_deref(),
-            status,
-            error,
-            Some(elapsed_ms(started)),
-            endpoint,
-        )
-    })
-}
-
 fn elapsed_ms(started: Instant) -> i64 {
     started.elapsed().as_millis().min(i64::MAX as u128) as i64
 }
@@ -1378,11 +1375,17 @@ mod tests {
         };
 
         let context = rule_context(&snapshot, 0).unwrap();
+        let route = context.route.unwrap();
 
         assert_eq!(context.rule_name, "Trash GitHub notifications");
-        assert_eq!(context.policy_name, "Taxonomy");
-        assert_eq!(context.providers[0].name, "Shade Taxonomy");
-        assert_eq!(context.providers[0].model, "taxonomy");
+        assert_eq!(route.policy_name, "Taxonomy");
+        assert_eq!(route.providers[0].name, "Shade Taxonomy");
+        assert_eq!(route.providers[0].model, "taxonomy");
+
+        let mut automatic = snapshot;
+        automatic.rules[0].rule.prompt.clear();
+        automatic.rules[0].rule.actions = vec![crate::rules::models::Action::Trash];
+        assert!(rule_context(&automatic, 0).unwrap().route.is_none());
     }
 
     #[test]

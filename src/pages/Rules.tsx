@@ -7,6 +7,7 @@ import {
   policyDisplayName,
   rulesList,
   rulesReorder,
+  usesLlm,
   workflowRuleSetStatus,
   type LlmRoutingPolicy,
   type WorkflowRuleSetStatus,
@@ -29,7 +30,8 @@ interface Rule {
 }
 
 interface RuleListItem extends Rule {
-  policyName: string;
+  /// Null when the rule never calls the LLM.
+  policyName: string | null;
 }
 
 export default function Rules() {
@@ -57,7 +59,7 @@ export default function Rules() {
     if (rulesResult.status === "fulfilled") {
       setRules(rulesResult.value.map((rule) => ({
         ...rule,
-        policyName: policyDisplayName(rule.inference_policy, policies),
+        policyName: usesLlm(rule) ? policyDisplayName(rule.inference_policy, policies) : null,
       })));
     }
     if (snapshotsResult.status === "fulfilled") setSnapshots(snapshotsResult.value);
@@ -163,7 +165,7 @@ export default function Rules() {
             <article key={rule.id} className="flex flex-wrap items-start gap-4 rounded-2xl border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-700 dark:bg-gray-800">
               <div className="flex shrink-0 flex-col items-center gap-1"><span className="flex h-8 w-8 items-center justify-center rounded-full bg-gray-100 text-xs font-semibold text-gray-600 dark:bg-gray-700 dark:text-gray-200">{index + 1}</span><button type="button" onClick={() => void moveRule(index, -1)} disabled={index === 0} className="text-xs text-gray-500 disabled:opacity-30">Up</button><button type="button" onClick={() => void moveRule(index, 1)} disabled={index === rules.length - 1} className="text-xs text-gray-500 disabled:opacity-30">Down</button></div>
               <button type="button" onClick={() => navigate(`/rules/${rule.id}/edit`)} className="min-w-0 flex-1 text-left">
-                <div className="flex flex-wrap items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${rule.enabled ? "bg-emerald-500" : "bg-gray-400"}`} /><span className="font-semibold">{rule.name}</span><span className="rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">{rule.policyName}</span></div>
+                <div className="flex flex-wrap items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${rule.enabled ? "bg-emerald-500" : "bg-gray-400"}`} /><span className="font-semibold">{rule.name}</span>{rule.policyName ? <span className="rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">{rule.policyName}</span> : <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300">No LLM</span>}</div>
                 <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">When {rule.conditions.length || "any"} condition{rule.conditions.length === 1 ? "" : "s"} match · {ruleSummary(rule)}{rule.continue_after_match ? " · continues along the line" : " · claims the message"}</p>
                 {rule.description && <p className="mt-1 text-sm text-gray-500">{rule.description}</p>}
               </button>
@@ -177,7 +179,6 @@ export default function Rules() {
 }
 
 function ruleSummary(rule: Rule): string {
-  if (rule.choose_from_all_labels || rule.choices.length > 0) return "classifies an outcome";
-  if (rule.prompt.trim()) return "asks the model to decide";
-  return "runs fixed actions";
+  if (!usesLlm(rule)) return "runs fixed actions";
+  return rule.choose_from_all_labels || rule.choices.length > 0 ? "classifies an outcome" : "asks the model to decide";
 }

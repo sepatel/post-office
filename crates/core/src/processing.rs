@@ -8,7 +8,6 @@ use tokio::sync::Mutex;
 
 use crate::config::AppConfig;
 use crate::db::history::NewHistoryEntry;
-use crate::db::llm_requests::NewLlmRequest;
 use crate::db::Database;
 use crate::gmail::models::{Message, MessageRef};
 use crate::rules::engine::{no_action_reason, resolve_rule, Outcome, Resolved};
@@ -600,7 +599,6 @@ async fn process_inference_job(
     let resolved = resolve_rule(llm, &rule, &email, &memories, &labels)
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
-    record_llm_request(db, account_email, &rule, &resolved, "retry");
     let attempt = AttemptMetadata::from(&resolved);
     match resolved.outcome {
         // A retried email still has to reach lower-priority rules, otherwise a
@@ -860,42 +858,6 @@ fn insert_history_entry(
             tracing::error!("Failed to insert history entry: {}", e);
             None
         }
-    }
-}
-
-fn record_llm_request(
-    db: &Arc<Database>,
-    account_email: &str,
-    rule: &Rule,
-    resolved: &Resolved,
-    source: &str,
-) {
-    let (Some(request_key), Some(model), Some(duration_ms)) = (
-        resolved.llm_request_key.as_deref(),
-        resolved.llm_model.as_deref(),
-        resolved.llm_duration_ms,
-    ) else {
-        return;
-    };
-    let request = NewLlmRequest {
-        rule_id: rule.id,
-        request_key: format!(
-            "{}:{request_key}",
-            resolved.llm_provider.as_deref().unwrap_or("unknown")
-        ),
-        source: source.to_string(),
-        kind: "decision".into(),
-        provider_id: resolved.llm_provider.clone(),
-        model: model.to_string(),
-        policy_id: Some(rule.inference_policy.clone()),
-        email_count: 1,
-        prompt_tokens: resolved.prompt_tokens.map(|value| value as i64),
-        completion_tokens: resolved.completion_tokens.map(|value| value as i64),
-        total_tokens: resolved.total_tokens.map(|value| value as i64),
-        duration_ms: duration_ms as i64,
-    };
-    if let Err(error) = db.with_llm_requests(|repo| repo.insert(account_email, &request)) {
-        tracing::error!("Failed to record LLM request: {}", error);
     }
 }
 
@@ -1429,7 +1391,6 @@ async fn process_message_refs(
                 },
             );
 
-            record_llm_request(db, account_email, &rule, &resolved, source.as_str());
             if continues_past(&rule, resolved.outcome) {
                 process_fallthrough(
                     db,
@@ -1480,8 +1441,6 @@ async fn process_message_refs(
                     policy_id: Some(rule.inference_policy.clone()),
                 },
             );
-
-            record_llm_request(db, account_email, &rule, &resolved, source.as_str());
 
             if continues_past(&rule, Outcome::Matched) {
                 process_fallthrough(
@@ -1593,7 +1552,6 @@ async fn process_fallthrough(
                     db,
                     account_email,
                     config,
-                    source,
                     email,
                     email_from,
                     email_subject,
@@ -1612,7 +1570,6 @@ async fn process_fallthrough(
                     db,
                     account_email,
                     config,
-                    source,
                     email,
                     email_from,
                     email_subject,
@@ -1644,7 +1601,6 @@ async fn process_fallthrough(
                     db,
                     account_email,
                     config,
-                    source,
                     email,
                     email_from,
                     email_subject,
@@ -1687,7 +1643,6 @@ async fn process_fallthrough(
                     db,
                     account_email,
                     config,
-                    source,
                     email,
                     email_from,
                     email_subject,
@@ -1752,7 +1707,6 @@ fn record_fallthrough(
     db: &Arc<Database>,
     account_email: &str,
     _config: &AppConfig,
-    source: PipelineSource,
     email: &Message,
     email_from: Option<&str>,
     email_subject: Option<&str>,
@@ -1782,9 +1736,6 @@ fn record_fallthrough(
             policy_id: Some(rule.inference_policy.clone()),
         },
     );
-    if let Some(resolved) = resolved {
-        record_llm_request(db, account_email, rule, resolved, source.as_str());
-    }
 }
 
 /// One-off backfill over `[after, before]` applying only `rule_ids`.
