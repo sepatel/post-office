@@ -1,6 +1,10 @@
+use parking_lot::{Mutex, ReentrantMutex};
 use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
+use std::panic::Location;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::thread::Thread;
+use std::time::{Duration, Instant};
 
 pub mod accounts;
 pub mod config;
@@ -15,19 +19,78 @@ pub mod rules;
 pub mod sync_state;
 pub mod workflow;
 
+const SLOW_LOCK_WARNING: Duration = Duration::from_secs(10);
+
+// Reentrant because repository work routinely calls helpers (e.g. the inference
+// router's circuit checks) that read the database again on the same thread; a
+// plain mutex turns any such nesting into a silent, app-wide hang.
+#[derive(Clone)]
 pub struct Database {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<ReentrantMutex<Connection>>,
+    // Lets a stalled waiter name the code holding the connection.
+    holder: Arc<Mutex<Option<LockHolder>>>,
 }
 
-impl Clone for Database {
-    fn clone(&self) -> Self {
-        Self {
-            conn: Arc::clone(&self.conn),
+struct LockHolder {
+    location: &'static Location<'static>,
+    thread: Thread,
+    since: Instant,
+}
+
+// Clears the holder before the connection guard is released, so a new holder
+// never observes a stale entry and mistakes itself for a nested acquisition.
+struct HolderReset<'a>(Option<&'a Mutex<Option<LockHolder>>>);
+
+impl Drop for HolderReset<'_> {
+    fn drop(&mut self) {
+        if let Some(holder) = self.0 {
+            *holder.lock() = None;
         }
     }
 }
 
 impl Database {
+    #[track_caller]
+    fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let location = Location::caller();
+        let waiting_since = Instant::now();
+        let conn = loop {
+            if let Some(conn) = self.conn.try_lock_for(SLOW_LOCK_WARNING) {
+                break conn;
+            }
+            match self.holder.lock().as_ref() {
+                Some(holder) => tracing::warn!(
+                    "Database lock wait at {} has lasted {:?}; held by {} on thread {:?} ({:?}) for {:?}",
+                    location,
+                    waiting_since.elapsed(),
+                    holder.location,
+                    holder.thread.name().unwrap_or("unnamed"),
+                    holder.thread.id(),
+                    holder.since.elapsed(),
+                ),
+                None => tracing::warn!(
+                    "Database lock wait at {} has lasted {:?}; holder unknown",
+                    location,
+                    waiting_since.elapsed(),
+                ),
+            }
+        };
+        let _reset = {
+            let mut holder = self.holder.lock();
+            if holder.is_none() {
+                *holder = Some(LockHolder {
+                    location,
+                    thread: std::thread::current(),
+                    since: Instant::now(),
+                });
+                HolderReset(Some(&self.holder))
+            } else {
+                HolderReset(None)
+            }
+        };
+        f(&conn)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
 
@@ -44,13 +107,14 @@ impl Database {
         )?;
 
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(ReentrantMutex::new(conn)),
+            holder: Arc::default(),
         })
     }
 
     pub fn migrate(&self) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let transaction = conn.transaction()?;
+        let conn = self.conn.lock();
+        let transaction = conn.unchecked_transaction()?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                  version INTEGER PRIMARY KEY,
@@ -176,109 +240,100 @@ impl Database {
         transaction.commit()
     }
 
+    #[track_caller]
     pub fn with_accounts<F, R>(&self, f: F) -> R
     where
         F: FnOnce(accounts::AccountRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        f(accounts::AccountRepository::new(&conn))
+        self.with_conn(|conn| f(accounts::AccountRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_rules<F, R>(&self, f: F) -> R
     where
         F: FnOnce(rules::RuleRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = rules::RuleRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(rules::RuleRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_history<F, R>(&self, f: F) -> R
     where
         F: FnOnce(history::HistoryRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = history::HistoryRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(history::HistoryRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_config<F, R>(&self, f: F) -> R
     where
         F: FnOnce(config::ConfigRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = config::ConfigRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(config::ConfigRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_rule_memory<F, R>(&self, f: F) -> R
     where
         F: FnOnce(rule_memory::RuleMemoryRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = rule_memory::RuleMemoryRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(rule_memory::RuleMemoryRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_rule_chat<F, R>(&self, f: F) -> R
     where
         F: FnOnce(rule_chat::RuleChatRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = rule_chat::RuleChatRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(rule_chat::RuleChatRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_inference<F, R>(&self, f: F) -> R
     where
         F: FnOnce(inference::InferenceRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = inference::InferenceRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(inference::InferenceRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_llm_provider_status<F, R>(&self, f: F) -> R
     where
         F: FnOnce(llm_provider_status::LlmProviderStatusRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = llm_provider_status::LlmProviderStatusRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(llm_provider_status::LlmProviderStatusRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_llm_endpoint_status<F, R>(&self, f: F) -> R
     where
         F: FnOnce(llm_endpoint_status::LlmEndpointStatusRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        f(llm_endpoint_status::LlmEndpointStatusRepository::new(&conn))
+        self.with_conn(|conn| f(llm_endpoint_status::LlmEndpointStatusRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_sync_state<F, R>(&self, f: F) -> R
     where
         F: FnOnce(sync_state::SyncStateRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = sync_state::SyncStateRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(sync_state::SyncStateRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_workflow<F, R>(&self, f: F) -> R
     where
         F: FnOnce(workflow::WorkflowRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        f(workflow::WorkflowRepository::new(&conn))
+        self.with_conn(|conn| f(workflow::WorkflowRepository::new(conn)))
     }
 
+    #[track_caller]
     pub fn with_labels<F, R>(&self, f: F) -> R
     where
         F: FnOnce(labels::LabelRepository<'_>) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let repo = labels::LabelRepository::new(&conn);
-        f(repo)
+        self.with_conn(|conn| f(labels::LabelRepository::new(conn)))
     }
 }
 
@@ -586,6 +641,20 @@ mod tests {
         assert!(accounts.is_empty());
     }
 
+    #[test]
+    fn nested_access_on_the_same_thread_does_not_deadlock() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+
+        let status = db.with_workflow(|_| {
+            db.with_llm_provider_status(|repo| repo.get("missing"))
+                .unwrap()
+        });
+
+        assert!(status.is_none());
+        assert!(db.holder.lock().is_none());
+    }
+
     /// The 014 backfill must preserve behavior exactly: a `configured` menu
     /// moves to `choices` while every non-label action stays in the recipe, and
     /// legacy APPLY/SKIP was already just match-or-not over that recipe.
@@ -596,7 +665,7 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock();
             conn.execute_batch(
                 r#"DELETE FROM schema_migrations WHERE version = 14;
                  ALTER TABLE rules DROP COLUMN choices;
@@ -631,7 +700,6 @@ mod tests {
         db.migrate().unwrap();
         db.conn
             .lock()
-            .unwrap()
             .execute("DELETE FROM schema_migrations WHERE version = 9", [])
             .unwrap();
 
@@ -643,7 +711,7 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock();
             conn.execute_batch(
                 "DELETE FROM schema_migrations WHERE version = 9;
                  DROP TABLE accounts;
@@ -690,7 +758,6 @@ mod tests {
         db.with_config(|repo| config.save(&repo)).unwrap();
         db.conn
             .lock()
-            .unwrap()
             .execute("DELETE FROM schema_migrations WHERE version = 24", [])
             .unwrap();
 
