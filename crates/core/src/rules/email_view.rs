@@ -19,6 +19,32 @@ const PROMPT_HEADERS: &[&str] = &[
     "Auto-Submitted",
 ];
 
+/// Which body-normalization heuristics to apply. Kept as data rather than a
+/// hardcoded pipeline so the offline harness can measure each one's effect
+/// against the historical decisions before it becomes the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BodyCleanup {
+    /// Drop quoted reply history, which describes an earlier message in the
+    /// thread rather than the one being routed.
+    pub trim_quotes: bool,
+    /// Drop a trailing signature block marked with the RFC 3676 `-- `
+    /// delimiter. Delimiter-less signatures are left alone: there is no
+    /// reliable boundary to cut on.
+    pub trim_signature: bool,
+}
+
+impl BodyCleanup {
+    pub const NONE: Self = Self {
+        trim_quotes: false,
+        trim_signature: false,
+    };
+
+    pub const FULL: Self = Self {
+        trim_quotes: true,
+        trim_signature: true,
+    };
+}
+
 /// The canonical view of a message: the headers and body text a decision is
 /// made from. Derived once and shared by the deterministic matcher and the LLM
 /// prompt so both see exactly the same content.
@@ -33,15 +59,24 @@ pub struct EmailView {
 
 impl EmailView {
     pub fn from_message(message: &Message) -> Self {
+        Self::from_message_with(message, BodyCleanup::FULL)
+    }
+
+    pub fn from_message_with(message: &Message, cleanup: BodyCleanup) -> Self {
         let payload = message.payload.as_ref();
         let mut attachment_names = Vec::new();
         if let Some(payload) = payload {
             collect_attachments(payload, &mut attachment_names);
         }
-        let body = payload
+        let body = match payload
             .and_then(body_text)
             .filter(|body| !body.trim().is_empty())
-            .unwrap_or_else(|| message.snippet.clone());
+        {
+            Some(body) => clean_body(&body, cleanup),
+            // The snippet is already a short, client-generated preview; do not
+            // run heuristics that expect a full message on it.
+            None => message.snippet.clone(),
+        };
         Self {
             headers: prompt_headers(payload),
             body,
@@ -117,6 +152,70 @@ fn collect_attachments(payload: &MessagePayload, out: &mut Vec<String>) {
             collect_attachments(part, out);
         }
     }
+}
+
+fn clean_body(body: &str, cleanup: BodyCleanup) -> String {
+    // Each step is conservative: if it would remove everything (e.g. a forward
+    // whose entire body is quoted history), the earlier body is kept. Some
+    // content is always better than none when routing.
+    let mut current = body.trim().to_string();
+    if cleanup.trim_quotes {
+        let trimmed = trim_quoted_reply(&current);
+        if !trimmed.trim().is_empty() {
+            current = trimmed.trim().to_string();
+        }
+    }
+    if cleanup.trim_signature {
+        let trimmed = trim_signature(&current);
+        if !trimmed.trim().is_empty() {
+            current = trimmed.trim().to_string();
+        }
+    }
+    current
+}
+
+/// Cuts a body at the first line that introduces quoted history. The boundary
+/// is the earliest of a `>`-quoted line and the common reply separators; a
+/// thread's earlier messages say nothing about how the newest one should route.
+fn trim_quoted_reply(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(start) = (0..lines.len()).find(|&index| is_reply_boundary(index, &lines)) else {
+        return body.to_string();
+    };
+    lines[..start].join("\n")
+}
+
+fn is_reply_boundary(index: usize, lines: &[&str]) -> bool {
+    let trimmed = lines[index].trim();
+    if trimmed.starts_with('>') {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("-----original message-----")
+        || lower.starts_with("__________")
+        || (lower.starts_with("on ") && lower.ends_with("wrote:"))
+    {
+        return true;
+    }
+    // Outlook replies open with a `From:` / `Sent:` header block.
+    lower.starts_with("from:")
+        && lines[index..]
+            .iter()
+            .take(4)
+            .any(|candidate| candidate.trim().to_ascii_lowercase().starts_with("sent:"))
+}
+
+/// Drops a trailing RFC 3676 signature: the last line that is exactly the
+/// `-- ` delimiter and everything below it.
+fn trim_signature(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .rposition(|line| matches!(line.trim_end(), "--" | "-- "))
+    else {
+        return body.to_string();
+    };
+    lines[..start].join("\n")
 }
 
 fn prompt_headers(payload: Option<&MessagePayload>) -> Vec<(String, String)> {
@@ -329,5 +428,94 @@ mod tests {
         let view = EmailView::from_message(&message(payload("text/plain", vec![], None)));
 
         assert_eq!(view.body, "snippet fallback");
+    }
+
+    fn body_of(text: &str, cleanup: BodyCleanup) -> String {
+        let view = EmailView::from_message_with(
+            &message(payload("text/plain", vec![], Some(text))),
+            cleanup,
+        );
+        view.body
+    }
+
+    #[test]
+    fn quoted_reply_history_is_cut() {
+        let body = "Please review the estimate.\n\nOn Mon, Jan 1 2024, Alice wrote:\n> can you send it?\n> thanks";
+
+        assert_eq!(
+            body_of(body, BodyCleanup::FULL),
+            "Please review the estimate."
+        );
+    }
+
+    #[test]
+    fn a_dash_quoted_reply_is_cut() {
+        let body = "Sounds good.\n\n> original request\n> more context";
+
+        assert_eq!(body_of(body, BodyCleanup::FULL), "Sounds good.");
+    }
+
+    #[test]
+    fn an_outlook_header_block_is_cut() {
+        let body =
+            "Approved.\n\nFrom: Bob\nSent: Tuesday\nTo: Alice\nSubject: Re: thing\n\nold thread";
+
+        assert_eq!(body_of(body, BodyCleanup::FULL), "Approved.");
+    }
+
+    #[test]
+    fn an_original_message_divider_is_cut() {
+        let body = "See below.\n\n-----Original Message-----\nfrom the past";
+
+        assert_eq!(body_of(body, BodyCleanup::FULL), "See below.");
+    }
+
+    #[test]
+    fn a_trailing_signature_is_cut() {
+        let body = "Let me know.\n\n-- \nAlice\nEngineer, Acme";
+
+        assert_eq!(body_of(body, BodyCleanup::FULL), "Let me know.");
+    }
+
+    /// A `-- ` in the middle of prose is not a signature delimiter; only a line
+    /// that is exactly the delimiter counts.
+    #[test]
+    fn an_inline_double_dash_is_left_alone() {
+        let body = "The value is 5 -- maybe more.\nSecond line.";
+
+        assert_eq!(body_of(body, BodyCleanup::FULL), body);
+    }
+
+    #[test]
+    fn cleanup_none_leaves_the_body_intact() {
+        let body = "Hello.\n\n> quoted\n\n-- \nsig";
+
+        assert_eq!(body_of(body, BodyCleanup::NONE), body);
+    }
+
+    /// A forward whose body is nothing but quoted history must keep that history
+    /// rather than routing on an empty body.
+    #[test]
+    fn an_all_quoted_body_is_preserved() {
+        let body = "> the only content\n> in this message";
+
+        assert_eq!(body_of(body, BodyCleanup::FULL), body);
+    }
+
+    /// A body that is only a signature is likewise preserved.
+    #[test]
+    fn an_all_signature_body_is_preserved() {
+        let body = "-- \nAlice\nEngineer";
+
+        assert_eq!(body_of(body, BodyCleanup::FULL), body);
+    }
+
+    /// The snippet is already a short client preview; cleanup must not touch it.
+    #[test]
+    fn the_snippet_is_never_cleaned() {
+        let mut msg = message(payload("text/plain", vec![], None));
+        msg.snippet = "Preview ... -- > not a body".into();
+
+        assert_eq!(EmailView::from_message(&msg).body, msg.snippet);
     }
 }

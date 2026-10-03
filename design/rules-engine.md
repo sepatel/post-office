@@ -121,9 +121,10 @@ pub enum Action {
 Conditions are evaluated against an `EmailView`, the canonical rendering of a
 message (see `rules::email_view`). It carries the allow-listed prompt headers,
 the cleaned body text (recursive MIME walk, `text/plain` preferred then
-`text/html` rendered to text, never an attachment part), the message's labels,
-and whether an attachment is present. The matcher and the LLM prompt consume the
-same view, so they can never disagree about what the email contains.
+`text/html` rendered to text, never an attachment part; then quoted reply
+history and RFC 3676 signatures removed), the message's labels, and whether an
+attachment is present. The matcher and the LLM prompt consume the same view, so
+they can never disagree about what the email contains.
 
 ```rust
 // crates/core/src/rules/matcher.rs

@@ -161,14 +161,34 @@ fn render_email(view: &EmailView) -> String {
 }
 ```
 
+### Body Cleanup And Truncation
+
+After MIME selection the body is normalized (`EmailView::from_message_with`,
+default `BodyCleanup::FULL`): quoted reply history is cut at the first `>` line,
+`On … wrote:`, `-----Original Message-----`, `________`, or Outlook
+`From:`/`Sent:` block; a trailing RFC 3676 `-- ` signature is dropped. Cleanup
+is conservative — if a step would empty the body (a forward that is entirely
+quoted history), the earlier body is kept. The snippet fallback is never
+cleaned.
+
+Measured against the stored corpus (`email_eval`), cleanup removes a further
+~11% of the email block after the header/MIME pass, changing 1,415 of 2,546
+bodies, with no body lost and 19 messages whose removed words also appear in
+their historical decision — the set to spot-check.
+
+Truncation (`engine::truncate_body`) still keeps the beginning and end of an
+over-budget body. It is rarely reached: after cleanup only 17 of 2,546 bodies
+exceed an 8k-token budget and none exceed 32k, so the head/tail split is left
+unchanged rather than tuned on a handful of messages.
+
 The pre-`EmailView` rendering kept every header and scanned only the top level
 of the MIME tree, which both wasted roughly 60% of the email block on headers
 and fell back to Gmail's snippet whenever the body lived in a nested
 `multipart/alternative`. The `email_eval` example
-(`cargo run -p post-office-core --example email_eval -- <app.db>`) reports the
-token delta and, for bodies that changed, the historical decision already
-recorded in `workflow_steps` so a change can be adjudicated without re-running a
-model.
+(`cargo run -p post-office-core --example email_eval -- <app.db>`) reports each
+phase's token delta and, for bodies that changed, the historical decision
+already recorded in `workflow_steps` so a change can be adjudicated without
+re-running a model.
 
 ## Response Parsing
 

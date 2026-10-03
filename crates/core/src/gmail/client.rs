@@ -201,6 +201,15 @@ impl GmailClient {
         .await
     }
 
+    /// Fetches only labels and the decision-relevant headers. Used where a read
+    /// exists purely to reconcile label state — e.g. before a retry or after an
+    /// ambiguous mutation — so a body is never downloaded for a decision it
+    /// cannot affect. A decision path must use [`Self::get_message`].
+    pub async fn get_message_metadata(&mut self, id: &str) -> Result<Message, GmailError> {
+        self.request(reqwest::Method::GET, &metadata_path(id), None::<&()>)
+            .await
+    }
+
     pub async fn modify_labels(
         &mut self,
         id: &str,
@@ -315,6 +324,30 @@ impl GmailClient {
     }
 }
 
+/// Headers requested by a metadata read. Mirrors the prompt allow-list in
+/// `rules::email_view`: the same set a decision can see, so a reconciliation
+/// read never needs a body.
+const METADATA_HEADERS: [&str; 9] = [
+    "From",
+    "To",
+    "Cc",
+    "Reply-To",
+    "Subject",
+    "Date",
+    "List-Id",
+    "List-Unsubscribe",
+    "Auto-Submitted",
+];
+
+fn metadata_path(id: &str) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("format", "metadata");
+    for header in METADATA_HEADERS {
+        serializer.append_pair("metadataHeaders", header);
+    }
+    format!("/messages/{id}?{}", serializer.finish())
+}
+
 fn is_rate_limit_error(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -364,5 +397,14 @@ mod tests {
             Some(404)
         );
         assert_eq!(embedded_api_error_code(r#"{"id":"message-1"}"#), None);
+    }
+
+    #[test]
+    fn a_metadata_read_asks_for_headers_and_not_a_body() {
+        let path = metadata_path("abc");
+
+        assert!(path.starts_with("/messages/abc?format=metadata"));
+        assert!(path.contains("metadataHeaders=From"));
+        assert!(path.contains("metadataHeaders=Subject"));
     }
 }

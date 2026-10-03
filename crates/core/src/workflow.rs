@@ -699,37 +699,23 @@ pub async fn prepare_run(
     };
 
     if run.message_json.is_some() {
-        match gmail.get_message(&run.gmail_message_id).await {
+        // Only label state can drift beneath a stored snapshot, so a metadata
+        // read is enough to reconcile; the body already on hand is kept.
+        match gmail.get_message_metadata(&run.gmail_message_id).await {
             Ok(remote) => {
                 let pending_action =
                     db.with_workflow(|repo| repo.action_for_rule(run.id, run.next_rule_index))?;
                 let action_already_applied = pending_action
                     .as_ref()
                     .is_some_and(|action| target_reached(&remote, action));
-                if !action_already_applied {
-                    if let Some(reason) = externally_resolved_reason(&message, &remote) {
-                        let message_json = serde_json::to_string(&remote)?;
-                        let labels_json = serde_json::to_string(&remote.label_ids)?;
-                        let stored = db.with_workflow(|repo| {
-                            repo.store_message_snapshot(
-                                run.id,
-                                &run.lease_token,
-                                &remote.thread_id,
-                                &message_json,
-                                &labels_json,
-                            )
-                        })?;
-                        if !stored {
-                            return Ok(());
-                        }
-                        db.with_workflow(|repo| {
-                            repo.resolve_externally(run.id, &run.lease_token, reason)
-                        })?;
-                        return Ok(());
-                    }
-                }
-                let message_json = serde_json::to_string(&remote)?;
-                let labels_json = serde_json::to_string(&remote.label_ids)?;
+                let externally_resolved = if action_already_applied {
+                    None
+                } else {
+                    externally_resolved_reason(&message, &remote)
+                };
+                message.label_ids = remote.label_ids.clone();
+                let message_json = serde_json::to_string(&message)?;
+                let labels_json = serde_json::to_string(&message.label_ids)?;
                 let stored = db.with_workflow(|repo| {
                     repo.store_message_snapshot(
                         run.id,
@@ -742,7 +728,12 @@ pub async fn prepare_run(
                 if !stored {
                     return Ok(());
                 }
-                message = remote;
+                if let Some(reason) = externally_resolved {
+                    db.with_workflow(|repo| {
+                        repo.resolve_externally(run.id, &run.lease_token, reason)
+                    })?;
+                    return Ok(());
+                }
             }
             Err(GmailError::Api { code: 404, .. }) => {
                 db.with_workflow(|repo| {
@@ -1189,9 +1180,11 @@ async fn apply_action_plan(
         Err(error) => {
             // The request may have reached Gmail before the connection failed.
             // Reconcile first so retries converge on state rather than intent.
-            match gmail.get_message(&run.gmail_message_id).await {
+            // Labels are all this check reads, so a metadata fetch suffices and
+            // the body stays as it is.
+            match gmail.get_message_metadata(&run.gmail_message_id).await {
                 Ok(remote) if target_reached(&remote, action) => {
-                    *message = remote;
+                    message.label_ids = remote.label_ids;
                     true
                 }
                 _ => {

@@ -1,24 +1,33 @@
 //! Offline token/quality report for the `EmailView` pre-processing pass.
 //!
-//! Reads persisted Gmail message snapshots and compares the email block the
-//! model sees today against the pre-`EmailView` rendering, using the same
-//! char/4 estimate the production budget uses. It never calls a model: for
-//! messages whose rendered content changed, it prints the historical decision
-//! already recorded in `workflow_steps` so a human can adjudicate whether the
-//! change was safe.
+//! Reads persisted Gmail message snapshots and compares three renderings of the
+//! email block the model sees, using the same char/4 estimate the production
+//! budget uses:
+//!
+//! - `old`      — the pre-`EmailView` pipeline (every header, one-level MIME);
+//! - `baseline` — `EmailView` with no body cleanup;
+//! - `clean`    — `EmailView` with the adopted body cleanup (quote/signature).
+//!
+//! It never calls a model. For bodies changed by cleanup, it flags messages
+//! whose *removed* words also appear in the historical decision already recorded
+//! in `workflow_steps` — the cases a human should adjudicate before trusting
+//! the cleanup.
 //!
 //!   cargo run -p post-office-core --example email_eval -- /path/to/app.db
 //!
 //! The database path may also be supplied via `POST_OFFICE_EVAL_DB`.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
 use post_office_core::db::Database;
 use post_office_core::gmail::models::{Message, MessagePayload};
-use post_office_core::rules::email_view::EmailView;
+use post_office_core::rules::email_view::{BodyCleanup, EmailView};
 
 const PER_PAGE: u32 = 500;
+/// Budgets a body might realistically have to fit inside, in tokens.
+const TRUNCATION_THRESHOLDS: [usize; 4] = [4_000, 8_000, 16_000, 32_000];
 
 fn estimated_tokens(value: &str) -> usize {
     value.chars().count().div_ceil(4)
@@ -29,16 +38,6 @@ enum Source {
     Plain,
     Html,
     Snippet,
-}
-
-impl Source {
-    fn label(self) -> &'static str {
-        match self {
-            Source::Plain => "plain",
-            Source::Html => "html",
-            Source::Snippet => "snippet",
-        }
-    }
 }
 
 fn main() {
@@ -110,32 +109,31 @@ struct Report {
 struct Row {
     id: String,
     old_tokens: usize,
-    new_tokens: usize,
-    old_header_tokens: usize,
-    new_header_tokens: usize,
+    baseline_tokens: usize,
+    clean_tokens: usize,
     old_source: Source,
-    new_source: Source,
-    body_changed: bool,
+    baseline_source: Source,
+    baseline_body: String,
+    clean_body: String,
     decision: Option<String>,
 }
 
 impl Report {
     fn observe(&mut self, message: &Message, decision: Option<&str>) {
         let (old_headers, old_body) = old_email_block(message);
-        let old_header_tokens = estimated_tokens(&old_headers);
-
-        let view = EmailView::from_message(message);
-        let new_header_tokens = estimated_tokens(&view.rendered_headers());
+        let baseline = EmailView::from_message_with(message, BodyCleanup::NONE);
+        let clean = EmailView::from_message_with(message, BodyCleanup::FULL);
+        let tokens = |headers: &str, body: &str| estimated_tokens(headers) + estimated_tokens(body);
 
         self.rows.push(Row {
             id: message.id.clone(),
-            old_tokens: old_header_tokens + estimated_tokens(&old_body),
-            new_tokens: new_header_tokens + estimated_tokens(&view.body),
-            old_header_tokens,
-            new_header_tokens,
+            old_tokens: tokens(&old_headers, &old_body),
+            baseline_tokens: tokens(&baseline.rendered_headers(), &baseline.body),
+            clean_tokens: tokens(&clean.rendered_headers(), &clean.body),
             old_source: old_body_source(message),
-            new_source: body_source(message),
-            body_changed: old_body != view.body,
+            baseline_source: body_source(message),
+            baseline_body: baseline.body,
+            clean_body: clean.body,
             decision: decision.map(str::to_string),
         });
     }
@@ -146,91 +144,111 @@ impl Report {
             println!("no stored message snapshots found");
             return;
         }
-        let old = self
-            .rows
-            .iter()
-            .map(|row| row.old_tokens)
-            .collect::<Vec<_>>();
-        let new = self
-            .rows
-            .iter()
-            .map(|row| row.new_tokens)
-            .collect::<Vec<_>>();
+        let old = self.tokens(|row| row.old_tokens);
+        let baseline = self.tokens(|row| row.baseline_tokens);
+        let clean = self.tokens(|row| row.clean_tokens);
 
         println!("messages: {total}");
         println!(
-            "{:<8} {:>8} {:>10} {:>8} {:>8} {:>8}",
+            "{:<9} {:>8} {:>10} {:>8} {:>8} {:>8}",
             "render", "count", "total", "p50", "p90", "max"
         );
         print_row("old", &old);
-        print_row("new", &new);
+        print_row("baseline", &baseline);
+        print_row("clean", &clean);
 
-        let saved: usize = self
-            .rows
-            .iter()
-            .map(|row| row.old_tokens.saturating_sub(row.new_tokens))
-            .sum();
-        let pct = (saved as f64 / old.iter().sum::<usize>().max(1) as f64) * 100.0;
-        println!("email-block tokens saved: {saved} ({pct:.1}%)");
-        let header_saved: usize = self
-            .rows
-            .iter()
-            .map(|row| row.old_header_tokens.saturating_sub(row.new_header_tokens))
-            .sum();
-        let body_saved = self
-            .rows
-            .iter()
-            .map(|row| {
-                let old_body = row.old_tokens - row.old_header_tokens;
-                let new_body = row.new_tokens - row.new_header_tokens;
-                (old_body as isize - new_body as isize).max(0) as usize
-            })
-            .sum::<usize>();
-        println!("  header noise removed: {header_saved}");
-        println!("  body tokens saved: {body_saved}");
+        let sum = |values: &[usize]| values.iter().sum::<usize>().max(1);
+        let phase1 = sum(&old) - sum(&baseline);
+        let phase2 = sum(&baseline) - sum(&clean);
+        println!(
+            "phase 1 (headers + MIME): saved {phase1} ({:.1}%)",
+            phase1 as f64 / sum(&old) as f64 * 100.0
+        );
+        println!(
+            "phase 2 (cleanup):        saved {phase2} ({:.1}%); bodies changed {}",
+            phase2 as f64 / sum(&baseline).max(1) as f64 * 100.0,
+            self.rows
+                .iter()
+                .filter(|row| row.baseline_body != row.clean_body)
+                .count()
+        );
 
         self.print_source_changes();
-        self.print_changed();
+        self.print_risk();
+        self.print_truncation_incidence();
+    }
+
+    fn tokens(&self, pick: impl Fn(&Row) -> usize) -> Vec<usize> {
+        self.rows.iter().map(pick).collect()
     }
 
     fn print_source_changes(&self) {
         let snippet_recovered = self
             .rows
             .iter()
-            .filter(|row| row.old_source == Source::Snippet && row.new_source != Source::Snippet)
+            .filter(|row| {
+                row.old_source == Source::Snippet && row.baseline_source != Source::Snippet
+            })
             .count();
         let lost = self
             .rows
             .iter()
-            .filter(|row| row.old_source != Source::Snippet && row.new_source == Source::Snippet)
+            .filter(|row| {
+                row.old_source != Source::Snippet && row.baseline_source == Source::Snippet
+            })
             .count();
         println!("snippet fallbacks recovered: {snippet_recovered} (lost: {lost})");
     }
 
-    fn print_changed(&self) {
-        let changed = self
-            .rows
-            .iter()
-            .filter(|row| row.body_changed)
-            .collect::<Vec<_>>();
-        println!("messages whose body changed: {}", changed.len());
-        for row in changed.iter().take(25) {
+    /// Cleanup that removes words the historical decision relied on is the only
+    /// real risk. Everything else is noise removed from a body the model saw in
+    /// full.
+    fn print_risk(&self) {
+        let mut flagged = 0;
+        let mut samples = Vec::new();
+        for row in &self.rows {
+            if row.baseline_body == row.clean_body {
+                continue;
+            }
+            let removed = words(&row.baseline_body);
+            let kept = words(&row.clean_body);
+            let removed: HashSet<&str> = removed.difference(&kept).copied().collect();
+            let decision_words = row.decision.as_deref().map(words).unwrap_or_default();
+            let overlap: Vec<&str> = removed.intersection(&decision_words).copied().collect();
+            if !overlap.is_empty() {
+                flagged += 1;
+                samples.push((row.id.as_str(), overlap, row.decision.as_deref()));
+            }
+        }
+        println!("cleanup risk candidates (removed word in historical decision): {flagged}");
+        for (id, overlap, decision) in samples.iter().take(10) {
             println!(
-                "  {} old={}tok/{} new={}tok/{} decision={:?}",
-                row.id,
-                row.old_tokens - row.old_header_tokens,
-                row.old_source.label(),
-                row.new_tokens - row.new_header_tokens,
-                row.new_source.label(),
-                row.decision
-                    .as_deref()
-                    .unwrap_or("-")
-                    .lines()
-                    .next()
-                    .unwrap_or("-"),
+                "  {id} removed={overlap:?} decision={:?}",
+                decision.unwrap_or("-").lines().next().unwrap_or("-")
             );
         }
     }
+
+    fn print_truncation_incidence(&self) {
+        let clean_body: Vec<usize> = self
+            .rows
+            .iter()
+            .map(|row| estimated_tokens(&row.clean_body))
+            .collect();
+        let counts = TRUNCATION_THRESHOLDS.map(|threshold| {
+            clean_body
+                .iter()
+                .filter(|tokens| **tokens > threshold)
+                .count()
+        });
+        println!("bodies exceeding budget after cleanup: {counts:?} (for {TRUNCATION_THRESHOLDS:?} tokens)");
+    }
+}
+
+fn words(text: &str) -> HashSet<&str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 4)
+        .collect()
 }
 
 fn print_row(label: &str, values: &[usize]) {
@@ -244,7 +262,7 @@ fn print_row(label: &str, values: &[usize]) {
         }
     };
     println!(
-        "{:<8} {:>8} {:>10} {:>8} {:>8} {:>8}",
+        "{:<9} {:>8} {:>10} {:>8} {:>8} {:>8}",
         label,
         sorted.len(),
         sorted.iter().sum::<usize>(),
