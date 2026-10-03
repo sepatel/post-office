@@ -10,6 +10,7 @@ use post_office_core::processing::{
     hydrate_processing_state, mark_last_successful, OpProgress, ProcessingState,
 };
 use post_office_core::rules::chat::{apply_proposal, chat_with_rule, ChatProposal, ChatTurn};
+use post_office_core::rules::email_view::EmailView;
 use post_office_core::rules::engine::{
     dry_run_pipeline, rules_after, ActionDisplay, FallthroughStep, PipelineDryRun,
     PipelineDryRunProgress, TestResult,
@@ -1172,13 +1173,14 @@ pub async fn rules_test(
         .get_message(&message_id)
         .await
         .map_err(|e| e.to_string())?;
+    let view = EmailView::from_message(&email);
 
     let rule_model = build_rule_model(&rule);
 
     let mut result = post_office_core::rules::engine::test_rule(
         &llm,
         &rule_model,
-        &email,
+        &view,
         &rule_memories(&state, rule_model.id),
         &labels,
     )
@@ -1192,11 +1194,11 @@ pub async fn rules_test(
             .db
             .with_rules(|repo| repo.list_all(&account_email))
             .unwrap_or_default();
-        for candidate in rules_after(&rules, rule_model.id, &email) {
+        for candidate in rules_after(&rules, rule_model.id, &view) {
             let step = post_office_core::rules::engine::test_rule(
                 &llm,
                 candidate,
-                &email,
+                &view,
                 &rule_memories(&state, candidate.id),
                 &labels,
             )
@@ -2284,10 +2286,12 @@ pub async fn pipeline_dry_run(
             .map(|rule| (rule.id, rule_memories(&state, rule.id)))
             .collect::<HashMap<_, _>>();
 
+        let inner = EmailView::from_message(&email);
+
         Ok(dry_run_pipeline(
             &llm,
             &rules,
-            &email,
+            &inner,
             &memories_by_rule,
             &labels,
             &|progress| {

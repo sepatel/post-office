@@ -13,6 +13,7 @@ pub struct Message {
     pub id: String,
     pub thread_id: String,
     pub label_ids: Vec<String>,
+    #[serde(default)]
     pub snippet: String,
     pub history_id: String,
     #[serde(default)]

@@ -10,6 +10,7 @@ use crate::config::AppConfig;
 use crate::db::history::NewHistoryEntry;
 use crate::db::Database;
 use crate::gmail::models::{Message, MessageRef};
+use crate::rules::email_view::EmailView;
 use crate::rules::engine::{no_action_reason, resolve_rule, Outcome, Resolved};
 use crate::rules::matcher;
 
@@ -577,10 +578,11 @@ async fn process_inference_job(
     }
 
     let email = gmail.get_message(&job.email_id).await?;
+    let view = EmailView::from_message(&email);
     if !rule
         .conditions
         .iter()
-        .all(|condition| matcher::evaluate(condition, &email, &email.label_ids))
+        .all(|condition| matcher::evaluate(condition, &view))
     {
         return Ok(JobOutcome::Skipped(
             "Rule no longer matches".into(),
@@ -596,7 +598,7 @@ async fn process_inference_job(
     let labels = crate::gmail::cached_labels(db, gmail, account_email)
         .await
         .unwrap_or_default();
-    let resolved = resolve_rule(llm, &rule, &email, &memories, &labels)
+    let resolved = resolve_rule(llm, &rule, &view, &memories, &labels)
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
     let attempt = AttemptMetadata::from(&resolved);
@@ -1146,15 +1148,10 @@ async fn process_message_refs(
             }
         }
 
-        let labels = email.label_ids.clone();
+        let view = EmailView::from_message(&email);
         let matched_rule: Option<Rule> = rules
             .iter()
-            .filter(|r| {
-                r.enabled
-                    && r.conditions
-                        .iter()
-                        .all(|c| matcher::evaluate(c, &email, &labels))
-            })
+            .filter(|r| r.enabled && r.conditions.iter().all(|c| matcher::evaluate(c, &view)))
             .min_by_key(|r| r.priority)
             .cloned();
 
@@ -1278,7 +1275,8 @@ async fn process_message_refs(
                 .unwrap_or_default()
         });
         let started = Instant::now();
-        let resolved = match resolve_rule(llm, &rule, &item.email, &memories, labels_ref).await {
+        let view = EmailView::from_message(&item.email);
+        let resolved = match resolve_rule(llm, &rule, &view, &memories, labels_ref).await {
             Ok(result) => result,
             Err(e) => {
                 let error = e.to_string();
@@ -1520,7 +1518,8 @@ async fn process_fallthrough(
     labels: &[crate::gmail::models::Label],
     source: PipelineSource,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let candidates = crate::rules::engine::rules_after(rules, current_rule_id, email);
+    let view = EmailView::from_message(email);
+    let candidates = crate::rules::engine::rules_after(rules, current_rule_id, &view);
     let considered = candidates.len();
     for rule in candidates {
         if db.with_inference(|repo| repo.has_active(account_email, &email.id, rule.id))? {
@@ -1532,7 +1531,7 @@ async fn process_fallthrough(
                 .unwrap_or_default()
         });
         let started = Instant::now();
-        let resolved = match resolve_rule(llm, rule, email, &memories, labels).await {
+        let resolved = match resolve_rule(llm, rule, &view, &memories, labels).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 let error = error.to_string();

@@ -238,13 +238,23 @@ impl GmailClient {
         Ok(response.messages.unwrap_or_default())
     }
 
-    pub async fn get_message(&mut self, id: &str, format: &str) -> Result<Message, GmailError> {
+    /// Full message: needed only when a decision can depend on the body.
+    pub async fn get_message(&mut self, id: &str) -> Result<Message, GmailError> {
         self.request(
             reqwest::Method::GET,
-            &format!("/messages/{id}?format={format}"),
+            &format!("/messages/{id}?format=full"),
             None::<()>,
         )
         .await
+    }
+
+    /// Labels plus the prompt headers, no body. Used for reads that only
+    /// reconcile label state (before a retry, or after an ambiguous mutation)
+    /// so a body is never downloaded for a decision it cannot affect.
+    pub async fn get_message_metadata(&mut self, id: &str) -> Result<Message, GmailError> {
+        // format=metadata&metadataHeaders=From&metadataHeaders=To&...
+        self.request(reqwest::Method::GET, &metadata_path(id), None::<()>)
+            .await
     }
 
     pub async fn modify_labels(

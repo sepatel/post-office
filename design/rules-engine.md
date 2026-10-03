@@ -118,52 +118,36 @@ pub enum Action {
 
 ## Condition Evaluation
 
+Conditions are evaluated against an `EmailView`, the canonical rendering of a
+message (see `rules::email_view`). It carries the allow-listed prompt headers,
+the cleaned body text (recursive MIME walk, `text/plain` preferred then
+`text/html` rendered to text, never an attachment part; then quoted reply
+history and RFC 3676 signatures removed), the message's labels, and whether an
+attachment is present. The matcher and the LLM prompt consume the same view, so
+they can never disagree about what the email contains.
+
 ```rust
 // crates/core/src/rules/matcher.rs
 
-use crate::gmail::models::{Message, MessagePayload};
+use crate::rules::email_view::EmailView;
+use crate::rules::models::{Condition, Operator};
 use chrono::NaiveDate;
 
-pub fn evaluate(condition: &Condition, email: &Message, current_labels: &[String]) -> bool {
+pub fn evaluate(condition: &Condition, view: &EmailView) -> bool {
     match condition {
         Condition::From { operator, value } => {
-            let sender = extract_header(email, "From");
-            evaluate_string_op(&sender, operator, value)
-        }
-        Condition::To { operator, value } => {
-            let to = extract_header(email, "To");
-            evaluate_string_op(&to, operator, value)
+            evaluate_string_op(view.header("From").unwrap_or_default(), operator, value)
         }
         Condition::Subject { operator, value } => {
-            let subject = extract_header(email, "Subject");
-            evaluate_string_op(&subject, operator, value)
+            evaluate_string_op(view.header("Subject").unwrap_or_default(), operator, value)
         }
-        Condition::Body { operator, value } => {
-            let body = extract_plain_text(email);
-            evaluate_string_op(&body, operator, value)
-        }
-        Condition::HasAttachment { value } => email_has_attachment(email) == *value,
+        Condition::Body { operator, value } => evaluate_string_op(&view.body, operator, value),
+        Condition::HasAttachment { value } => view.has_attachments == *value,
         Condition::IsUnread { value } => {
-            current_labels.iter().any(|l| l == "UNREAD") == *value
+            view.label_ids.iter().any(|l| l == "UNREAD") == *value
         }
-        Condition::Label { operator, value } => {
-            current_labels.iter().any(|l| evaluate_string_op(l, operator, value))
-        }
-        Condition::DateAfter { value } => NaiveDate::parse_from_str(value, "%Y/%m/%d")
-            .ok()
-            .and_then(|date| parse_email_date(email).map(|d| d >= date))
-            .unwrap_or(false),
-        Condition::DateBefore { value } => NaiveDate::parse_from_str(value, "%Y/%m/%d")
-            .ok()
-            .and_then(|date| parse_email_date(email).map(|d| d <= date))
-            .unwrap_or(false),
-        Condition::And { conditions } => {
-            conditions.iter().all(|c| evaluate(c, email, current_labels))
-        }
-        Condition::Or { conditions } => {
-            conditions.iter().any(|c| evaluate(c, email, current_labels))
-        }
-        Condition::Not { condition } => !evaluate(condition, email, current_labels),
+        // Label / DateAfter / DateBefore / And / Or / Not omitted.
+        _ => todo!(),
     }
 }
 
@@ -176,41 +160,6 @@ fn evaluate_string_op(haystack: &str, op: &Operator, needle: &str) -> bool {
             .unwrap_or(false),
         Operator::NotContains => !haystack.to_lowercase().contains(&needle.to_lowercase()),
     }
-}
-
-fn extract_header(email: &Message, name: &str) -> String {
-    email
-        .payload
-        .as_ref()
-        .and_then(|p| p.headers.as_ref())
-        .and_then(|headers| headers.iter().find(|h| h.name == name))
-        .map(|h| h.value.clone())
-        .unwrap_or_default()
-}
-
-fn email_has_attachment(email: &Message) -> bool {
-    email
-        .payload
-        .as_ref()
-        .is_some_and(has_attachment_recursive)
-}
-
-fn has_attachment_recursive(payload: &MessagePayload) -> bool {
-    payload
-        .filename
-        .as_ref()
-        .is_some_and(|f| !f.is_empty())
-        || payload
-            .parts
-            .as_ref()
-            .is_some_and(|parts| parts.iter().any(has_attachment_recursive))
-}
-
-fn parse_email_date(email: &Message) -> Option<NaiveDate> {
-    let date_str = extract_header(email, "Date");
-    NaiveDate::parse_from_str(&date_str, "%a, %d %b %Y")
-        .or_else(|_| NaiveDate::parse_from_str(&date_str, "%d %b %Y"))
-        .ok()
 }
 ```
 
