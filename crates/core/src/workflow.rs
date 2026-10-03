@@ -994,6 +994,10 @@ fn record_decision_error(
     let error = error.to_string();
     let attribution = llm.provider_attribution(policy_id);
     let endpoint_circuit_open = llm.endpoint_circuit_open(policy_id);
+    let fallback = run
+        .route_provider_id
+        .as_deref()
+        .and_then(|provider_id| llm.fallback_provider(policy_id, provider_id));
     db.with_workflow(|repo| {
         repo.record_llm_attempt(&NewLlmAttempt {
             run_id: run.id,
@@ -1013,11 +1017,7 @@ fn record_decision_error(
             duration_ms: None,
             tokens: TokenUsage::default(),
         })?;
-        if let Some(provider) = run
-            .route_provider_id
-            .as_deref()
-            .and_then(|provider_id| llm.fallback_provider(policy_id, provider_id))
-        {
+        if let Some(provider) = fallback {
             return repo.queue_for_route(
                 run.id,
                 &run.lease_token,
@@ -1320,9 +1320,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exposes_the_rule_and_route_pinned_to_a_run() {
-        let config = AppConfig {
+    fn taxonomy_config() -> AppConfig {
+        AppConfig {
             llm_providers: vec![LlmProviderProfile {
                 id: "taxonomy".into(),
                 name: "Shade Taxonomy".into(),
@@ -1349,7 +1348,12 @@ mod tests {
                 allow_fallback: true,
             }],
             ..AppConfig::default()
-        };
+        }
+    }
+
+    #[test]
+    fn exposes_the_rule_and_route_pinned_to_a_run() {
+        let config = taxonomy_config();
         let snapshot = RuleSetSnapshot {
             rules: vec![RuleSnapshot {
                 rule: Rule {
@@ -1472,6 +1476,59 @@ mod tests {
                 .unwrap();
             assert_eq!(stored.rule_set_version, version);
             assert_eq!(stored.state, "retry_wait");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    // Reproduces the Sep 25 hang: a failed routed decision under a fallback-enabled
+    // policy consults provider status while recording the failure.
+    #[test]
+    fn routed_decision_error_schedules_a_retry() {
+        let db = Arc::new(Database::open(Path::new(":memory:")).unwrap());
+        db.migrate().unwrap();
+        let config = taxonomy_config();
+        let run = db
+            .with_workflow(|repo| {
+                repo.initialize_mailbox("test@example.com", "100")?;
+                repo.activate_rule_set("test@example.com", r#"{"rules":[]}"#)?;
+                repo.enqueue_arrivals("test@example.com", "101", &["message-1".into()])?;
+                let run = repo.claim_next("test@example.com", "lease-1")?.unwrap();
+                repo.queue_for_route(
+                    run.id,
+                    "lease-1",
+                    "taxonomy",
+                    "http://shade:4000/v1",
+                    "taxonomy",
+                    1,
+                )?;
+                repo.claim_next_for_route(
+                    "test@example.com",
+                    "http://shade:4000/v1",
+                    "taxonomy",
+                    "lease-2",
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let llm = InferenceRouter::from_config(&config).with_database(db.as_ref().clone());
+
+        record_decision_error(
+            &db,
+            &run,
+            &llm,
+            0,
+            "taxonomy",
+            "Model returned reasoning without a final decision",
+        )
+        .unwrap();
+
+        db.with_workflow(|repo| {
+            let stored = repo
+                .run_for_message("test@example.com", run.message_id)?
+                .unwrap();
+            assert_eq!(stored.state, "retry_wait");
+            assert_eq!(repo.llm_attempts(run.id)?[0].status, "error");
             Ok::<_, rusqlite::Error>(())
         })
         .unwrap();

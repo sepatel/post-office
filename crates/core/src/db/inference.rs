@@ -336,7 +336,7 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
         let job_id = {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock();
             conn.execute(
                 "INSERT INTO inference_jobs (account_email, email_id) VALUES (?1, ?2)",
                 params!["test@example.com", "message-1"],
@@ -369,7 +369,7 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock();
             conn.execute(
                 "INSERT INTO rules (account_email, name, conditions, prompt, actions)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -405,7 +405,7 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock();
             conn.execute(
                 "INSERT INTO inference_jobs (account_email, email_id) VALUES (?1, ?2)",
                 params!["test@example.com", "message-1"],
@@ -435,7 +435,7 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.migrate().unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock();
             conn.execute(
                 "INSERT INTO rules (account_email, name, conditions, prompt, actions)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
