@@ -141,98 +141,54 @@ pub enum LlmError {
 
 ## Prompt Construction
 
-How emails are formatted for the LLM:
+How emails are formatted for the LLM: every message is first rendered to an
+`EmailView` (`crates/core/src/rules/email_view.rs`), the single definition of
+what the model sees. It keeps only the decision-relevant headers (`From`, `To`,
+`Cc`, `Reply-To`, `Subject`, `Date`, `List-Id`, `List-Unsubscribe`,
+`Auto-Submitted`), dropping transport noise like `Received`, `DKIM-Signature`,
+and `ARC-*`; and it selects the body by walking the MIME tree — a
+non-attachment `text/plain` leaf, else a non-attachment `text/html` leaf
+rendered to text, else the snippet. The matcher reads the same view, so a
+deterministic condition and the model never disagree about the email's content.
+
+The prompt is assembled from that view plus the rule instruction and memories:
 
 ```rust
-// crates/core/src/rules/engine.rs (simplified)
+// crates/core/src/rules/evaluation.rs (simplified)
 
-use crate::gmail::models::Message;
-
-pub fn build_user_prompt(rule_prompt: &str, email: &Message) -> String {
-    let headers = email
-        .payload
-        .as_ref()
-        .and_then(|p| p.headers.as_ref())
-        .map(|h| {
-            h.iter()
-                .map(|header| format!("{}: {}", header.name, header.value))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-
-    let body = extract_plain_text(email);
-
-    format!(
-        "--- Email Headers ---\n\
-         {headers}\n\n\
-         --- Email Body ---\n\
-         {body}\n\n\
-         --- Rule Instruction ---\n\
-         {rule_prompt}"
-    )
-}
-
-fn extract_plain_text(email: &Message) -> String {
-    let payload = match &email.payload {
-        Some(p) => p,
-        None => return email.snippet.clone(),
-    };
-
-    // Prefer text/plain for cleaner LLM input
-    let find_plain = |parts: &[MessagePayload]| -> Option<String> {
-        parts
-            .iter()
-            .find(|p| p.mime_type == "text/plain")
-            .and_then(|p| p.body.as_ref())
-            .and_then(|b| b.data.as_deref())
-            .map(base64url_decode)
-    };
-
-    let find_html = |parts: &[MessagePayload]| -> Option<String> {
-        parts
-            .iter()
-            .find(|p| p.mime_type == "text/html")
-            .and_then(|p| p.body.as_ref())
-            .and_then(|b| b.data.as_deref())
-            .map(|data| html_to_text(&base64url_decode(data)))
-    };
-
-    // Try direct body first, then parts
-    payload
-        .body
-        .as_ref()
-        .and_then(|b| b.data.as_deref())
-        .filter(|_| payload.mime_type == "text/plain")
-        .map(base64url_decode)
-        .or_else(|| payload.parts.as_deref().and_then(&find_plain))
-        .or_else(|| payload.parts.as_deref().and_then(&find_html))
-        .unwrap_or_else(|| email.snippet.clone())
-}
-
-fn base64url_decode(data: &str) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE
-        .decode(data)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
-}
-
-fn html_to_text(html: &str) -> String {
-    // Compiled once via LazyLock — regex compilation is expensive
-    use std::sync::LazyLock;
-    static TAG_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
-
-    TAG_RE
-        .replace_all(html, "")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
+fn render_email(view: &EmailView) -> String {
+    format!("{}\n\n{}\n", view.rendered_headers(), view.body)
 }
 ```
+
+### Body Cleanup And Truncation
+
+After MIME selection the body is normalized (`EmailView::from_message_with`,
+default `BodyCleanup::FULL`): quoted reply history is cut at the first `>` line,
+`On … wrote:`, `-----Original Message-----`, `________`, or Outlook
+`From:`/`Sent:` block; a trailing RFC 3676 `-- ` signature is dropped. Cleanup
+is conservative — if a step would empty the body (a forward that is entirely
+quoted history), the earlier body is kept. The snippet fallback is never
+cleaned.
+
+Measured against the stored corpus (`email_eval`), cleanup removes a further
+~11% of the email block after the header/MIME pass, changing 1,415 of 2,546
+bodies, with no body lost and 19 messages whose removed words also appear in
+their historical decision — the set to spot-check.
+
+Truncation (`engine::truncate_body`) still keeps the beginning and end of an
+over-budget body. It is rarely reached: after cleanup only 17 of 2,546 bodies
+exceed an 8k-token budget and none exceed 32k, so the head/tail split is left
+unchanged rather than tuned on a handful of messages.
+
+The pre-`EmailView` rendering kept every header and scanned only the top level
+of the MIME tree, which both wasted roughly 60% of the email block on headers
+and fell back to Gmail's snippet whenever the body lived in a nested
+`multipart/alternative`. The `email_eval` example
+(`cargo run -p post-office-core --example email_eval -- <app.db>`) reports each
+phase's token delta and, for bodies that changed, the historical decision
+already recorded in `workflow_steps` so a change can be adjudicated without
+re-running a model.
 
 ## Response Parsing
 

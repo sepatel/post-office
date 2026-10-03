@@ -59,7 +59,9 @@ the same deterministic chain.
 An LLM decision creates an immutable action plan before Gmail is called. The
 action plan stores resolved Gmail label IDs rather than rule text. If a Gmail
 request fails after it may have reached Gmail, the worker fetches the message
-and verifies the desired labels before retrying.
+and verifies the desired labels before retrying. Because only label state can
+drift, these reconciliation reads use Gmail's `format=metadata` (labels plus the
+prompt headers) rather than downloading a body they cannot act on.
 
 Decision and action failures receive at most three automatic attempts, including
 the first attempt. Exhausted work moves to `needs_attention`; it never returns
