@@ -3155,6 +3155,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "keyring",
+ "parking_lot",
  "rand 0.8.7",
  "regex",
  "reqwest 0.12.28",
