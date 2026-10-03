@@ -1,8 +1,9 @@
 use crate::gmail::models::{Label, Message};
 use crate::llm::{InferenceRouter, ProcessKind, ProcessRequest};
+use crate::rules::email_view::EmailView;
 use crate::rules::engine::{
-    choice_catalog, display_action, effective_actions, email_parts, estimated_tokens, memory_block,
-    parse_row, ActionDisplay, Choice, Outcome, Resolved, Row, RuleError,
+    choice_catalog, display_action, effective_actions, estimated_tokens, memory_block, parse_row,
+    ActionDisplay, Choice, Outcome, Resolved, Row, RuleError,
 };
 use crate::rules::matcher;
 use crate::rules::models::Rule;
@@ -40,7 +41,7 @@ struct DecisionContext {
 pub async fn resolve_decision(
     llm: &InferenceRouter,
     rule: &Rule,
-    email: &Message,
+    view: &EmailView,
     memories: &[String],
     labels: &[Label],
 ) -> Result<Resolved, RuleError> {
@@ -48,7 +49,7 @@ pub async fn resolve_decision(
         let actions: Vec<ParsedAction> = rule.actions.iter().map(ParsedAction::from).collect();
         return Ok(Resolved::local(Outcome::Matched, actions));
     };
-    let user_prompt = build_decision_prompt(rule, email, memories, context.budget)?;
+    let user_prompt = build_decision_prompt(rule, view, memories, context.budget)?;
     let max_tokens = llm.decision_max_tokens(rule.decision_max_tokens);
     let response = llm
         .process(
@@ -96,14 +97,14 @@ pub async fn resolve_decision(
 pub fn decision_estimate(
     llm: &InferenceRouter,
     rule: &Rule,
-    email: &Message,
+    view: &EmailView,
     memories: &[String],
     labels: &[Label],
 ) -> Result<Option<DecisionEstimate>, RuleError> {
     let Some(context) = decision_context(llm, rule, labels) else {
         return Ok(None);
     };
-    let user_prompt = build_decision_prompt(rule, email, memories, context.budget)?;
+    let user_prompt = build_decision_prompt(rule, view, memories, context.budget)?;
     let input_tokens = estimated_tokens(&context.system_prompt)
         .saturating_add(estimated_tokens(&user_prompt))
         .try_into()
@@ -168,13 +169,14 @@ pub async fn evaluate_messages(
             diagnostic: None,
         })
         .collect();
-    let matched: Vec<usize> = emails
+    let views: Vec<EmailView> = emails.iter().map(EmailView::from_message).collect();
+    let matched: Vec<usize> = views
         .iter()
         .enumerate()
-        .filter(|(_, email)| {
+        .filter(|(_, view)| {
             rule.conditions
                 .iter()
-                .all(|condition| matcher::evaluate(condition, email, &email.label_ids))
+                .all(|condition| matcher::evaluate(condition, view))
         })
         .map(|(index, _)| index)
         .collect();
@@ -182,7 +184,7 @@ pub async fn evaluate_messages(
         return Ok(verdicts);
     }
     for index in matched {
-        let result = resolve_decision(llm, rule, &emails[index], memories, labels).await?;
+        let result = resolve_decision(llm, rule, &views[index], memories, labels).await?;
         verdicts[index].matched = result.outcome == Outcome::Matched;
         verdicts[index].indeterminate = result.outcome == Outcome::Unparsed;
         verdicts[index].actions = result.actions.iter().map(display_action).collect();
@@ -299,19 +301,19 @@ fn incomplete_decision_error(
 
 fn build_decision_prompt(
     rule: &Rule,
-    email: &Message,
+    view: &EmailView,
     memories: &[String],
     budget: usize,
 ) -> Result<String, RuleError> {
     let prefix = decision_prefix(rule, memories);
     let suffix = "\nAnswer with exactly one decision line.\n";
-    let prompt = format!("{prefix}{}{}", render_email(email), suffix);
+    let prompt = format!("{prefix}{}{}", render_email(view), suffix);
     if estimated_tokens(&prompt) <= budget {
         return Ok(prompt);
     }
-    let (headers, body) = email_parts(email);
+    let headers = view.rendered_headers();
     let email_prefix = format!("{prefix}{headers}\n\n");
-    crate::rules::engine::fit_email_body(&email_prefix, &body, suffix, budget)
+    crate::rules::engine::fit_email_body(&email_prefix, &view.body, suffix, budget)
 }
 
 /// The menu lives in the system prompt, which is built per rule, so the payload
@@ -325,9 +327,8 @@ fn decision_prefix(rule: &Rule, memories: &[String]) -> String {
     format!("{instruction}{}\n\nEMAIL:\n", memory_block(memories))
 }
 
-fn render_email(email: &Message) -> String {
-    let (headers, body) = email_parts(email);
-    format!("{headers}\n\n{body}\n")
+fn render_email(view: &EmailView) -> String {
+    format!("{}\n\n{}\n", view.rendered_headers(), view.body)
 }
 
 #[cfg(test)]

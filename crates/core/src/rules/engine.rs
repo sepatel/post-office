@@ -8,8 +8,9 @@ use super::matcher;
 use super::models::{Action, Rule};
 use super::response_parser::ParsedAction;
 use crate::db::rules::RuleRepository;
-use crate::gmail::models::{Label, Message, MessagePayload};
+use crate::gmail::models::Label;
 use crate::llm::InferenceRouter;
+use crate::rules::email_view::EmailView;
 use crate::rules::evaluation::{decision_estimate, DecisionEstimate};
 
 const TRUNCATION_MARKER: &str = "\n\n[Body truncated; middle omitted]\n\n";
@@ -23,19 +24,14 @@ impl<'a> RuleEngine<'a> {
         Self { rule_repo }
     }
 
-    pub fn find_matching_rule(
-        &self,
-        account_email: &str,
-        email: &Message,
-        current_labels: &[String],
-    ) -> Option<Rule> {
+    pub fn find_matching_rule(&self, account_email: &str, view: &EmailView) -> Option<Rule> {
         let rules = self.rule_repo.get_enabled_rules(account_email).ok()?;
         rules
             .into_iter()
             .filter(|rule| {
                 rule.conditions
                     .iter()
-                    .all(|condition| matcher::evaluate(condition, email, current_labels))
+                    .all(|condition| matcher::evaluate(condition, view))
             })
             .min_by_key(|rule| rule.priority)
     }
@@ -46,7 +42,7 @@ impl<'a> RuleEngine<'a> {
 ///
 /// Shared so the live pipeline and the rule tester agree on what "the next rule"
 /// means; `rules` must be ordered by ascending priority.
-pub fn rules_after<'a>(rules: &'a [Rule], current_rule_id: i64, email: &Message) -> Vec<&'a Rule> {
+pub fn rules_after<'a>(rules: &'a [Rule], current_rule_id: i64, view: &EmailView) -> Vec<&'a Rule> {
     rules
         .iter()
         .skip_while(|rule| rule.id != current_rule_id)
@@ -56,7 +52,7 @@ pub fn rules_after<'a>(rules: &'a [Rule], current_rule_id: i64, email: &Message)
                 && rule
                     .conditions
                     .iter()
-                    .all(|condition| matcher::evaluate(condition, email, &email.label_ids))
+                    .all(|condition| matcher::evaluate(condition, view))
         })
         .collect()
 }
@@ -67,19 +63,19 @@ pub fn rules_after<'a>(rules: &'a [Rule], current_rule_id: i64, email: &Message)
 pub async fn resolve_rule(
     llm: &InferenceRouter,
     rule: &Rule,
-    email: &Message,
+    view: &EmailView,
     memories: &[String],
     labels: &[Label],
 ) -> Result<Resolved, RuleError> {
     let conditions_match = rule
         .conditions
         .iter()
-        .all(|condition| matcher::evaluate(condition, email, &email.label_ids));
+        .all(|condition| matcher::evaluate(condition, view));
     if !conditions_match {
         return Ok(Resolved::declined());
     }
     let resolved =
-        crate::rules::evaluation::resolve_decision(llm, rule, email, memories, labels).await?;
+        crate::rules::evaluation::resolve_decision(llm, rule, view, memories, labels).await?;
     if resolved.llm_unavailable {
         return Err(RuleError::Llm(crate::llm::LlmError::Routing(
             resolved
@@ -93,11 +89,11 @@ pub async fn resolve_rule(
 pub async fn test_rule(
     llm: &InferenceRouter,
     rule: &Rule,
-    email: &Message,
+    view: &EmailView,
     memories: &[String],
     labels: &[Label],
 ) -> Result<TestResult, RuleError> {
-    let resolved = resolve_rule(llm, rule, email, memories, labels).await?;
+    let resolved = resolve_rule(llm, rule, view, memories, labels).await?;
     Ok(TestResult {
         matched: resolved.outcome == Outcome::Matched,
         indeterminate: resolved.outcome == Outcome::Unparsed,
@@ -230,7 +226,7 @@ pub struct PipelineDryRunProgress {
 pub async fn dry_run_pipeline(
     llm: &InferenceRouter,
     rules: &[Rule],
-    email: &Message,
+    view: &EmailView,
     memories_by_rule: &HashMap<i64, Vec<String>>,
     labels: &[Label],
     on_progress: &impl Fn(PipelineDryRunProgress),
@@ -248,7 +244,7 @@ pub async fn dry_run_pipeline(
         if !rule
             .conditions
             .iter()
-            .all(|condition| matcher::evaluate(condition, email, &email.label_ids))
+            .all(|condition| matcher::evaluate(condition, view))
         {
             steps.push(PipelineDryRunStep {
                 rule_id: rule.id,
@@ -287,12 +283,12 @@ pub async fn dry_run_pipeline(
             rule_id: rule.id,
             rule_name: rule.name.clone(),
             priority: rule.priority,
-            decision_estimate: decision_estimate(llm, rule, email, memories, labels)
+            decision_estimate: decision_estimate(llm, rule, view, memories, labels)
                 .ok()
                 .flatten(),
             step: None,
         });
-        let resolved = match resolve_rule(llm, rule, email, memories, labels).await {
+        let resolved = match resolve_rule(llm, rule, view, memories, labels).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 steps.push(PipelineDryRunStep {
@@ -854,22 +850,6 @@ fn strip_angle_wrapper(line: &str) -> &str {
 static MARKER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^\s*(?:(?:n|\d+)\s*[:.)]|[-*\u{2022}])\s*").unwrap());
 
-pub(crate) fn email_parts(email: &Message) -> (String, String) {
-    let headers = email
-        .payload
-        .as_ref()
-        .map(|payload| {
-            payload
-                .headers
-                .iter()
-                .map(|header| format!("{}: {}", header.name, header.value))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    (headers, extract_plain_text(email))
-}
-
 pub(crate) fn estimated_tokens(value: &str) -> usize {
     value.chars().count().div_ceil(4)
 }
@@ -942,56 +922,6 @@ pub(crate) fn memory_block(memories: &[String]) -> String {
             memories.join("\n")
         )
     }
-}
-
-fn extract_plain_text(email: &Message) -> String {
-    let Some(payload) = &email.payload else {
-        return email.snippet.clone();
-    };
-    let find_plain = |parts: &[MessagePayload]| {
-        parts
-            .iter()
-            .find(|part| part.mime_type == "text/plain")
-            .and_then(|part| part.body.as_ref())
-            .and_then(|body| body.data.as_deref())
-            .map(decode_base64url)
-    };
-    let find_html = |parts: &[MessagePayload]| {
-        parts
-            .iter()
-            .find(|part| part.mime_type == "text/html")
-            .and_then(|part| part.body.as_ref())
-            .and_then(|body| body.data.as_deref())
-            .map(|data| strip_html(&decode_base64url(data)))
-    };
-    payload
-        .body
-        .as_ref()
-        .and_then(|body| body.data.as_deref())
-        .filter(|_| payload.mime_type == "text/plain")
-        .map(decode_base64url)
-        .or_else(|| payload.parts.as_deref().and_then(find_plain))
-        .or_else(|| payload.parts.as_deref().and_then(find_html))
-        .unwrap_or_else(|| email.snippet.clone())
-}
-
-fn decode_base64url(data: &str) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE
-        .decode(data)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
-}
-
-fn strip_html(html: &str) -> String {
-    static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
-    TAG_RE
-        .replace_all(html, "")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
 }
 
 #[cfg(test)]
@@ -1328,8 +1258,8 @@ mod tests {
         rule
     }
 
-    fn email_from(sender: &str) -> Message {
-        Message {
+    fn email_from(sender: &str) -> EmailView {
+        let message = crate::gmail::models::Message {
             id: "m1".into(),
             thread_id: "t1".into(),
             label_ids: vec![],
@@ -1337,7 +1267,7 @@ mod tests {
             history_id: "1".into(),
             internal_date: String::new(),
             size_estimate: 0,
-            payload: Some(MessagePayload {
+            payload: Some(crate::gmail::models::MessagePayload {
                 mime_type: "text/plain".into(),
                 headers: vec![crate::gmail::models::Header {
                     name: "From".into(),
@@ -1347,7 +1277,8 @@ mod tests {
                 parts: None,
                 filename: None,
             }),
-        }
+        };
+        EmailView::from_message(&message)
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::llm::{
     InferenceRouter, InferenceRuntime, LlmProviderProfile, LlmRoutingPolicy, ReasoningEffort,
 };
 use crate::rules::actions::resolve_actions;
+use crate::rules::email_view::EmailView;
 use crate::rules::engine::{needs_llm_decision, resolve_rule, Outcome, Resolved};
 use crate::rules::matcher;
 use crate::rules::models::Rule;
@@ -154,7 +155,7 @@ pub fn message_detail(
     let labels = label_names(db, account_email);
     let message = queue_item(&run, &labels)?;
     let body = parse_message(&run)
-        .map(|message| crate::rules::engine::email_parts(&message).1)
+        .map(|message| EmailView::from_message(&message).body)
         .unwrap_or_default();
     let snapshot = serde_json::from_str::<RuleSetSnapshot>(&run.rules_json).ok();
     let current_rule = snapshot
@@ -790,6 +791,9 @@ pub async fn prepare_run(
             return Ok(());
         };
         let rule = &rule_snapshot.rule;
+        // Rebuilt per iteration so labels applied earlier in the chain are
+        // visible to later rules, matching `message.label_ids`.
+        let view = EmailView::from_message(&message);
 
         if let Some(action) = db.with_workflow(|repo| repo.action_for_rule(run.id, rule_index))? {
             let confirmed =
@@ -804,7 +808,7 @@ pub async fn prepare_run(
         if !rule
             .conditions
             .iter()
-            .all(|condition| matcher::evaluate(condition, &message, &message.label_ids))
+            .all(|condition| matcher::evaluate(condition, &view))
         {
             let advanced = db.with_workflow(|repo| {
                 repo.record_step_and_advance(
@@ -827,7 +831,7 @@ pub async fn prepare_run(
 
         if !needs_llm_decision(rule, &labels) {
             let resolved =
-                resolve_rule(&llm, rule, &message, &rule_snapshot.memories, &labels).await?;
+                resolve_rule(&llm, rule, &view, &rule_snapshot.memories, &labels).await?;
             persist_decision(db, &run, rule, rule_index, &labels, &resolved)?;
             return Ok(());
         }
@@ -941,8 +945,8 @@ pub async fn process_routed_run(
         }
     }
     let started = Instant::now();
-    let resolved = match resolve_rule(&llm, rule, &message, &rule_snapshot.memories, &labels).await
-    {
+    let view = EmailView::from_message(&message);
+    let resolved = match resolve_rule(&llm, rule, &view, &rule_snapshot.memories, &labels).await {
         Ok(resolved) => resolved,
         Err(error) => {
             record_decision_error(
