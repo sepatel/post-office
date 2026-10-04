@@ -20,7 +20,7 @@ use crate::db::Database;
 use crate::gmail::models::{Label, Message};
 use crate::rules::email_view::EmailView;
 
-use super::questions::{state_text, Meaning};
+use super::questions::{framing_group, state_text, Meaning};
 use super::report::{captures, is_negative};
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,7 +167,7 @@ pub fn export(
         };
         let line = json!({
             "id": format!("{}-{}", row.step_id, row.framing),
-            "subset": row.framing,
+            "subset": framing_group(&row.framing),
             "family": format!("rule {}: {}", row.rule_legacy_id, row.rule_name),
             "state": state_text(&EmailView::from_message(&message)),
             "question": serde_json::from_str::<Value>(&question).unwrap_or(Value::Null),

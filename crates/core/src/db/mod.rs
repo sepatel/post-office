@@ -10,6 +10,7 @@ pub mod accounts;
 pub mod config;
 pub mod history;
 pub mod inference;
+pub mod label_qualifications;
 pub mod labels;
 pub mod llm_endpoint_status;
 pub mod llm_provider_status;
@@ -115,7 +116,7 @@ impl Database {
 
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock();
-        snapshot_before(&conn, 27);
+        snapshot_before(&conn, 28);
         let transaction = conn.unchecked_transaction()?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -247,6 +248,12 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (27)", [])?;
         }
+        if !migration_applied(&transaction, 28)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/028_rule_match_mode.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (28)", [])?;
+        }
         transaction.commit()
     }
 
@@ -352,6 +359,18 @@ impl Database {
         F: FnOnce(labels::LabelRepository<'_>) -> R,
     {
         self.with_conn(|conn| f(labels::LabelRepository::new(conn)))
+    }
+
+    #[track_caller]
+    pub fn with_label_qualifications<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(label_qualifications::LabelQualificationRepository<'_>) -> R,
+    {
+        self.with_conn(|conn| {
+            f(label_qualifications::LabelQualificationRepository::new(
+                conn,
+            ))
+        })
     }
 }
 

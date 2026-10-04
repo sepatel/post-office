@@ -107,6 +107,8 @@ export interface RulePayload {
   decision_reasoning_effort: string;
   decision_max_tokens: number | null;
   continue_after_match: boolean;
+  /// 'single' asks the model for exactly one outcome; 'multiple' allows several.
+  match_mode?: "single" | "multiple";
   source_rule_id?: number;
 }
 
@@ -739,6 +741,48 @@ export interface GmailLabel {
 
 export async function gmailListLabels(refresh = false): Promise<GmailLabel[]> {
   return invoke("gmail_list_labels", { refresh });
+}
+
+export interface LabelQualification {
+  account_email: string;
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+  source: string;
+  updated_at: string;
+}
+
+export async function labelQualificationsList(): Promise<LabelQualification[]> {
+  return invoke("label_qualifications_list");
+}
+
+export interface LabelQualificationInput {
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+  source: string;
+}
+
+export async function labelQualificationUpsert(input: LabelQualificationInput): Promise<void> {
+  return invoke("label_qualification_upsert", { input });
+}
+
+export async function labelQualificationDelete(labelId: string): Promise<void> {
+  return invoke("label_qualification_delete", { labelId });
+}
+
+export async function labelQualificationsGenerate(options?: {
+  accountEmail?: string;
+  policyId?: string;
+  overwrite?: boolean;
+}): Promise<number> {
+  return invoke("label_qualifications_generate", {
+    accountEmail: options?.accountEmail,
+    policyId: options?.policyId,
+    overwrite: options?.overwrite,
+  });
 }
 
 export interface LlmTestResult {

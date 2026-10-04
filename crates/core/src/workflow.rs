@@ -1388,6 +1388,7 @@ mod tests {
                     decision_reasoning_effort: ReasoningEffort::ServerDefault,
                     decision_max_tokens: None,
                     continue_after_match: false,
+                    match_mode: crate::rules::models::MatchMode::Single,
                 },
                 memories: vec![],
             }],

@@ -103,7 +103,7 @@ pub fn installed_model_id(models_dir: &Path) -> Option<String> {
     ))
 }
 
-/// `von-1.2.0@498ceba3/q1`: the checkpoint and the question format, which
+/// `von-1.2.0@498ceba3/q2`: the checkpoint and the question format, which
 /// together determine a verdict.
 fn model_id(name: &str, revision: &str) -> String {
     format!(

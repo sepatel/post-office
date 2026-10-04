@@ -136,6 +136,10 @@ impl<'a> AccountRepository<'a> {
             params![email],
         )?;
         transaction.execute(
+            "DELETE FROM label_qualifications WHERE account_email = ?1",
+            params![email],
+        )?;
+        transaction.execute(
             "DELETE FROM workflow_events WHERE account_email = ?1",
             params![email],
         )?;

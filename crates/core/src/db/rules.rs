@@ -4,7 +4,7 @@ use crate::rules::models::Rule;
 
 const RULE_COLUMNS: &str = "r.id, r.name, r.description, r.conditions, r.prompt, r.choices, r.choose_from_all_labels,
      r.actions, r.priority, r.enabled, r.parent_id, COALESCE(p.policy_id, 'default'), r.decision_reasoning_effort,
-     r.decision_max_tokens, r.continue_after_match";
+     r.decision_max_tokens, r.continue_after_match, r.match_mode";
 
 const RULE_FROM: &str = "FROM rules r LEFT JOIN rule_inference_policy p ON p.rule_id = r.id";
 
@@ -29,6 +29,10 @@ fn map_rule_row(row: &Row<'_>) -> Result<Rule> {
         .unwrap_or(crate::llm::ReasoningEffort::Off),
         decision_max_tokens: row.get(13)?,
         continue_after_match: row.get::<_, i32>(14)? != 0,
+        match_mode: row
+            .get::<_, String>(15)?
+            .parse()
+            .unwrap_or(crate::rules::models::MatchMode::Single),
     })
 }
 
@@ -103,8 +107,8 @@ impl<'a> RuleRepository<'a> {
         self.conn.execute(
             "INSERT INTO rules (account_email, name, description, conditions, prompt, choices,
                                 choose_from_all_labels, actions, priority, enabled, decision_reasoning_effort,
-                                decision_max_tokens, continue_after_match)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                decision_max_tokens, continue_after_match, match_mode)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 account_email,
                 rule.name,
@@ -119,6 +123,7 @@ impl<'a> RuleRepository<'a> {
                 rule.decision_reasoning_effort.config_value(),
                 rule.decision_max_tokens,
                 rule.continue_after_match as i32,
+                rule.match_mode.config_value(),
             ],
         )?;
 
@@ -145,6 +150,7 @@ impl<'a> RuleRepository<'a> {
             decision_reasoning_effort: rule.decision_reasoning_effort,
             decision_max_tokens: rule.decision_max_tokens,
             continue_after_match: rule.continue_after_match,
+            match_mode: rule.match_mode,
         })
     }
 
@@ -153,7 +159,7 @@ impl<'a> RuleRepository<'a> {
             "UPDATE rules SET name = ?1, description = ?2, conditions = ?3, prompt = ?4,
              choices = ?5, choose_from_all_labels = ?6, actions = ?7, priority = ?8, enabled = ?9,
              decision_reasoning_effort = ?10, decision_max_tokens = ?11, continue_after_match = ?12,
-             updated_at = datetime('now') WHERE id = ?13 AND account_email = ?14",
+             match_mode = ?13, updated_at = datetime('now') WHERE id = ?14 AND account_email = ?15",
             params![
                 rule.name,
                 rule.description,
@@ -167,6 +173,7 @@ impl<'a> RuleRepository<'a> {
                 rule.decision_reasoning_effort.config_value(),
                 rule.decision_max_tokens,
                 rule.continue_after_match as i32,
+                rule.match_mode.config_value(),
                 id,
                 account_email,
             ],
@@ -219,6 +226,7 @@ pub struct CreateRuleRequest {
     pub decision_reasoning_effort: crate::llm::ReasoningEffort,
     pub decision_max_tokens: Option<u32>,
     pub continue_after_match: bool,
+    pub match_mode: crate::rules::models::MatchMode,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +244,7 @@ pub struct UpdateRuleRequest {
     pub decision_reasoning_effort: crate::llm::ReasoningEffort,
     pub decision_max_tokens: Option<u32>,
     pub continue_after_match: bool,
+    pub match_mode: crate::rules::models::MatchMode,
 }
 
 #[cfg(test)]
@@ -252,6 +261,7 @@ mod tests {
 
         let mut req = sample_request();
         req.continue_after_match = true;
+        req.match_mode = crate::rules::models::MatchMode::Multiple;
         req.choices = vec![Action::Trash];
         req.decision_reasoning_effort = crate::llm::ReasoningEffort::Low;
         req.decision_max_tokens = Some(4_096);
@@ -268,6 +278,7 @@ mod tests {
             stored.decision_reasoning_effort,
             crate::llm::ReasoningEffort::Low
         );
+        assert_eq!(stored.match_mode, crate::rules::models::MatchMode::Multiple);
         assert_eq!(stored.decision_max_tokens, Some(4_096));
         assert_eq!(stored.choices.len(), 1);
         assert_eq!(stored.actions.len(), 1);
@@ -286,6 +297,7 @@ mod tests {
             decision_reasoning_effort: crate::llm::ReasoningEffort::Medium,
             decision_max_tokens: None,
             continue_after_match: false,
+            match_mode: crate::rules::models::MatchMode::Single,
         };
         let updated = db
             .with_rules(|repo| repo.update("test@example.com", created.id, &update))
@@ -326,6 +338,7 @@ mod tests {
             decision_reasoning_effort: crate::llm::ReasoningEffort::ServerDefault,
             decision_max_tokens: None,
             continue_after_match: false,
+            match_mode: crate::rules::models::MatchMode::Single,
         }
     }
 

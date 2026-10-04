@@ -16,7 +16,7 @@ use post_office_core::rules::engine::{
     PipelineDryRunProgress, TestResult,
 };
 use post_office_core::rules::evaluation::EvaluationVerdict;
-use post_office_core::rules::models::{Action, Condition, Rule};
+use post_office_core::rules::models::{Action, Condition, MatchMode, Rule};
 use post_office_core::sync::{replay_history, start_watch, stop_watch, ReplayResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -324,6 +324,8 @@ pub struct RuleCreateRequest {
     #[serde(default)]
     pub continue_after_match: bool,
     #[serde(default)]
+    pub match_mode: MatchMode,
+    #[serde(default)]
     pub source_rule_id: Option<i64>,
 }
 
@@ -348,6 +350,8 @@ pub struct RuleUpdateRequest {
     pub decision_max_tokens: Option<u32>,
     #[serde(default)]
     pub continue_after_match: bool,
+    #[serde(default)]
+    pub match_mode: MatchMode,
     #[serde(default)]
     pub source_rule_id: Option<i64>,
 }
@@ -416,6 +420,7 @@ fn build_rule_model(rule: &RuleCreateRequest) -> Rule {
         decision_reasoning_effort: rule.decision_reasoning_effort,
         decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
+        match_mode: rule.match_mode,
     }
 }
 
@@ -902,6 +907,7 @@ pub async fn rules_create(
         decision_reasoning_effort: rule.decision_reasoning_effort,
         decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
+        match_mode: rule.match_mode,
     };
     let created = state
         .db
@@ -944,6 +950,7 @@ pub async fn rules_update(
         decision_reasoning_effort: rule.decision_reasoning_effort,
         decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
+        match_mode: rule.match_mode,
     };
     let updated = state
         .db
@@ -1938,6 +1945,180 @@ pub fn resolve_client_secret(app: &tauri::AppHandle) -> Option<String> {
 /// empty unless the user overrode it. `GmailAuth::load` rejects an empty
 /// client_id, so using the raw config value here previously reported a working
 /// connection as unauthenticated.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LabelQualificationInput {
+    pub label_id: String,
+    pub description: String,
+    pub examples: Vec<String>,
+    pub negative_examples: Vec<String>,
+    pub source: String,
+}
+
+#[tauri::command]
+pub async fn label_qualifications_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<post_office_core::db::label_qualifications::LabelQualification>, String> {
+    let config = state.config.lock().await;
+    let account_email = active_account(&config)?;
+    drop(config);
+    state
+        .db
+        .with_label_qualifications(|repo| repo.list_for_account(&account_email))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn label_qualification_upsert(
+    state: State<'_, AppState>,
+    input: LabelQualificationInput,
+) -> Result<(), String> {
+    let config = state.config.lock().await;
+    let account_email = active_account(&config)?;
+    drop(config);
+    state
+        .db
+        .with_label_qualifications(|repo| {
+            repo.upsert(
+                &account_email,
+                &input.label_id,
+                &post_office_core::db::label_qualifications::LabelQualification {
+                    account_email: account_email.clone(),
+                    label_id: input.label_id.clone(),
+                    description: input.description,
+                    examples: input.examples,
+                    negative_examples: input.negative_examples,
+                    source: input.source,
+                    updated_at: String::new(),
+                },
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn label_qualification_delete(
+    state: State<'_, AppState>,
+    label_id: String,
+) -> Result<(), String> {
+    let config = state.config.lock().await;
+    let account_email = active_account(&config)?;
+    drop(config);
+    state
+        .db
+        .with_label_qualifications(|repo| repo.delete(&account_email, &label_id))
+        .map_err(|e| e.to_string())
+}
+
+const LABEL_QUALIFICATIONS_SYSTEM_PROMPT: &str = "You describe a user's Gmail labels for an email classifier. For every label given, write a concise description plus short example and negative-example phrases. Use only the exact label_id values provided. Never ask for, quote, or summarize actual email content.";
+
+#[derive(Debug, Deserialize)]
+struct GeneratedLabelQualifications {
+    labels: Vec<GeneratedLabelQualification>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeneratedLabelQualification {
+    label_id: String,
+    description: String,
+    #[serde(default)]
+    examples: Vec<String>,
+    #[serde(default)]
+    negative_examples: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn label_qualifications_generate(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_email: Option<String>,
+    policy_id: Option<String>,
+    overwrite: Option<bool>,
+) -> Result<usize, String> {
+    let (account_email, policy_id, llm) = {
+        let config = state.config.lock().await;
+        let account_email = match account_email.filter(|value| !value.trim().is_empty()) {
+            Some(value) => value,
+            None => active_account(&config)?,
+        };
+        let policy_id = policy_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| config.llm_default_policy.clone());
+        let llm =
+            InferenceRouter::from_config_with_runtime(&config, state.inference_runtime.clone())
+                .with_database(state.db.clone());
+        (account_email, policy_id, llm)
+    };
+
+    let labels = account_labels(&app, &state, &account_email).await?;
+    let known_ids: HashMap<&str, &Label> = labels
+        .iter()
+        .map(|label| (label.id.as_str(), label))
+        .collect();
+    if known_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let listing = labels
+        .iter()
+        .map(|label| format!("- {} ({})", label.name, label.id))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let user_prompt = format!(
+        "Here are the Gmail labels for one account (label names use '/' for hierarchy):\n{listing}\n\n\
+         Describe each label for a classifier: what a matching email looks like, example phrases, \
+         and negative-example phrases. Respond with JSON only of the shape \
+         {{\"labels\":[{{\"label_id\":\"...\",\"description\":\"...\",\"examples\":[\"...\"],\"negative_examples\":[\"...\"]}}]}}. \
+         Use exact label_id values from the list above. Do not include any email content."
+    );
+
+    let response = llm
+        .chat_json(&policy_id, LABEL_QUALIFICATIONS_SYSTEM_PROMPT, &user_prompt)
+        .await
+        .map_err(|e| e.to_string())?;
+    let generated: GeneratedLabelQualifications =
+        serde_json::from_value(response).map_err(|e| e.to_string())?;
+
+    let overwrite = overwrite.unwrap_or(false);
+    let mut saved = 0usize;
+    state.db.with_label_qualifications(|repo| {
+        for entry in &generated.labels {
+            if !known_ids.contains_key(entry.label_id.as_str())
+                || entry.description.trim().is_empty()
+            {
+                continue;
+            }
+            let refresh = match repo
+                .get(&account_email, &entry.label_id)
+                .map_err(|e| e.to_string())?
+            {
+                None => true,
+                Some(row) if row.description.trim().is_empty() => true,
+                Some(row) if overwrite && row.source == "ai" => true,
+                Some(_) => false,
+            };
+            if refresh {
+                repo.upsert(
+                    &account_email,
+                    &entry.label_id,
+                    &post_office_core::db::label_qualifications::LabelQualification {
+                        account_email: account_email.clone(),
+                        label_id: entry.label_id.clone(),
+                        description: entry.description.trim().to_string(),
+                        examples: entry.examples.clone(),
+                        negative_examples: entry.negative_examples.clone(),
+                        source: "ai".into(),
+                        updated_at: String::new(),
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                saved += 1;
+            }
+        }
+        Ok::<(), String>(())
+    })?;
+    Ok(saved)
+}
+
 fn active_account(config: &AppConfig) -> Result<String, String> {
     config
         .gmail_account

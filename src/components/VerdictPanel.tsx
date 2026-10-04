@@ -11,7 +11,12 @@ const FRAMING: Record<string, string> = {
   noul: "yes/no",
   binary: "applies / not",
   menu: "menu",
+  multi: "label",
 };
+
+function framingFamily(framing: string): string {
+  return framing.split(":")[0];
+}
 
 const FEEDBACK: Record<string, string> = {
   label_removed: "You removed the label",
@@ -33,7 +38,8 @@ function llmText(row: VerdictRow): string {
 }
 
 function verdictText(row: VerdictRow): string {
-  if (row.framing === "menu") return row.verdict_matched ? choiceName(row.verdict_choice) : "No match";
+  if (row.framing === "menu" || framingFamily(row.framing) === "multi")
+    return row.verdict_matched ? choiceName(row.verdict_choice) : "No match";
   return row.verdict_matched ? "Match" : "No match";
 }
 
@@ -104,7 +110,7 @@ export default function VerdictPanel({ messageId }: { messageId: number }) {
               <p className="mt-1 text-gray-600 dark:text-gray-300">LLM: {llmText(rows[0])}</p>
               {rows.map((row) => (
                 <p key={row.id} className="mt-0.5 text-gray-600 dark:text-gray-300">
-                  rverdict ({FRAMING[row.framing] ?? row.framing}): {verdictText(row)}
+                  rverdict ({FRAMING[framingFamily(row.framing)] ?? row.framing}): {verdictText(row)}
                   {row.confidence != null && ` · ${Math.round(row.confidence * 100)}%`}
                   {row.agrees != null && (
                     <span className={row.agrees ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400"}>

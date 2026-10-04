@@ -24,6 +24,7 @@ import {
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import RuleChatPanel from "../components/RuleChatPanel";
+import LabelQualificationsPanel from "../components/LabelQualificationsPanel";
 import ConditionBuilder, {
   Condition,
   normalizeConditionLabelIds as normalizeConditionLabelIdsRecursive,
@@ -116,6 +117,7 @@ export default function RuleEditor() {
   const [decisionMaxTokens, setDecisionMaxTokens] = useState("server_default");
   const [chooseFromAllLabels, setChooseFromAllLabels] = useState(false);
   const [continueAfterMatch, setContinueAfterMatch] = useState(false);
+  const [matchMode, setMatchMode] = useState<"single" | "multiple">("single");
   const [routingPolicies, setRoutingPolicies] = useState<RoutingPolicy[]>([]);
   const [conditions, setConditions] = useState<Condition[]>([]);
 
@@ -161,6 +163,18 @@ export default function RuleEditor() {
       ),
     [prompt, gmailLabels]
   );
+
+  const offeredLabels = useMemo(() => {
+    if (chooseFromAllLabels) return gmailLabels;
+    const values = new Set(
+      choices
+        .filter((choice) => needsLabelValue(choice.type))
+        .map((choice) => choice.value)
+    );
+    return gmailLabels.filter(
+      (label) => values.has(label.id) || values.has(label.name) || values.has(label.name.toLowerCase())
+    );
+  }, [chooseFromAllLabels, choices, gmailLabels]);
 
   const unofferedLabels = useMemo(() => {
     if (chooseFromAllLabels) return [];
@@ -290,6 +304,7 @@ export default function RuleEditor() {
         choices?: unknown[];
         choose_from_all_labels?: boolean;
         continue_after_match?: boolean;
+        match_mode?: "single" | "multiple";
       }[];
       const rule = rules.find((r) => r.id === ruleId);
       if (rule) {
@@ -325,6 +340,7 @@ export default function RuleEditor() {
         setDecisionMaxTokens(rule.decision_max_tokens?.toString() || "server_default");
         setChooseFromAllLabels(rule.choose_from_all_labels || false);
         setContinueAfterMatch(rule.continue_after_match || false);
+        setMatchMode(rule.match_mode === "multiple" ? "multiple" : "single");
         setConditions(normalizedConditions);
         setActions(normalizedActions);
         setChoices(normalizedChoices);
@@ -436,6 +452,7 @@ export default function RuleEditor() {
       decision_reasoning_effort: decisionReasoningEffort,
       decision_max_tokens: decisionMaxTokens === "server_default" ? null : Number(decisionMaxTokens),
       continue_after_match: continueAfterMatch,
+      match_mode: matchMode,
       source_rule_id: isEdit ? ruleId : undefined,
     };
   }
@@ -706,6 +723,17 @@ export default function RuleEditor() {
         </div>
 
         {decisionMode === "classify" && <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800 space-y-2">
+          <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+            <span>Select</span>
+            <select
+              value={matchMode}
+              onChange={(event) => setMatchMode(event.target.value as "single" | "multiple")}
+              className="rounded-lg border border-gray-300 bg-white px-2 py-1 text-sm dark:border-gray-700 dark:bg-gray-900"
+            >
+              <option value="single">One outcome</option>
+              <option value="multiple">Multiple outcomes</option>
+            </select>
+          </div>
           <label className="block text-sm text-gray-500 dark:text-gray-400">
             Outcome choices
           </label>
@@ -821,6 +849,7 @@ export default function RuleEditor() {
               while still stopping lower-priority rules from running.
             </p>
           )}
+          <LabelQualificationsPanel labels={offeredLabels} matchMode={matchMode} />
         </div>}
 
         <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800">
