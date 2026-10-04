@@ -24,5 +24,6 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
 [features]
-default = ["custom-protocol"]
+default = ["custom-protocol", "embedded"]
+embedded = ["post-office-core/embedded"]
 custom-protocol = ["tauri/custom-protocol"]

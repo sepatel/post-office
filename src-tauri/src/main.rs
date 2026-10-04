@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 mod commands;
 mod sync_runtime;
 mod tray;
+mod verdict;
 
 pub type ProcessingStates =
     Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<Mutex<ProcessingState>>>>>;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub inference_runtime: InferenceRuntime,
     pub sync_trigger: mpsc::UnboundedSender<sync_runtime::SyncTrigger>,
     pub tray: Arc<std::sync::Mutex<Option<TrayIcon>>>,
+    pub verdict: verdict::Verdict,
 }
 
 impl AppState {
@@ -99,6 +101,14 @@ fn main() {
                 inference_runtime.clone(),
             );
 
+            // Off by default: the service thread only waits until local
+            // decisions are enabled in settings.
+            let verdict = verdict::Verdict::start(
+                app.handle(),
+                db.clone(),
+                config_arc.clone(),
+                app_dir.clone(),
+            );
             let app_state = AppState {
                 db,
                 processing_states,
@@ -109,6 +119,7 @@ fn main() {
                 inference_runtime,
                 sync_trigger,
                 tray: Arc::new(std::sync::Mutex::new(None)),
+                verdict,
             };
 
             app.manage(app_state);
@@ -191,6 +202,12 @@ fn main() {
             commands::llm_list_models,
             commands::llm_provider_set_api_key,
             commands::llm_provider_status_list,
+            verdict::verdict_overview,
+            verdict::verdict_settings_set,
+            verdict::verdict_report,
+            verdict::verdict_message,
+            verdict::verdict_rate,
+            verdict::verdict_export,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

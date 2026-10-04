@@ -181,4 +181,6 @@ pub struct HistoryMessageEnvelope {
 #[serde(rename_all = "camelCase")]
 pub struct HistoryLabelEnvelope {
     pub message: MessageRef,
+    #[serde(default)]
+    pub label_ids: Vec<String>,
 }

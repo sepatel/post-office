@@ -855,3 +855,131 @@ export async function syncWatchStart(): Promise<WatchResponse> {
 export async function syncWatchStop(): Promise<void> {
   return invoke("sync_watch_stop");
 }
+
+// Local decisions (rverdict) running in shadow beside the LLM.
+
+export interface VerdictSettings {
+  enabled: boolean;
+  precision: "f32" | "f16" | string;
+  backend: string;
+  max_state_tokens: number;
+}
+
+export interface VerdictStatus {
+  state: "off" | "downloading" | "converting" | "loading" | "running" | "idle" | "error" | string;
+  detail: string | null;
+  model: string | null;
+  backend: string | null;
+  precision: string | null;
+  download: { file: string; done: number; total: number } | null;
+  pending: number | null;
+  done: number | null;
+  processed_this_session: number;
+}
+
+export interface VerdictOverview {
+  available: boolean;
+  settings: VerdictSettings;
+  status: VerdictStatus | null;
+}
+
+export interface VerdictCalibration {
+  held_out: number;
+  nll_before: number;
+  nll_after: number;
+  ece_before: number;
+  ece_after: number;
+  accuracy_before: number;
+  accuracy_after: number;
+}
+
+export interface VerdictRuleReport {
+  account_email: string;
+  rule_legacy_id: number;
+  rule_name: string;
+  framing: "noul" | "binary" | "menu" | string;
+  model: string;
+  decisions: number;
+  skipped: number;
+  errors: number;
+  agreement: number | null;
+  llm_majority_share: number | null;
+  minority_agreement: number | null;
+  minority_decisions: number;
+  confident: number;
+  confident_share: number | null;
+  confident_disagreements: number;
+  confident_disagreement_rate: number | null;
+  feedback: number;
+  feedback_llm_wrong: number;
+  feedback_verdict_disagreed: number;
+  calibration: VerdictCalibration | null;
+  median_ms: number | null;
+  truncated: number;
+}
+
+export interface VerdictRow {
+  id: number;
+  step_id: number;
+  rule_index: number;
+  rule_name: string;
+  framing: string;
+  model: string;
+  status: string;
+  detail: string | null;
+  options_json: string | null;
+  probabilities_json: string | null;
+  verdict_matched: boolean | null;
+  verdict_choice: string | null;
+  confidence: number | null;
+  llm_matched: boolean | null;
+  llm_choices_json: string | null;
+  agrees: boolean | null;
+  state_tokens: number | null;
+  truncated: boolean | null;
+  duration_ms: number | null;
+  created_at: string;
+}
+
+export interface VerdictFeedback {
+  step_id: number | null;
+  kind: string;
+  label_id: string;
+  created_at: string;
+}
+
+export interface VerdictExportSummary {
+  decisions: number;
+  from_user: number;
+  captures: number;
+  decisions_path: string;
+  captures_path: string;
+}
+
+export async function verdictOverview(): Promise<VerdictOverview> {
+  return invoke("verdict_overview");
+}
+
+export async function verdictSettingsSet(settings: VerdictSettings): Promise<void> {
+  return invoke("verdict_settings_set", { settings });
+}
+
+export async function verdictReport(): Promise<VerdictRuleReport[]> {
+  return invoke("verdict_report");
+}
+
+export async function verdictMessage(messageId: number): Promise<{ verdicts: VerdictRow[]; feedback: VerdictFeedback[] }> {
+  return invoke("verdict_message", { messageId });
+}
+
+export async function verdictRate(stepId: number, up: boolean | null): Promise<void> {
+  return invoke("verdict_rate", { stepId, up });
+}
+
+export async function verdictExport(): Promise<VerdictExportSummary> {
+  return invoke("verdict_export");
+}
+
+export function onVerdictStatus(handler: (status: VerdictStatus) => void) {
+  return listen<VerdictStatus>("verdict-status", (event) => handler(event.payload));
+}

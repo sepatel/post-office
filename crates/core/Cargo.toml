@@ -23,6 +23,18 @@ thiserror = "2"
 tokio = { version = "1", features = ["sync", "time"] }
 tracing = "0.1"
 parking_lot = "0.12"
+rverdict-core = { git = "https://github.com/sepatel/rverdict", rev = "aeefa59fe9e4ef1058c86f18eea96ac31efab338" }
+rverdict-eval = { git = "https://github.com/sepatel/rverdict", rev = "aeefa59fe9e4ef1058c86f18eea96ac31efab338" }
+rverdict-engine = { git = "https://github.com/sepatel/rverdict", rev = "aeefa59fe9e4ef1058c86f18eea96ac31efab338", optional = true }
+
+[features]
+# The local decision model (rverdict) and its GPU backends. Without it the
+# shadow worker never starts and the app behaves exactly as before.
+embedded = ["dep:rverdict-engine"]
+
+[[example]]
+name = "verdict"
+required-features = ["embedded"]
 
 [build-dependencies]
 serde_json = "1"
