@@ -15,6 +15,7 @@ A Rust desktop application for applying AI filters over Gmail emails. Runs local
 | [Dependencies](dependencies.md) | Crate choices and rationale |
 | [Gmail Push Sync](gmail-push-sync.md) | Push architecture (`watch` + `history.list`) and relay design |
 | [Implementation Phases](implementation-phases.md) | Development roadmap |
+| [rverdict](rverdict.md) | Native Rust decision engine (separate repo) and its Post Office integration |
 
 ## Project Decisions
 
