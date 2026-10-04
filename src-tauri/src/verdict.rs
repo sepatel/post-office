@@ -1,0 +1,186 @@
+//! Tauri side of local decisions (rverdict shadow mode): the service handle
+//! and the commands the UI uses.
+
+use std::path::PathBuf;
+
+use post_office_core::db::verdicts::{Feedback, VerdictRow};
+use post_office_core::decision::export::ExportSummary;
+use post_office_core::decision::report::{rule_reports, RuleReport};
+use post_office_core::decision::VerdictSettings;
+use serde::Serialize;
+use tauri::State;
+
+use crate::AppState;
+
+/// The running service, when the app was built with the embedded model.
+pub struct Verdict {
+    #[cfg(feature = "embedded")]
+    pub service: post_office_core::decision::service::VerdictService,
+    pub data_dir: PathBuf,
+}
+
+impl Verdict {
+    #[cfg(feature = "embedded")]
+    pub fn start(
+        app: &tauri::AppHandle,
+        db: post_office_core::db::Database,
+        config: std::sync::Arc<tokio::sync::Mutex<post_office_core::config::AppConfig>>,
+        data_dir: PathBuf,
+    ) -> Self {
+        use tauri::Emitter;
+        let handle = app.clone();
+        let service = post_office_core::decision::service::VerdictService::spawn(
+            db,
+            &data_dir,
+            move || config.blocking_lock().verdict_settings(),
+            move |status| {
+                let _ = handle.emit("verdict-status", status);
+            },
+        );
+        Self { service, data_dir }
+    }
+
+    #[cfg(not(feature = "embedded"))]
+    pub fn start(
+        _app: &tauri::AppHandle,
+        _db: post_office_core::db::Database,
+        _config: std::sync::Arc<tokio::sync::Mutex<post_office_core::config::AppConfig>>,
+        data_dir: PathBuf,
+    ) -> Self {
+        Self { data_dir }
+    }
+
+    fn wake(&self) {
+        #[cfg(feature = "embedded")]
+        self.service.wake();
+    }
+
+    fn model(&self) -> Option<String> {
+        #[cfg(feature = "embedded")]
+        return post_office_core::decision::service::installed_model_id(self.service.models_dir());
+        #[cfg(not(feature = "embedded"))]
+        None
+    }
+
+    fn calibration(&self) -> post_office_core::decision::Calibration {
+        #[cfg(feature = "embedded")]
+        return post_office_core::decision::service::installed_calibration(
+            self.service.models_dir(),
+        );
+        #[cfg(not(feature = "embedded"))]
+        post_office_core::decision::Calibration::default()
+    }
+}
+
+#[derive(Serialize)]
+pub struct VerdictOverview {
+    /// Whether this build includes the local model.
+    pub available: bool,
+    pub settings: VerdictSettings,
+    #[cfg(feature = "embedded")]
+    pub status: post_office_core::decision::service::VerdictStatus,
+    #[cfg(not(feature = "embedded"))]
+    pub status: Option<()>,
+}
+
+#[tauri::command]
+pub async fn verdict_overview(state: State<'_, AppState>) -> Result<VerdictOverview, String> {
+    let settings = state.config.lock().await.verdict_settings();
+    Ok(VerdictOverview {
+        available: cfg!(feature = "embedded"),
+        settings,
+        #[cfg(feature = "embedded")]
+        status: state.verdict.service.status(),
+        #[cfg(not(feature = "embedded"))]
+        status: None,
+    })
+}
+
+#[tauri::command]
+pub async fn verdict_settings_set(
+    state: State<'_, AppState>,
+    settings: VerdictSettings,
+) -> Result<(), String> {
+    if !["f32", "f16"].contains(&settings.precision.as_str()) {
+        return Err(format!("unknown precision {:?}", settings.precision));
+    }
+    if !(256..=8_192).contains(&settings.max_state_tokens) {
+        return Err("max_state_tokens must be between 256 and 8192".into());
+    }
+    {
+        let mut config = state.config.lock().await;
+        config.set_verdict_settings(&settings);
+        state
+            .db
+            .with_config(|repo| config.save(&repo))
+            .map_err(|e| e.to_string())?;
+    }
+    state.verdict.wake();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn verdict_report(state: State<'_, AppState>) -> Result<Vec<RuleReport>, String> {
+    let model = state.verdict.model();
+    let calibration = state.verdict.calibration();
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || rule_reports(&db, model.as_deref(), &calibration))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+pub struct MessageVerdicts {
+    pub verdicts: Vec<VerdictRow>,
+    pub feedback: Vec<Feedback>,
+}
+
+#[tauri::command]
+pub async fn verdict_message(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> Result<MessageVerdicts, String> {
+    let verdicts = state
+        .db
+        .with_verdicts(|repo| repo.for_message(message_id))
+        .map_err(|e| e.to_string())?;
+    let feedback = state
+        .db
+        .with_verdicts(|repo| repo.feedback_for_message(message_id))
+        .map_err(|e| e.to_string())?;
+    Ok(MessageVerdicts { verdicts, feedback })
+}
+
+/// Thumbs up (`true`), down (`false`) or cleared (`null`) on the LLM's
+/// decision for a step.
+#[tauri::command]
+pub async fn verdict_rate(
+    state: State<'_, AppState>,
+    step_id: i64,
+    up: Option<bool>,
+) -> Result<(), String> {
+    state
+        .db
+        .with_verdicts(|repo| repo.set_rating(step_id, up))
+        .map_err(|e| e.to_string())
+}
+
+/// Writes the decision export under the app data directory and returns
+/// where. The files contain email text and stay on this machine.
+#[tauri::command]
+pub async fn verdict_export(state: State<'_, AppState>) -> Result<ExportSummary, String> {
+    let dir = state.verdict.data_dir.join("exports").join(
+        chrono::Utc::now()
+            .format("decisions-%Y%m%d-%H%M%S")
+            .to_string(),
+    );
+    let model = state.verdict.model();
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        post_office_core::decision::export::export(&db, &dir, model.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}

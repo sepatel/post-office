@@ -427,6 +427,14 @@ struct LlmSnapshot {
     default_policy: String,
 }
 
+/// The rule and its memories at `index` of a stored rule-set snapshot, as the
+/// run that used it saw them.
+pub(crate) fn snapshot_rule(rules_json: &str, index: usize) -> Option<(Rule, Vec<String>)> {
+    let snapshot: RuleSetSnapshot = serde_json::from_str(rules_json).ok()?;
+    let entry = snapshot.rules.into_iter().nth(index)?;
+    Some((entry.rule, entry.memories))
+}
+
 impl LlmSnapshot {
     fn capture(config: &AppConfig) -> Self {
         Self {
@@ -553,6 +561,9 @@ pub async fn ingest_history(
     let mut page_token = None;
     let mut to_history_id = from_history_id.clone();
     let mut message_ids = BTreeSet::new();
+    // Label changes are read only for shadow-mode feedback, and only when
+    // local decisions are enabled; they never queue work.
+    let mut label_events = Vec::new();
     loop {
         let page = match gmail
             .list_history_page(&from_history_id, page_token.as_deref())
@@ -579,6 +590,9 @@ pub async fn ingest_history(
         for record in page.history.as_deref().unwrap_or_default() {
             to_history_id = max_history_id(to_history_id, &record.id);
             collect_arrivals(&mut message_ids, record);
+            if config.verdict_enabled {
+                crate::decision::feedback::collect(record, &mut label_events);
+            }
         }
         page_token = page.next_page_token;
         if page_token.is_none() {
@@ -586,6 +600,11 @@ pub async fn ingest_history(
         }
     }
 
+    if !label_events.is_empty() {
+        if let Err(error) = crate::decision::feedback::record(db, account_email, &label_events) {
+            tracing::warn!("Could not record label feedback for {account_email}: {error}");
+        }
+    }
     let ids = message_ids.into_iter().collect::<Vec<_>>();
     let queued_messages =
         db.with_workflow(|repo| repo.enqueue_arrivals(account_email, &to_history_id, &ids))?;
