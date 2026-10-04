@@ -16,6 +16,7 @@ const FRAMING: Record<string, string> = {
   noul: "Yes/no",
   binary: "Applies / not",
   menu: "Menu",
+  multi: "Multiple",
 };
 
 function percent(value: number | null): string {

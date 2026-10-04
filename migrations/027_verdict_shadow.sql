@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS workflow_verdicts (
     rule_index          INTEGER NOT NULL,
     rule_legacy_id      INTEGER NOT NULL,
     rule_name           TEXT NOT NULL,
-    -- 'noul' | 'binary' | 'menu', or '-' for a step that could not be asked.
+    -- 'noul' | 'binary' | 'menu' | 'multi:<target>', or '-' for a step that
+    -- could not be asked. Multiple-match targets share the 'multi' family.
     framing             TEXT NOT NULL,
     model               TEXT NOT NULL,
     backend             TEXT,

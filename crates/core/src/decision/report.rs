@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::db::verdicts::{Feedback, VerdictRow};
 use crate::db::Database;
+use crate::decision::questions::framing_group;
 
 /// Confidence at which a rule could act on rverdict's answer alone.
 pub const ACT_THRESHOLD: f64 = 0.9;
@@ -104,7 +105,7 @@ fn build(rows: &[VerdictRow], feedback: &[Feedback], calibration: &Calibration) 
                 .entry((
                     row.account_email.clone(),
                     row.rule_legacy_id,
-                    row.framing.clone(),
+                    framing_group(&row.framing).to_owned(),
                     row.model.clone(),
                 ))
                 .or_default()
@@ -240,7 +241,7 @@ pub fn captures(rows: &[&VerdictRow]) -> Vec<Capture> {
             let logits: Logits = serde_json::from_str(row.logits_json.as_deref()?).ok()?;
             Some(Capture {
                 id: format!("{}-{}", row.step_id, row.framing),
-                group: row.framing.clone(),
+                group: framing_group(&row.framing).to_owned(),
                 kind,
                 expected: usize::try_from(row.llm_option?).ok()?,
                 logits,
@@ -279,7 +280,7 @@ fn calibration_report(
 mod tests {
     use super::*;
     use crate::decision::worker::shadow_batch;
-    use crate::decision::worker::tests::{seeded, FirstOption};
+    use crate::decision::worker::tests::{seeded, seeded_multi, FirstOption};
 
     #[test]
     fn reports_agreement_per_rule_and_framing() {
@@ -308,5 +309,18 @@ mod tests {
             ]
         );
         assert!(reports.iter().all(|r| r.calibration.is_none()));
+    }
+
+    #[test]
+    fn multiple_match_targets_group_under_one_multi_framing() {
+        let db = seeded_multi();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        let reports = rule_reports(&db, None, &Calibration::default()).unwrap();
+        let sort: Vec<_> = reports
+            .iter()
+            .filter(|r| r.rule_name == "Sort")
+            .map(|r| (r.framing.as_str(), r.decisions, r.agreement))
+            .collect();
+        assert_eq!(sort, [("multi", 2, Some(0.5))]);
     }
 }

@@ -138,7 +138,7 @@ fn decision_context(
         return None;
     }
     let has_instruction = !rule.prompt.trim().is_empty();
-    let system_prompt = decision_prompt(&menu, has_instruction);
+    let system_prompt = decision_prompt(&menu, has_instruction, rule.match_mode);
     let reserved_completion_tokens = llm.decision_context_reserve_tokens(rule.decision_max_tokens);
     let budget = llm
         .input_token_budget(&rule.inference_policy, reserved_completion_tokens)

@@ -30,6 +30,38 @@ pub struct Rule {
     /// Keep evaluating lower-priority rules after this one matches and acts.
     #[serde(default)]
     pub continue_after_match: bool,
+    /// Whether a match may select exactly one outcome or several.
+    #[serde(default)]
+    pub match_mode: MatchMode,
+}
+
+/// Whether a matching rule may pick a single outcome or multiple ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    #[default]
+    Single,
+    Multiple,
+}
+
+impl MatchMode {
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Multiple => "multiple",
+        }
+    }
+}
+
+impl std::str::FromStr for MatchMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "multiple" => MatchMode::Multiple,
+            _ => MatchMode::Single,
+        })
+    }
 }
 
 impl Rule {

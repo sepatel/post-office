@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::db::label_qualifications::LabelQualification;
 use crate::db::verdicts::{NewVerdict, PendingStep};
 use crate::db::Database;
 use crate::gmail::models::{Label, Message};
@@ -25,6 +26,7 @@ pub fn shadow_batch(
     let info = model.info().clone();
     let pending = db.with_verdicts(|repo| repo.pending_steps(&info.id, limit))?;
     let mut labels: HashMap<String, Vec<Label>> = HashMap::new();
+    let mut qualifications: HashMap<String, Vec<LabelQualification>> = HashMap::new();
     for step in &pending {
         let labels = match labels.get(&step.account_email) {
             Some(labels) => labels,
@@ -36,7 +38,17 @@ pub fn shadow_batch(
                 labels.entry(step.account_email.clone()).or_insert(cached)
             }
         };
-        shadow_step(db, model, step, labels)?;
+        let qualifications = match qualifications.get(&step.account_email) {
+            Some(qualifications) => qualifications,
+            None => {
+                let cached = db
+                    .with_label_qualifications(|repo| repo.list_for_account(&step.account_email))?;
+                qualifications
+                    .entry(step.account_email.clone())
+                    .or_insert(cached)
+            }
+        };
+        shadow_step(db, model, step, labels, qualifications)?;
     }
     Ok(pending.len())
 }
@@ -46,6 +58,7 @@ fn shadow_step(
     model: &dyn DecisionModel,
     step: &PendingStep,
     labels: &[Label],
+    qualifications: &[LabelQualification],
 ) -> rusqlite::Result<()> {
     let info = model.info();
     let base = NewVerdict {
@@ -86,7 +99,7 @@ fn shadow_step(
     };
     let view = EmailView::from_message(&message);
     let menu = choice_catalog(&rule, labels);
-    let Some(plan) = plan(&rule, &menu, &view, &memories) else {
+    let Some(plan) = plan(&rule, &menu, &view, &memories, qualifications) else {
         return skip("the rule makes no model decision");
     };
     let llm = llm_answer(&step.outcome, step.reply.as_deref(), &menu);
@@ -108,8 +121,7 @@ fn shadow_step(
     let share = elapsed / i64::try_from(plan.asked.len().max(1)).unwrap_or(1);
 
     for asked in &plan.asked {
-        let framing = asked.framing.as_str();
-        let Some(answer) = evaluation.answers.iter().find(|a| a.id == framing) else {
+        let Some(answer) = evaluation.answers.iter().find(|a| a.id == asked.id) else {
             continue;
         };
         let v = verdict(
@@ -121,7 +133,7 @@ fn shadow_step(
         );
         db.with_verdicts(|repo| {
             repo.insert(&NewVerdict {
-                framing,
+                framing: &asked.id,
                 status: "ok",
                 question_json: Some(asked.question.to_string()),
                 options_json: serde_json::to_string(&asked.options).ok(),
@@ -298,5 +310,49 @@ pub(crate) mod tests {
             .iter()
             .all(|v| v.status == "skipped" && v.framing == "-"));
         assert_eq!(shadow_batch(&db, &FirstOption::default(), 10).unwrap(), 0);
+    }
+
+    /// The seeded database with the menu rule flipped to multiple-match.
+    pub(crate) fn seeded_multi() -> Database {
+        let db = seeded();
+        let rules: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT rules_json FROM workflow_rule_sets WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&rules).unwrap();
+        value["rules"][1]["rule"]["match_mode"] = json!("multiple");
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_rule_sets SET rules_json = ?1 WHERE id = 1",
+                [value.to_string()],
+            )
+        })
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn multiple_match_rules_record_one_verdict_per_choice() {
+        let db = seeded_multi();
+        assert_eq!(shadow_batch(&db, &FirstOption::default(), 10).unwrap(), 2);
+        let rows = db.with_verdicts(|r| r.all(None)).unwrap();
+        let multi: Vec<_> = rows
+            .iter()
+            .filter(|v| v.step_id == 2)
+            .map(|v| (v.framing.as_str(), v.agrees, v.verdict_choice.as_deref()))
+            .collect();
+        // rverdict says yes to both labels; the LLM chose only Financial.
+        assert_eq!(
+            multi,
+            [
+                ("multi:0", Some(true), Some("\"Financial\"")),
+                ("multi:1", Some(false), Some("\"Work\"")),
+            ]
+        );
     }
 }

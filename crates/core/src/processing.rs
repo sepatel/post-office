@@ -1887,6 +1887,7 @@ mod tests {
             decision_reasoning_effort: crate::llm::ReasoningEffort::ServerDefault,
             decision_max_tokens: None,
             continue_after_match,
+            match_mode: crate::rules::models::MatchMode::Single,
         }
     }
 

@@ -323,8 +323,9 @@ privacy routing rules; local stays the default.
 | Rule shape | Question |
 |---|---|
 | instruction only | `noul`: instruction phrased as a statement about the email |
-| menu of choices | `choice` with each choice's description, plus an explicit described "none of these apply" option |
-| `choose_from_all_labels` | `choice` over label names with descriptions; split into two steps (coarse, then fine) when there are more than about 20 labels |
+| menu of choices, one | `choice` with each choice's description, plus an explicit described "none of these apply" option |
+| menu of choices, multiple | one `noul` question per choice: does this choice apply to the email? |
+| `choose_from_all_labels` | by default a multi-label set of `noul` questions over qualified labels; one flat 100-way choice was the wrong fit |
 | instruction + menu | `noul` for whether the rule applies, plus `choice` for which option, in the same pass |
 
 All candidate rules for an email are asked in **one forward pass**. The
@@ -428,6 +429,28 @@ Where the build differs from the design above, and why.
   code against a copy of a database, without the app or Gmail.
 - **Dev builds** compile dependencies at `opt-level = 3`; unoptimised Burn
   makes inference 10–50× slower under `tauri dev`.
+
+#### 6.8 As adjusted, multi-label and label qualifications
+
+Simple agreement with the LLM was 15–21% and all-label rules were 1%, so
+these changed:
+
+- **`Rule.match_mode`**: `single` keeps the original choice question;
+  `multiple` asks every menu item as an independent `noul`. Multiple matches
+  no longer reduce to one softmax pick.
+- **`label_qualifications(account_email, label_id, ...)`** stores what a
+  label means: editable text, positive examples and negative examples,
+  source (`ai` or `user`). The Rule Editor renders them for the candidate
+  labels for a rule, and can call the configured chat model to draft the
+  descriptions and examples from label names only (source `ai`), which the
+  user edits and saves as `source: user`.
+- Option descriptions passed to rverdict from label qualifications first;
+  the old `- "Name" -- description` prompt parser remains as the fallback.
+- Multi-label LLM replies still use the tolerant existing `MATCH |
+  LABELS: A, B` parser. Rverdict answers one yes/no result for A and one for
+  B; a target applies iff the model chose it in the recorded answer set.
+- `QUESTIONS_VERSION` is `2` (`von-1.2.0@498ceba3/q2`), so the old single
+  softmax comparisons are not mixed with per-label records.
 
 ---
 
