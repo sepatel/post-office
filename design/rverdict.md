@@ -380,6 +380,55 @@ From Phase 2:
 - The LLM stays responsible for authoring rules, fallback on hard cases, and
   acting as the teacher.
 
+### 6.7 As built (Phase 4, shadow mode)
+Where the build differs from the design above, and why.
+- **Off by default, one switch.** Local decisions are a setting (Inference
+  settings → Local decisions). Off, nothing new runs: no download, no GPU
+  probe, no worker. On, the model installs into the app data directory
+  (`models/`, about 1.6 GB, sha256-checked, PyTorch weights converted to
+  safetensors), with rverdict's caches beside it (`rverdict/`).
+- **Shadowing never touches the live path.** A background worker reads
+  steps the LLM decided from `workflow_steps`, rebuilds the exact rule from
+  the run's rule-set snapshot and the email from `workflow_messages`, and
+  writes `workflow_verdicts`. The LLM's choice is recovered by re-parsing
+  its stored reply against the menu, so no live write was added. The same
+  worker backfills every past decision, newest first.
+- **No per-rule mode yet.** Every LLM rule is shadowed when the setting is
+  on; per-rule modes (`verdict`, `verdict_then_llm`) arrive with Phase 5.
+- **Rule → question mapping.** Instruction-only rules are asked two ways
+  (`noul` and a two-option `choice`) to learn which framing agrees better.
+  Menu rules are one `choice` with a described "none of these" option.
+  Option descriptions come from the rule prompt itself (`- "Name" --
+  description` lines) and NO_MATCH's stated meaning; reply-protocol phrases
+  ("reply MATCH if") are dropped. Bare names gave 0% agreement on a
+  one-label rule the LLM declines 98% of the time; described options gave
+  100% on the same emails.
+- **Verdicts are keyed by model and question format**
+  (`von-1.2.0@498ceba3/q1`), so changing either re-shadows instead of mixing
+  results.
+- **Feedback.** Ingestion keeps the label changes it already fetches (only
+  while the setting is on) and records undos of our actions (label removed,
+  restored from Trash or Spam, moved back to the inbox, unstarred) and labels
+  the user adds. Thumbs up/down on the LLM's decision in the message view.
+- **Storage.** Migration 027 (26 is skipped: a removed development migration
+  left 26 recorded in real databases) adds `workflow_verdicts` and
+  `workflow_feedback` only. A `VACUUM INTO <db>.pre-027.bak` copy is taken
+  first. Older builds ignore both tables.
+- **Export** (`Export decisions`, or `examples/verdict.rs export`) writes
+  `decisions.jsonl` (rverdict tasks; `source` is `llm`, or `user` where
+  feedback says what the answer was) and `decisions.captures.jsonl` for
+  `rverdict calibrate`. Bodies come from the stored message snapshots.
+- **Reports** per rule and framing: agreement, the LLM's majority share and
+  agreement on its other answers (so a rule that is 98% "no" is not scored
+  by its base rate), share at ≥ 0.9 confidence and how many of those
+  disagree, feedback, and held-out NLL before and after a per-rule
+  temperature refit.
+- **Headless tool.** `cargo run --release -p post-office-core --features
+  embedded --example verdict -- shadow|report|export <db>` runs the same
+  code against a copy of a database, without the app or Gmail.
+- **Dev builds** compile dependencies at `opt-level = 3`; unoptimised Burn
+  makes inference 10–50× slower under `tauri dev`.
+
 ---
 
 ## 7. Phases
@@ -442,6 +491,10 @@ so it never blocks Post Office.
   Studio views, feedback capture, decision export.
 - **Done when**: two or more weeks of shadow data with agreement and
   calibration reported per rule.
+- **Status** 2026-10-04: built and verified on a copy of the production
+  database (backfill of 2,048 LLM decisions, `research/phase-4-shadow.md`);
+  off by default. The two-week clock starts when it is turned on in the app
+  on the production machine.
 
 ### Phase 5: personal model + rollout
 - Calibrate, then LoRA-tune on personal data; switch rules to
@@ -510,6 +563,13 @@ so it never blocks Post Office.
   computed on a reset device.
 - Call TypeSafe and Cloudflare for real once API keys are available, and add
   Jev's Workers AI model id when Cloudflare documents it.
+- `choose_from_all_labels` rules (61–106 bare label names) agree 1% zero-shot:
+  ask coarse-then-fine (section 6.2), or describe labels, before judging them.
+- A choice bias correction (per option, per rule) alongside temperature:
+  temperature cannot change which option wins, and most per-rule
+  disagreement is a ranking bias.
+- Calibration maps must not extrapolate their other features either
+  (`log_tokens` beyond the fitted state lengths).
 - CPU speed: Flex's fused attention (~36 GFLOP/s) and broadcast element-wise
   kernels dominate CPU inference. Options: upstream Flex work or an attention
   kernel of our own.

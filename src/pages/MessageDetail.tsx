@@ -9,6 +9,7 @@ import {
 import { formatLocalDateTime } from "../lib/datetime";
 import { useGate } from "../lib/gate";
 import LoadError from "../components/LoadError";
+import VerdictPanel from "../components/VerdictPanel";
 
 function title(kind: string): string {
   return kind.replace(/_/g, " ").replace(/\b\w/g, (letter: string) => letter.toUpperCase());
@@ -239,6 +240,7 @@ export default function MessageDetail() {
           <h2 className="mb-5 text-lg font-semibold">Run timeline</h2>
           <div className="min-h-0 flex-1 overflow-y-auto px-4">
             <Timeline detail={detail} />
+            <VerdictPanel messageId={messageId} />
             {detail.steps.some((step) => step.decision) && (
               <details className="mt-6 rounded-xl bg-gray-50 p-3 text-xs dark:bg-gray-900/70">
                 <summary className="cursor-pointer font-medium text-gray-600 dark:text-gray-300">Decision evidence</summary>

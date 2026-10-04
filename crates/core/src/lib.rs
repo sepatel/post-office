@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod config;
 pub mod db;
+pub mod decision;
 pub mod gmail;
 pub mod llm;
 pub mod processing;

@@ -16,6 +16,7 @@ import LoadError from "../components/LoadError";
 import InferenceStudio, {
   type InferenceConfig,
 } from "../components/InferenceStudio";
+import LocalDecisions from "../components/LocalDecisions";
 
 interface Config extends InferenceConfig {
   gmail_account: string | null;
@@ -178,10 +179,13 @@ export default function Settings() {
       </div>
 
       {tab === "inference" && (
-        <InferenceStudio
-          config={config}
-          onConfigChange={(next) => setConfig({ ...config, ...next })}
-        />
+        <>
+          <InferenceStudio
+            config={config}
+            onConfigChange={(next) => setConfig({ ...config, ...next })}
+          />
+          <LocalDecisions />
+        </>
       )}
 
       {tab === "mailbox" && (
