@@ -7,7 +7,7 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-post-office-core = { path = "../crates/core" }
+post-office-core = { path = "../crates/core", features = ["embedded"] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +24,5 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
 [features]
-default = ["custom-protocol", "embedded"]
-embedded = ["post-office-core/embedded"]
+default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
