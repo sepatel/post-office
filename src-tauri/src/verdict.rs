@@ -12,15 +12,13 @@ use tauri::State;
 
 use crate::AppState;
 
-/// The running service, when the app was built with the embedded model.
+/// The running local-decision service (rverdict shadow mode).
 pub struct Verdict {
-    #[cfg(feature = "embedded")]
     pub service: post_office_core::decision::service::VerdictService,
     pub data_dir: PathBuf,
 }
 
 impl Verdict {
-    #[cfg(feature = "embedded")]
     pub fn start(
         app: &tauri::AppHandle,
         db: post_office_core::db::Database,
@@ -40,59 +38,31 @@ impl Verdict {
         Self { service, data_dir }
     }
 
-    #[cfg(not(feature = "embedded"))]
-    pub fn start(
-        _app: &tauri::AppHandle,
-        _db: post_office_core::db::Database,
-        _config: std::sync::Arc<tokio::sync::Mutex<post_office_core::config::AppConfig>>,
-        data_dir: PathBuf,
-    ) -> Self {
-        Self { data_dir }
-    }
-
     fn wake(&self) {
-        #[cfg(feature = "embedded")]
         self.service.wake();
     }
 
     fn model(&self) -> Option<String> {
-        #[cfg(feature = "embedded")]
-        return post_office_core::decision::service::installed_model_id(self.service.models_dir());
-        #[cfg(not(feature = "embedded"))]
-        None
+        post_office_core::decision::service::installed_model_id(self.service.models_dir())
     }
 
     fn calibration(&self) -> post_office_core::decision::Calibration {
-        #[cfg(feature = "embedded")]
-        return post_office_core::decision::service::installed_calibration(
-            self.service.models_dir(),
-        );
-        #[cfg(not(feature = "embedded"))]
-        post_office_core::decision::Calibration::default()
+        post_office_core::decision::service::installed_calibration(self.service.models_dir())
     }
 }
 
 #[derive(Serialize)]
 pub struct VerdictOverview {
-    /// Whether this build includes the local model.
-    pub available: bool,
     pub settings: VerdictSettings,
-    #[cfg(feature = "embedded")]
     pub status: post_office_core::decision::service::VerdictStatus,
-    #[cfg(not(feature = "embedded"))]
-    pub status: Option<()>,
 }
 
 #[tauri::command]
 pub async fn verdict_overview(state: State<'_, AppState>) -> Result<VerdictOverview, String> {
     let settings = state.config.lock().await.verdict_settings();
     Ok(VerdictOverview {
-        available: cfg!(feature = "embedded"),
         settings,
-        #[cfg(feature = "embedded")]
         status: state.verdict.service.status(),
-        #[cfg(not(feature = "embedded"))]
-        status: None,
     })
 }
 

@@ -922,9 +922,8 @@ export interface VerdictStatus {
 }
 
 export interface VerdictOverview {
-  available: boolean;
   settings: VerdictSettings;
-  status: VerdictStatus | null;
+  status: VerdictStatus;
 }
 
 export interface VerdictCalibration {

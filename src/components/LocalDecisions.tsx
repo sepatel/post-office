@@ -132,26 +132,21 @@ export default function LocalDecisions() {
             A local model answers the same rules as the LLM, for every decision, past and new, and both answers are recorded side by side. It never acts on mail. Off by default.
           </p>
         </div>
-        {overview.available ? (
-          <button
-            type="button"
-            onClick={() => void toggle()}
-            disabled={saving}
-            className={`rounded-lg px-4 py-2 text-sm font-medium shadow-sm disabled:opacity-50 ${
-              settings.enabled
-                ? "border border-gray-300 text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
-                : "bg-blue-600 text-white hover:bg-blue-700"
-            }`}
-          >
-            {settings.enabled ? "Turn off" : "Turn on"}
-          </button>
-        ) : (
-          <span className="text-sm text-gray-500 dark:text-gray-400">Not included in this build</span>
-        )}
+        <button
+          type="button"
+          onClick={() => void toggle()}
+          disabled={saving}
+          className={`rounded-lg px-4 py-2 text-sm font-medium shadow-sm disabled:opacity-50 ${
+            settings.enabled
+              ? "border border-gray-300 text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
+              : "bg-blue-600 text-white hover:bg-blue-700"
+          }`}
+        >
+          {settings.enabled ? "Turn off" : "Turn on"}
+        </button>
       </div>
 
-      {overview.available && (
-        <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-3 border-t border-gray-100 pt-4 text-sm dark:border-gray-700">
+      <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-3 border-t border-gray-100 pt-4 text-sm dark:border-gray-700">
           <div className="min-w-0 flex-1">
             <p className={status?.state === "error" ? "text-red-600 dark:text-red-400" : "text-gray-700 dark:text-gray-200"}>
               {statusText(status)}
@@ -189,8 +184,7 @@ export default function LocalDecisions() {
               ))}
             </div>
           </div>
-        </div>
-      )}
+      </div>
 
       <div className="mt-5 flex items-center justify-between gap-3">
         <h4 className="text-sm font-semibold">Agreement with the LLM, per rule</h4>
