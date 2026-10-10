@@ -2,7 +2,7 @@
 //! often it is confidently wrong, what user feedback says, and whether a
 //! calibration refit on the rule's own history would help.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rverdict_core::{Calibration, Logits, RenderedKind};
 use rverdict_eval::calibrate::{self, Capture, Form};
@@ -76,6 +76,7 @@ pub fn is_negative(kind: &str) -> bool {
             | "unarchived"
             | "unstarred"
             | "thumbs_down"
+            | "verdict_wrong"
     )
 }
 
@@ -90,9 +91,15 @@ pub fn rule_reports(
 }
 
 fn build(rows: &[VerdictRow], feedback: &[Feedback], calibration: &Calibration) -> Vec<RuleReport> {
+    // Feedback about one label is about that row alone. Step-level feedback is
+    // a verdict on the step as a whole, so it applies to every row of that step
+    // — but only where nothing more specific was said.
     let mut by_step: HashMap<i64, Vec<&Feedback>> = HashMap::new();
+    let mut by_verdict: HashMap<i64, Vec<&Feedback>> = HashMap::new();
     for f in feedback {
-        if let Some(step) = f.step_id {
+        if let Some(verdict) = f.verdict_id {
+            by_verdict.entry(verdict).or_default().push(f);
+        } else if let Some(step) = f.step_id {
             by_step.entry(step).or_default().push(f);
         }
     }
@@ -133,7 +140,7 @@ fn build(rows: &[VerdictRow], feedback: &[Feedback], calibration: &Calibration) 
                 .get(&(account_email.clone(), rule_legacy_id, model.clone()))
                 .copied()
                 .unwrap_or_default();
-            let mut report = summarize(&rows, &by_step, calibration);
+            let mut report = summarize(&rows, &by_step, &by_verdict, calibration);
             report.rule_name = rows.last().map(|r| r.rule_name.clone()).unwrap_or_default();
             report.account_email = account_email;
             report.rule_legacy_id = rule_legacy_id;
@@ -162,6 +169,7 @@ fn share(part: usize, whole: usize) -> Option<f64> {
 fn summarize(
     rows: &[&VerdictRow],
     feedback: &HashMap<i64, Vec<&Feedback>>,
+    per_row: &HashMap<i64, Vec<&Feedback>>,
     calibration: &Calibration,
 ) -> RuleReport {
     let compared: Vec<&&VerdictRow> = rows.iter().filter(|r| r.agrees.is_some()).collect();
@@ -191,21 +199,31 @@ fn summarize(
         .collect();
     let confident_disagreements = confident.iter().filter(|r| r.agrees == Some(false)).count();
 
-    let mut feedback_n = 0;
-    let mut llm_wrong = 0;
-    let mut verdict_disagreed = 0;
+    // A step is the LLM's one decision, but a step fans out to a row per
+    // question — 57 labels for a multiple-match rule. Counting feedback per row
+    // would score one thumbs-down as 57 wrong decisions, so these count steps.
+    let mut rated: HashSet<i64> = HashSet::new();
+    let mut marked_wrong: HashSet<i64> = HashSet::new();
+    let mut verdict_disagreed: HashSet<i64> = HashSet::new();
     for row in &compared {
-        let Some(entries) = feedback.get(&row.step_id) else {
+        let step_negative = feedback
+            .get(&row.step_id)
+            .is_some_and(|entries| entries.iter().any(|f| is_negative(&f.kind)));
+        let specific = per_row.get(&row.id).map(Vec::as_slice).unwrap_or_default();
+        if !step_negative && specific.is_empty() {
             continue;
-        };
-        feedback_n += 1;
-        if entries.iter().any(|f| is_negative(&f.kind)) {
-            llm_wrong += 1;
+        }
+        rated.insert(row.step_id);
+        if step_negative || specific.iter().any(|f| is_negative(&f.kind)) {
+            marked_wrong.insert(row.step_id);
             if row.agrees == Some(false) {
-                verdict_disagreed += 1;
+                verdict_disagreed.insert(row.step_id);
             }
         }
     }
+    let feedback_n = rated.len();
+    let llm_wrong = marked_wrong.len();
+    let verdict_disagreed = verdict_disagreed.len();
 
     let mut durations: Vec<i64> = rows.iter().filter_map(|r| r.duration_ms).collect();
     durations.sort_unstable();
@@ -322,5 +340,71 @@ mod tests {
             .map(|r| (r.framing.as_str(), r.decisions, r.agreement))
             .collect();
         assert_eq!(sort, [("multi", 2, Some(0.5))]);
+    }
+
+    /// A step fans out to a row per label, so rating one label wrong must not
+    /// mark the step's other labels wrong too.
+    #[test]
+    fn a_row_rating_is_not_read_as_a_verdict_on_the_whole_step() {
+        let db = seeded_multi();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        let rows = db.with_verdicts(|r| r.all(None)).unwrap();
+        let work = rows
+            .iter()
+            .find(|v| v.target.as_deref() == Some("\"Work\""))
+            .expect("a Work row");
+        db.with_verdicts(|r| r.set_verdict_rating(work.id, Some(false)))
+            .unwrap();
+
+        let sort = rule_reports(&db, None, &Calibration::default())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.rule_name == "Sort")
+            .unwrap();
+        // One decision rated, not one per row.
+        assert_eq!(sort.feedback, 1);
+        assert_eq!(sort.feedback_llm_wrong, 1);
+        // Work was the row rverdict disagreed on, so it counts.
+        assert_eq!(sort.feedback_verdict_disagreed, 1);
+    }
+
+    /// A thumbs-down on the step still speaks for every row it fanned out to.
+    #[test]
+    fn a_step_rating_applies_to_all_of_its_rows() {
+        let db = seeded_multi();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        db.with_verdicts(|r| r.set_rating(2, Some(false))).unwrap();
+
+        let sort = rule_reports(&db, None, &Calibration::default())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.rule_name == "Sort")
+            .unwrap();
+        // Two rows, but one decision, so it is counted once.
+        assert_eq!(sort.decisions, 2);
+        assert_eq!(sort.feedback, 1);
+        assert_eq!(sort.feedback_llm_wrong, 1);
+        assert_eq!(sort.feedback_verdict_disagreed, 1);
+    }
+
+    /// Clearing or replacing the step's rating must leave the per-label ones
+    /// alone: they are separate signals about separate questions.
+    #[test]
+    fn a_step_rating_leaves_the_row_ratings_alone() {
+        let db = seeded_multi();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        let rows = db.with_verdicts(|r| r.all(None)).unwrap();
+        let work = rows
+            .iter()
+            .find(|v| v.target.as_deref() == Some("\"Work\""))
+            .expect("a Work row");
+        db.with_verdicts(|r| r.set_verdict_rating(work.id, Some(false)))
+            .unwrap();
+        db.with_verdicts(|r| r.set_rating(2, Some(true))).unwrap();
+
+        let feedback = db.with_verdicts(|r| r.feedback_for_steps()).unwrap();
+        let kinds: Vec<_> = feedback.iter().map(|f| f.kind.as_str()).collect();
+        assert!(kinds.contains(&"verdict_wrong"));
+        assert!(kinds.contains(&"thumbs_up"));
     }
 }

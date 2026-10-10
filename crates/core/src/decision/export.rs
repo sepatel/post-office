@@ -50,7 +50,10 @@ fn user_option(
     feedback: &[&Feedback],
     label_names: &HashMap<String, String>,
 ) -> Option<usize> {
-    if feedback.iter().any(|f| f.kind == "thumbs_up") {
+    if feedback
+        .iter()
+        .any(|f| f.kind == "thumbs_up" || f.kind == "verdict_right")
+    {
         return row.llm_option.and_then(|o| usize::try_from(o).ok());
     }
     // A label the user added that is on the menu is the right answer.
@@ -104,8 +107,11 @@ pub fn export(
         .collect();
     let feedback = db.with_verdicts(|repo| repo.feedback_for_steps())?;
     let mut by_step: HashMap<i64, Vec<&Feedback>> = HashMap::new();
+    let mut by_verdict: HashMap<i64, Vec<&Feedback>> = HashMap::new();
     for f in &feedback {
-        if let Some(step) = f.step_id {
+        if let Some(verdict) = f.verdict_id {
+            by_verdict.entry(verdict).or_default().push(f);
+        } else if let Some(step) = f.step_id {
             by_step.entry(step).or_default().push(f);
         }
     }
@@ -146,9 +152,13 @@ pub fn export(
             .as_deref()
             .and_then(|o| serde_json::from_str(o).ok())
             .unwrap_or_default();
-        let empty = Vec::new();
-        let feedback = by_step.get(&row.step_id).unwrap_or(&empty);
-        let user = user_option(&row, &meanings, feedback, &label_names);
+        // Feedback about this row alone decides this row; step-level feedback
+        // still speaks for every row the step fanned out to.
+        let mut feedback = by_step.get(&row.step_id).cloned().unwrap_or_default();
+        if let Some(specific) = by_verdict.get(&row.id) {
+            feedback.extend(specific.iter().copied());
+        }
+        let user = user_option(&row, &meanings, &feedback, &label_names);
         let (option, source) = match (user, row.llm_option) {
             (Some(option), _) => (option, "user"),
             (None, Some(option)) => (usize::try_from(option).unwrap_or(usize::MAX), "llm"),

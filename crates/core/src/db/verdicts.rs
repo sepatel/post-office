@@ -42,6 +42,10 @@ pub struct NewVerdict<'a> {
     pub probabilities_json: Option<String>,
     pub verdict_matched: Option<bool>,
     pub verdict_choice: Option<&'a str>,
+    /// The menu entry a multiple-match question asked about, named whether or
+    /// not rverdict matched it. Null for other framings and for rows recorded
+    /// before the column existed.
+    pub target: Option<&'a str>,
     pub confidence: Option<f64>,
     pub llm_matched: Option<bool>,
     pub llm_choices_json: Option<String>,
@@ -76,6 +80,7 @@ pub struct VerdictRow {
     pub probabilities_json: Option<String>,
     pub verdict_matched: Option<bool>,
     pub verdict_choice: Option<String>,
+    pub target: Option<String>,
     pub confidence: Option<f64>,
     pub llm_matched: Option<bool>,
     pub llm_choices_json: Option<String>,
@@ -101,6 +106,7 @@ pub struct AppliedPlan {
 #[derive(Debug, Clone, Serialize)]
 pub struct Feedback {
     pub step_id: Option<i64>,
+    pub verdict_id: Option<i64>,
     pub kind: String,
     pub label_id: String,
     pub created_at: String,
@@ -110,8 +116,8 @@ const VERDICT_COLUMNS: &str =
     "v.id, v.step_id, v.run_id, v.account_email, v.rule_index, v.rule_legacy_id,
     v.rule_name, v.framing, v.model, v.backend, v.precision, v.status, v.detail, v.options_json,
     v.kind_json, v.logits_json, v.probabilities_json, v.verdict_matched, v.verdict_choice,
-    v.confidence, v.llm_matched, v.llm_choices_json, v.llm_option, v.agrees, v.state_tokens,
-    v.truncated, v.duration_ms, v.created_at";
+    v.target, v.confidence, v.llm_matched, v.llm_choices_json, v.llm_option, v.agrees,
+    v.state_tokens, v.truncated, v.duration_ms, v.created_at";
 
 fn verdict_row(row: &rusqlite::Row<'_>) -> Result<VerdictRow> {
     Ok(VerdictRow {
@@ -134,15 +140,16 @@ fn verdict_row(row: &rusqlite::Row<'_>) -> Result<VerdictRow> {
         probabilities_json: row.get(16)?,
         verdict_matched: row.get(17)?,
         verdict_choice: row.get(18)?,
-        confidence: row.get(19)?,
-        llm_matched: row.get(20)?,
-        llm_choices_json: row.get(21)?,
-        llm_option: row.get(22)?,
-        agrees: row.get(23)?,
-        state_tokens: row.get(24)?,
-        truncated: row.get(25)?,
-        duration_ms: row.get(26)?,
-        created_at: row.get(27)?,
+        target: row.get(19)?,
+        confidence: row.get(20)?,
+        llm_matched: row.get(21)?,
+        llm_choices_json: row.get(22)?,
+        llm_option: row.get(23)?,
+        agrees: row.get(24)?,
+        state_tokens: row.get(25)?,
+        truncated: row.get(26)?,
+        duration_ms: row.get(27)?,
+        created_at: row.get(28)?,
     })
 }
 
@@ -207,11 +214,11 @@ impl<'a> VerdictRepository<'a> {
             "INSERT OR REPLACE INTO workflow_verdicts (
                  step_id, run_id, account_email, rule_index, rule_legacy_id, rule_name, framing,
                  model, backend, precision, status, detail, question_json, options_json, kind_json,
-                 logits_json, probabilities_json, verdict_matched, verdict_choice, confidence,
-                 llm_matched, llm_choices_json, llm_option, agrees, state_tokens, truncated,
-                 duration_ms)
+                 logits_json, probabilities_json, verdict_matched, verdict_choice, target,
+                 confidence, llm_matched, llm_choices_json, llm_option, agrees, state_tokens,
+                 truncated, duration_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             params![
                 v.step_id,
                 v.run_id,
@@ -232,6 +239,7 @@ impl<'a> VerdictRepository<'a> {
                 v.probabilities_json,
                 v.verdict_matched,
                 v.verdict_choice,
+                v.target,
                 v.confidence,
                 v.llm_matched,
                 v.llm_choices_json,
@@ -342,7 +350,9 @@ impl<'a> VerdictRepository<'a> {
     pub fn set_rating(&self, step_id: i64, up: Option<bool>) -> Result<()> {
         let explicit = format!("explicit:{step_id}");
         self.conn.execute(
-            "DELETE FROM workflow_feedback WHERE step_id = ?1 AND kind IN ('thumbs_up', 'thumbs_down')",
+            "DELETE FROM workflow_feedback
+             WHERE step_id = ?1 AND verdict_id IS NULL
+               AND kind IN ('thumbs_up', 'thumbs_down')",
             params![step_id],
         )?;
         let Some(up) = up else {
@@ -364,14 +374,16 @@ impl<'a> VerdictRepository<'a> {
 
     pub fn feedback_for_steps(&self) -> Result<Vec<Feedback>> {
         let mut statement = self.conn.prepare(
-            "SELECT step_id, kind, label_id, created_at FROM workflow_feedback ORDER BY id",
+            "SELECT step_id, verdict_id, kind, label_id, created_at
+             FROM workflow_feedback ORDER BY id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(Feedback {
                 step_id: row.get(0)?,
-                kind: row.get(1)?,
-                label_id: row.get(2)?,
-                created_at: row.get(3)?,
+                verdict_id: row.get(1)?,
+                kind: row.get(2)?,
+                label_id: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         rows.collect()
@@ -379,17 +391,46 @@ impl<'a> VerdictRepository<'a> {
 
     pub fn feedback_for_message(&self, message_id: i64) -> Result<Vec<Feedback>> {
         let mut statement = self.conn.prepare(
-            "SELECT step_id, kind, label_id, created_at FROM workflow_feedback
+            "SELECT step_id, verdict_id, kind, label_id, created_at FROM workflow_feedback
              WHERE message_id = ?1 ORDER BY id",
         )?;
         let rows = statement.query_map(params![message_id], |row| {
             Ok(Feedback {
                 step_id: row.get(0)?,
-                kind: row.get(1)?,
-                label_id: row.get(2)?,
-                created_at: row.get(3)?,
+                verdict_id: row.get(1)?,
+                kind: row.get(2)?,
+                label_id: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// Sets or clears the user's thumbs on one verdict row, so being wrong
+    /// about one label does not mark the step's other labels wrong too.
+    pub fn set_verdict_rating(&self, verdict_id: i64, up: Option<bool>) -> Result<()> {
+        let explicit = format!("explicit:verdict:{verdict_id}");
+        self.conn.execute(
+            "DELETE FROM workflow_feedback
+             WHERE verdict_id = ?1 AND kind IN ('verdict_right', 'verdict_wrong')",
+            params![verdict_id],
+        )?;
+        let Some(up) = up else {
+            return Ok(());
+        };
+        self.conn.execute(
+            "INSERT INTO workflow_feedback
+                 (account_email, message_id, run_id, step_id, rule_index, verdict_id, kind,
+                  gmail_history_id)
+             SELECT r.account_email, r.message_id, v.run_id, v.step_id, v.rule_index, v.id, ?2, ?3
+             FROM workflow_verdicts v JOIN workflow_runs r ON r.id = v.run_id
+             WHERE v.id = ?1",
+            params![
+                verdict_id,
+                if up { "verdict_right" } else { "verdict_wrong" },
+                explicit
+            ],
+        )?;
+        Ok(())
     }
 }

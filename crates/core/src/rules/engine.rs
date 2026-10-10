@@ -300,9 +300,16 @@ pub async fn dry_run_pipeline(
             rule_id: rule.id,
             rule_name: rule.name.clone(),
             priority: rule.priority,
-            decision_estimate: decision_estimate(llm, rule, view, memories, labels, &label_contexts)
-                .ok()
-                .flatten(),
+            decision_estimate: decision_estimate(
+                llm,
+                rule,
+                view,
+                memories,
+                labels,
+                &label_contexts,
+            )
+            .ok()
+            .flatten(),
             step: None,
         });
         let resolved = match resolve_rule(llm, rule, view, memories, labels, &label_contexts).await
@@ -667,25 +674,49 @@ pub(crate) fn parse_row(line: &str, menu: &[Choice]) -> Result<Row, RowError> {
         .collect();
     let &head = fields.first().ok_or(RowError::NotADecision)?;
     // Everything that is not the decision or a selection is the explanation.
-    let reason = join_reason(fields.iter().enumerate().filter_map(|(index, field)| {
-        (index > 0 && selection_tag(field).is_none()).then_some(*field)
-    }));
+    // `skip` is the field the selection was read from, so a choice named in
+    // its own field is not repeated as the reason.
+    let reason_of = |skip: Option<usize>| {
+        join_reason(fields.iter().enumerate().filter_map(|(index, field)| {
+            (index > 0 && Some(index) != skip && selection_tag(field).is_none()).then_some(*field)
+        }))
+    };
 
     // The decline is read off the head before anything else, or a trailing
     // `LABELS: none` would turn "no match" into a match with no labels.
     let verdict = keyword(head);
     if let Some((Verdict::Decline, _)) = verdict {
-        return Ok(Row::declined(&text, reason));
+        return Ok(Row::declined(&text, reason_of(None)));
     }
 
     // A self-describing selection field outranks position, so `MATCH | CHOOSE:
     // Bills | why` and a bare `"Bills" | why` both land on the same selection.
-    let tagged = fields.iter().find_map(|field| selection_tag(field));
-    let declared_match = tagged.is_some() || verdict.is_some();
-    let selection = tagged.unwrap_or(match verdict {
-        Some((_, rest)) => rest,
-        None => head,
-    });
+    // A bare `MATCH` is a keyword rather than a choice, so the selection is the
+    // field after it: `MATCH | Bills, Work | why` keeps both labels instead of
+    // matching with none.
+    let selected: Option<(usize, &str)> = match fields
+        .iter()
+        .enumerate()
+        .find_map(|(index, field)| Some((index, selection_tag(field)?)))
+    {
+        Some(tagged) => Some(tagged),
+        None => match verdict {
+            Some((Verdict::Match, rest)) if !rest.is_empty() => Some((0, rest)),
+            // Nothing to resolve a name against without a menu, so a menuless
+            // rule reads the rest as prose and applies its own actions.
+            Some((Verdict::Match, _)) if !menu.is_empty() => fields.get(1).map(|field| (1, *field)),
+            _ => None,
+        },
+    };
+    let declared_match = selected.is_some() || verdict.is_some();
+    let reason = reason_of(selected.map(|(index, _)| index));
+    let selection = selected.map_or_else(
+        || match verdict {
+            Some((_, rest)) => rest,
+            None => head,
+        },
+        |(_, selection)| selection,
+    );
 
     // `none` is a deliberately empty answer only when no choice goes by that
     // name.
@@ -1141,11 +1172,38 @@ mod tests {
     fn a_match_that_skips_the_menu_is_flagged() {
         let row = parse_row("MATCH | The email discusses college visits.", &menu()).unwrap();
         assert!(row.chosen.is_empty());
-        assert!(row.note.unwrap().contains("without choosing"));
+        assert!(row.note.unwrap().contains("not on the menu"));
 
         // With no menu on offer there is nothing to report.
         let row = parse_row("MATCH | The email discusses college visits.", &[]).unwrap();
         assert!(row.note.is_none());
+
+        // Nothing at all after the keyword is still an empty match, not a
+        // reason to read a later field as a choice.
+        let row = parse_row("MATCH", &menu()).unwrap();
+        assert!(row.chosen.is_empty());
+        assert!(row.note.unwrap().contains("without choosing"));
+    }
+
+    /// The prompt offers `MATCH` as a legal start for the line, so a model
+    /// that writes it and then lists its labels must not lose them.
+    #[test]
+    fn a_match_keyword_does_not_swallow_a_comma_separated_selection() {
+        let menu = vec![
+            Choice::label("Label_1", "Bills"),
+            Choice::label("Label_2", "Work"),
+        ];
+
+        assert_eq!(
+            chosen("MATCH | Bills, Work | both apply", &menu),
+            vec![
+                ParsedAction::Label("Label_1".into()),
+                ParsedAction::Label("Label_2".into())
+            ]
+        );
+        // The selection is not repeated as the reason.
+        let row = parse_row("MATCH | Bills, Work | both apply", &menu).unwrap();
+        assert_eq!(row.reason, "both apply");
     }
 
     /// A rule prompt authored against its own vocabulary ("reply with only
