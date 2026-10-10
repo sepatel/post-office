@@ -10,6 +10,7 @@ import {
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import { useGate } from "../lib/gate";
+import LabelChips from "../components/LabelChips";
 import LoadError from "../components/LoadError";
 
 const states: Array<{ id: WorkflowRunState; label: string }> = [
@@ -27,23 +28,6 @@ function count(summary: WorkflowQueueSummary | null, state: string): number {
 
 function stateLabel(state: string): string {
   return states.find((entry) => entry.id === state)?.label ?? state.replace(/_/g, " ");
-}
-
-function stateTone(state: string): string {
-  switch (state) {
-    case "needs_attention":
-      return "border-red-200 bg-red-50 text-red-700 dark:border-red-900/70 dark:bg-red-950/40 dark:text-red-200";
-    case "processing":
-      return "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/70 dark:bg-blue-950/40 dark:text-blue-200";
-    case "retry_wait":
-      return "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/70 dark:bg-amber-950/40 dark:text-amber-200";
-    case "queued":
-      return "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200";
-    case "resolved_externally":
-      return "border-violet-200 bg-violet-50 text-violet-700 dark:border-violet-900/70 dark:bg-violet-950/40 dark:text-violet-200";
-    default:
-      return "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-950/40 dark:text-emerald-200";
-  }
 }
 
 export default function Queue() {
@@ -183,18 +167,13 @@ export default function Queue() {
             </div>
           )}
           {items.map((item) => (
-            <article key={item.run_id} className="flex flex-wrap items-center gap-x-4 gap-y-3 px-5 py-4">
+            <article key={item.run_id} className="group relative flex flex-wrap items-center gap-x-4 gap-y-3 px-5 py-4 hover:bg-gray-50 dark:hover:bg-gray-700/30">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <Link
-                    to={`/messages/${item.message_id}`}
-                    className="font-medium text-gray-900 hover:text-blue-700 dark:text-gray-100 dark:hover:text-blue-300"
-                  >
+                  <span className="font-medium text-gray-900 group-hover:text-blue-700 dark:text-gray-100 dark:group-hover:text-blue-300">
                     {item.subject || "Untitled message"}
-                  </Link>
-                  <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${stateTone(item.state)}`}>
-                    {stateLabel(item.state)}
                   </span>
+                  <LabelChips applied={item.applied_labels} inherited={item.inherited_labels} />
                 </div>
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-gray-400">
                   <span>{item.sender || "Unknown sender"}</span>
@@ -210,11 +189,6 @@ export default function Queue() {
                     {(item.state === "needs_attention" || item.state === "retry_wait") ? item.last_error : item.preview}
                   </p>
                 )}
-                {(item.state === "completed" || item.state === "resolved_externally") && item.labels.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {item.labels.map((label) => <span key={label} className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200">{label}</span>)}
-                  </div>
-                )}
               </div>
               <div className="flex items-center gap-2 self-start sm:self-center">
                 {item.state === "retry_wait" && (
@@ -227,18 +201,17 @@ export default function Queue() {
                     type="button"
                     onClick={() => void retry(item)}
                     disabled={retrying === item.run_id}
-                    className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                    className="relative z-10 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
                   >
                     {retrying === item.run_id ? "Queuing…" : "Retry with latest rules"}
                   </button>
                 )}
-                <Link
-                  to={`/messages/${item.message_id}`}
-                  className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
-                >
-                  Inspect
-                </Link>
               </div>
+              <Link
+                to={`/messages/${item.message_id}`}
+                aria-label={`Inspect ${item.subject || "message"}`}
+                className="absolute inset-0 rounded-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
+              />
             </article>
           ))}
         </div>

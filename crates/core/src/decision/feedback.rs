@@ -2,7 +2,7 @@
 //! actions, read from the same history pages ingestion already fetches.
 
 use crate::db::Database;
-use crate::gmail::models::HistoryRecord;
+use crate::gmail::models::{is_user_label_id, HistoryRecord};
 
 /// One message's label changes in one history record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,10 +31,6 @@ pub fn collect(record: &HistoryRecord, events: &mut Vec<LabelEvent>) {
     }
 }
 
-fn is_user_label(id: &str) -> bool {
-    id.starts_with("Label_")
-}
-
 /// What a label change says about a decision that planned `planned_add` and
 /// `planned_remove`, if anything.
 fn classify(
@@ -47,7 +43,7 @@ fn classify(
         if planned_remove.iter().any(|l| l == label) {
             return (label == "INBOX").then_some("unarchived");
         }
-        return (is_user_label(label) && !planned_add.iter().any(|l| l == label))
+        return (is_user_label_id(label) && !planned_add.iter().any(|l| l == label))
             .then_some("label_added");
     }
     if !planned_add.iter().any(|l| l == label) {
@@ -57,7 +53,7 @@ fn classify(
         "TRASH" => Some("restored_from_trash"),
         "SPAM" => Some("restored_from_spam"),
         "STARRED" => Some("unstarred"),
-        l if is_user_label(l) => Some("label_removed"),
+        l if is_user_label_id(l) => Some("label_removed"),
         _ => None,
     }
 }
