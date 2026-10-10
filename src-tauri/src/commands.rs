@@ -1397,28 +1397,25 @@ pub async fn history_list(
 }
 
 #[tauri::command]
-pub async fn rules_metrics(
-    state: State<'_, AppState>,
-) -> Result<Vec<post_office_core::db::history::RuleMetrics>, String> {
-    let account_email = active_account(&*state.config.lock().await)?;
-    state
-        .db
-        .with_history(|repo| repo.rules_metrics(&account_email))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub async fn rule_activity(
     state: State<'_, AppState>,
     rule_id: i64,
+    outcome: Option<String>,
+    since: Option<String>,
     page: u32,
     per_page: u32,
-) -> Result<Vec<post_office_core::db::history::HistoryEntry>, String> {
+) -> Result<post_office_core::workflow::RuleActivityPage, String> {
     let account_email = active_account(&*state.config.lock().await)?;
-    state
-        .db
-        .with_history(|repo| repo.by_rule(&account_email, rule_id, page, per_page))
-        .map_err(|e| e.to_string())
+    post_office_core::workflow::rule_activity(
+        &state.db,
+        &account_email,
+        rule_id,
+        outcome.as_deref(),
+        since.as_deref(),
+        page,
+        per_page,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1431,51 +1428,6 @@ pub async fn history_search(
         .db
         .with_history(|repo| repo.search(&account_email, &query))
         .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn inference_jobs_list(
-    state: State<'_, AppState>,
-    page: u32,
-    per_page: u32,
-) -> Result<Vec<post_office_core::db::inference::InferenceJob>, String> {
-    let account_email = active_account(&*state.config.lock().await)?;
-    state
-        .db
-        .with_inference(|repo| repo.list(&account_email, page, per_page))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn rule_inference_jobs(
-    state: State<'_, AppState>,
-    rule_id: i64,
-    page: u32,
-    per_page: u32,
-) -> Result<Vec<post_office_core::db::inference::InferenceJob>, String> {
-    let account_email = active_account(&*state.config.lock().await)?;
-    state
-        .db
-        .with_inference(|repo| repo.list_for_rule(&account_email, rule_id, page, per_page))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn inference_job_attempts(
-    state: State<'_, AppState>,
-    job_id: i64,
-) -> Result<Vec<post_office_core::db::inference::InferenceAttempt>, String> {
-    let account_email = active_account(&*state.config.lock().await)?;
-    state
-        .db
-        .with_inference(|repo| repo.attempts(&account_email, job_id))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn inference_job_retry(state: State<'_, AppState>, job_id: i64) -> Result<bool, String> {
-    let _ = (state, job_id);
-    Err("Legacy inference jobs cannot be retried by the message workflow.".into())
 }
 
 #[tauri::command]

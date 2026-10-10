@@ -1,7 +1,16 @@
-use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result, Transaction};
 use serde::Serialize;
 
 pub const MAX_ATTEMPTS: i64 = 3;
+
+/// The columns `map_workflow_run` reads, in order. Every query that builds a
+/// [`WorkflowRun`] selects exactly this list.
+const RUN_COLUMNS: &str = "r.id, m.id, m.gmail_message_id, m.gmail_thread_id, m.message_json,
+     m.labels_json, r.state, r.next_rule_index, r.attempt_count,
+     r.next_attempt_at, r.last_error, r.created_at, r.updated_at,
+     r.completed_at, rs.version, rs.rules_json, r.route_provider_id,
+     r.route_endpoint, r.route_model";
 
 pub struct WorkflowRepository<'a> {
     conn: &'a Connection,
@@ -820,15 +829,13 @@ impl<'a> WorkflowRepository<'a> {
         per_page: u32,
     ) -> Result<Vec<WorkflowRun>> {
         let offset = page.saturating_mul(per_page);
-        let query = "SELECT r.id, m.id, m.gmail_message_id, m.gmail_thread_id, m.message_json,
-                             m.labels_json, r.state, r.next_rule_index, r.attempt_count,
-                             r.next_attempt_at, r.last_error, r.created_at, r.updated_at,
-                             r.completed_at, s.version, s.rules_json, r.route_provider_id,
-                             r.route_endpoint, r.route_model
-                     FROM workflow_runs r
-                     JOIN workflow_messages m ON m.id = r.message_id
-                     JOIN workflow_rule_sets s ON s.id = r.rule_set_id
-                     WHERE r.account_email = ?1";
+        let query = format!(
+            "SELECT {RUN_COLUMNS}
+             FROM workflow_runs r
+             JOIN workflow_messages m ON m.id = r.message_id
+             JOIN workflow_rule_sets rs ON rs.id = r.rule_set_id
+             WHERE r.account_email = ?1"
+        );
         let order = " ORDER BY CASE r.state
                          WHEN 'needs_attention' THEN 0
                          WHEN 'processing' THEN 1
@@ -863,19 +870,87 @@ impl<'a> WorkflowRepository<'a> {
     ) -> Result<Option<WorkflowRun>> {
         self.conn
             .query_row(
-                "SELECT r.id, m.id, m.gmail_message_id, m.gmail_thread_id, m.message_json,
-                         m.labels_json, r.state, r.next_rule_index, r.attempt_count,
-                         r.next_attempt_at, r.last_error, r.created_at, r.updated_at,
-                         r.completed_at, s.version, s.rules_json, r.route_provider_id,
-                         r.route_endpoint, r.route_model
-                 FROM workflow_runs r
-                 JOIN workflow_messages m ON m.id = r.message_id
-                 JOIN workflow_rule_sets s ON s.id = r.rule_set_id
-                 WHERE r.account_email = ?1 AND m.id = ?2",
+                &format!(
+                    "SELECT {RUN_COLUMNS}
+                     FROM workflow_runs r
+                     JOIN workflow_messages m ON m.id = r.message_id
+                     JOIN workflow_rule_sets rs ON rs.id = r.rule_set_id
+                     WHERE r.account_email = ?1 AND m.id = ?2"
+                ),
                 params![account_email, message_id],
                 map_workflow_run,
             )
             .optional()
+    }
+
+    /// Every message run that evaluated `rule_id`, newest first. One row per
+    /// step, so a rule retried within the same run appears more than once.
+    pub fn rule_activity(
+        &self,
+        account_email: &str,
+        rule_id: i64,
+        outcome: Option<&str>,
+        since: Option<&str>,
+        page: u32,
+        per_page: u32,
+    ) -> Result<Vec<RuleActivityRun>> {
+        let (filter, mut values) = rule_activity_filter(account_email, rule_id, outcome, since);
+        values.push(Value::Integer(per_page.into()));
+        values.push(Value::Integer(page.saturating_mul(per_page).into()));
+        let limit = values.len() - 1;
+        let offset = values.len();
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS},
+                    st.id, st.rule_index, st.rule_legacy_id, st.rule_name, st.outcome,
+                    st.decision_json, st.error, st.created_at
+             {ACTIVITY_STEPS}
+             JOIN workflow_messages m ON m.id = r.message_id
+             JOIN workflow_rule_sets rs ON rs.id = r.rule_set_id
+             {filter}
+             ORDER BY st.created_at DESC, st.id DESC LIMIT ?{limit} OFFSET ?{offset}"
+        ))?;
+        let rows = statement.query_map(params_from_iter(values.iter()), map_rule_activity_run)?;
+        rows.collect()
+    }
+
+    /// Total step count for the same filter, for paging.
+    pub fn rule_activity_count(
+        &self,
+        account_email: &str,
+        rule_id: i64,
+        outcome: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<i64> {
+        let (filter, values) = rule_activity_filter(account_email, rule_id, outcome, since);
+        self.conn
+            .query_row(
+                &format!("SELECT COUNT(*) {ACTIVITY_STEPS} {filter}"),
+                params_from_iter(values.iter()),
+                |row| {
+                    row.get(0)
+                },
+            )
+    }
+
+    /// Per-outcome counts for one rule inside the window, so the UI can show
+    /// what a rule did rather than only what the user asked to see.
+    pub fn rule_activity_totals(
+        &self,
+        account_email: &str,
+        rule_id: i64,
+        since: Option<&str>,
+    ) -> Result<Vec<RuleOutcomeCount>> {
+        let (filter, values) = rule_activity_filter(account_email, rule_id, None, since);
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT st.outcome, COUNT(*) {ACTIVITY_STEPS} {filter}\n             GROUP BY st.outcome ORDER BY 2 DESC"
+        ))?;
+        let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+            Ok(RuleOutcomeCount {
+                outcome: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })?;
+        rows.collect()
     }
 
     pub fn state_counts(&self, account_email: &str) -> Result<Vec<WorkflowStateCount>> {
@@ -1161,6 +1236,19 @@ pub struct WorkflowStateCount {
     pub count: i64,
 }
 
+/// One step of one rule, paired with the run that produced it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleActivityRun {
+    pub run: WorkflowRun,
+    pub step: WorkflowStep,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleOutcomeCount {
+    pub outcome: String,
+    pub count: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowMailbox {
     pub account_email: String,
@@ -1361,6 +1449,53 @@ fn map_workflow_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRun> {
     })
 }
 
+/// Reads the shared [`RUN_COLUMNS`] block, then the step columns that follow it.
+fn map_rule_activity_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuleActivityRun> {
+    Ok(RuleActivityRun {
+        run: map_workflow_run(row)?,
+        step: WorkflowStep {
+            id: row.get(19)?,
+            rule_index: row.get(20)?,
+            rule_legacy_id: row.get(21)?,
+            rule_name: row.get(22)?,
+            outcome: row.get(23)?,
+            decision: row.get(24)?,
+            error: row.get(25)?,
+            created_at: row.get(26)?,
+        },
+    })
+}
+
+/// The `WHERE` half of the rule-scoped activity views. Callers supply the
+/// tables they need, since only the full listing joins the message and ruleset.
+/// `since` is a SQLite datetime modifier (`-1 day`), which keeps the window
+/// definition in one place.
+fn rule_activity_filter(
+    account_email: &str,
+    rule_id: i64,
+    outcome: Option<&str>,
+    since: Option<&str>,
+) -> (String, Vec<Value>) {
+    let mut sql = String::from("WHERE r.account_email = ?1 AND st.rule_legacy_id = ?2");
+    let mut values = vec![Value::Text(account_email.to_owned()), Value::Integer(rule_id)];
+    if let Some(outcome) = outcome {
+        values.push(Value::Text(outcome.to_owned()));
+        sql.push_str(&format!(" AND st.outcome = ?{}", values.len()));
+    }
+    if let Some(since) = since {
+        values.push(Value::Text(since.to_owned()));
+        sql.push_str(&format!(
+            " AND st.created_at >= datetime('now', ?{})",
+            values.len()
+        ));
+    }
+    (sql, values)
+}
+
+/// Steps joined to the run that wrote them, for the activity views.
+const ACTIVITY_STEPS: &str =
+    "FROM workflow_steps st JOIN workflow_runs r ON r.id = st.run_id";
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1414,6 +1549,80 @@ mod tests {
             assert_eq!(usage.by_model_7d[0].totals.total_tokens, 360);
             assert_eq!(usage.by_model_7d[1].provider.as_deref(), Some("Local"));
             assert_eq!(repo.token_usage("other@example.com")?.all_time.requests, 0);
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn rule_activity_filters_by_rule_outcome_and_window() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        db.with_workflow(|repo| {
+            repo.initialize_mailbox("test@example.com", "100")?;
+            repo.activate_rule_set("test@example.com", r#"{"rules":[]}"#)?;
+            repo.enqueue_arrivals(
+                "test@example.com",
+                "101",
+                &["message-1".into(), "message-2".into()],
+            )?;
+
+            let step = |run_id: i64, lease: &str, rule: i64, name: &str, outcome: &str| {
+                repo.record_step_and_advance(run_id, lease, 0, rule, name, outcome, None, None)
+            };
+
+            let first = repo.claim_next("test@example.com", "lease-1")?.unwrap();
+            step(first.id, "lease-1", 7, "Receipts", "matched")?;
+            step(first.id, "lease-1", 9, "Alerts", "no_match")?;
+
+            let second = repo.claim_next("test@example.com", "lease-2")?.unwrap();
+            step(second.id, "lease-2", 7, "Receipts", "condition_skipped")?;
+            step(second.id, "lease-2", 9, "Alerts", "matched")?;
+
+            // Both runs reached rule 7, but only one of them matched it.
+            let all = repo.rule_activity("test@example.com", 7, None, None, 0, 20)?;
+            assert_eq!(all.len(), 2);
+            assert_eq!(
+                all.iter()
+                    .map(|activity| activity.step.outcome.as_str())
+                    .collect::<Vec<_>>(),
+                ["condition_skipped", "matched"]
+            );
+            // The run's own fields ride along, so a row links to its message.
+            assert_eq!(all[0].run.gmail_message_id, second.gmail_message_id);
+
+            let matched = repo.rule_activity("test@example.com", 7, Some("matched"), None, 0, 20)?;
+            assert_eq!(matched.len(), 1);
+            assert_eq!(matched[0].run.gmail_message_id, first.gmail_message_id);
+
+            // A different rule's activity never bleeds in.
+            let other = repo.rule_activity("test@example.com", 9, None, None, 0, 20)?;
+            assert_eq!(other.len(), 2);
+
+            assert_eq!(repo.rule_activity_count("test@example.com", 7, None, None)?, 2);
+            assert_eq!(
+                repo.rule_activity_count("test@example.com", 7, Some("matched"), None)?,
+                1
+            );
+            // The steps are written now, so a bound in the future excludes
+            // them — which a silently ignored `since` would not do.
+            assert!(repo
+                .rule_activity("test@example.com", 7, None, Some("+1 second"), 0, 20)?
+                .is_empty());
+
+            let totals = repo.rule_activity_totals("test@example.com", 7, None)?;
+            assert_eq!(totals.len(), 2);
+            assert_eq!(
+                totals
+                    .iter()
+                    .find(|entry| entry.outcome == "matched")
+                    .map(|entry| entry.count),
+                Some(1)
+            );
+
+            // Paging past the end is empty rather than an error.
+            assert!(repo.rule_activity("test@example.com", 7, None, None, 1, 20)?.is_empty());
+            assert_eq!(repo.rule_activity("other@example.com", 7, None, None, 0, 20)?.len(), 0);
             Ok::<(), rusqlite::Error>(())
         })
         .unwrap();

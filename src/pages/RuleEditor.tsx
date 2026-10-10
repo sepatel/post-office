@@ -25,6 +25,7 @@ import {
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import RuleChatPanel from "../components/RuleChatPanel";
+import RuleActivityPanel from "../components/RuleActivityPanel";
 import RuleLabelOverridesPanel from "../components/RuleLabelOverridesPanel";
 import ConditionBuilder, {
   Condition,
@@ -653,7 +654,8 @@ export default function RuleEditor() {
 
         {isEdit && activeTab === "activity" && (
           <div className="mb-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-100">
-            Saving applies this rule to every unfinished message. Production outcomes belong to each message run in the <Link to="/queue" className="font-semibold underline">Queue</Link>.
+            Every message this rule was asked about. Open one to see its full run
+            timeline in the <Link to="/queue" className="font-semibold underline">Queue</Link>.
           </div>
         )}
 
@@ -1318,13 +1320,7 @@ export default function RuleEditor() {
           </div>
         </div>}
 
-        {activeTab === "activity" && isEdit && (
-          <div className="rounded-2xl border border-gray-200 bg-white p-8 text-center dark:border-gray-700 dark:bg-gray-800">
-            <h3 className="text-lg font-semibold">Execution lives with each message</h3>
-            <p className="mx-auto mt-2 max-w-md text-sm text-gray-500 dark:text-gray-400">Inspect a queued message to see the ruleset snapshot, decisions, actions, and retries that produced its outcome.</p>
-            <Link to="/queue" className="mt-5 inline-flex rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Open Queue</Link>
-          </div>
-        )}
+        {activeTab === "activity" && isEdit && <RuleActivityPanel ruleId={ruleId} />}
 
         {activeTab === "learn" && (
           isEdit ? <div className="h-[38rem]"><RuleChatPanel ruleId={ruleId} ruleName={name || "Untitled rule"} onApplyProposal={applyChatProposalToDraft} /></div> : <div className="rounded-2xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400">Save the rule before tuning it with chat.</div>

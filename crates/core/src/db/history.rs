@@ -136,97 +136,12 @@ impl<'a> HistoryRepository<'a> {
         Ok(entries)
     }
 
-    pub fn by_rule(
-        &self,
-        account_email: &str,
-        rule_id: i64,
-        page: u32,
-        per_page: u32,
-    ) -> Result<Vec<HistoryEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT h.id, h.email_id, h.email_from, h.email_subject, h.rule_id, h.rule_name, h.action, h.status,
-                    h.llm_model, h.llm_response, h.error, h.duration_ms, h.created_at,
-                    m.email_sent_at, im.provider_id, im.policy_id
-             FROM history h
-              LEFT JOIN history_email_meta m ON m.account_email = h.account_email AND m.email_id = h.email_id
-              LEFT JOIN history_inference_meta im ON im.history_id = h.id
-             WHERE h.account_email = ?1 AND h.rule_id = ?2
-             ORDER BY h.created_at DESC
-             LIMIT ?3 OFFSET ?4",
-        )?;
-        let entries = stmt
-            .query_map(
-                params![
-                    account_email,
-                    rule_id,
-                    per_page,
-                    page.saturating_mul(per_page)
-                ],
-                |row| {
-                    Ok(HistoryEntry {
-                        id: row.get(0)?,
-                        email_id: row.get(1)?,
-                        email_from: row.get(2)?,
-                        email_subject: row.get(3)?,
-                        rule_id: row.get(4)?,
-                        rule_name: row.get(5)?,
-                        action: row.get(6)?,
-                        status: row.get(7)?,
-                        llm_model: row.get(8)?,
-                        llm_response: row.get(9)?,
-                        error: row.get(10)?,
-                        duration_ms: row.get(11)?,
-                        created_at: row.get(12)?,
-                        email_sent_at: row.get(13)?,
-                        llm_provider: row.get(14)?,
-                        policy_id: row.get(15)?,
-                    })
-                },
-            )?
-            .collect();
-        entries
-    }
-
     pub fn latest_created_at(&self, account_email: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
             .prepare("SELECT created_at FROM history WHERE account_email = ?1 ORDER BY created_at DESC LIMIT 1")?;
         let mut rows = stmt.query_map(params![account_email], |row| row.get::<_, String>(0))?;
         rows.next().transpose()
-    }
-
-    pub fn rules_metrics(&self, account_email: &str) -> Result<Vec<RuleMetrics>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                rule_id,
-                SUM(CASE WHEN created_at >= datetime('now', '-24 hours') THEN 1 ELSE 0 END) AS checked_24h,
-                SUM(CASE WHEN created_at >= datetime('now', '-24 hours') AND status = 'success' THEN 1 ELSE 0 END) AS succeeded_24h,
-                SUM(CASE WHEN created_at >= datetime('now', '-24 hours') AND (action = 'RESOLVE_RULE' OR COALESCE(TRIM(llm_response), '') <> '') THEN 1 ELSE 0 END) AS llm_calls_24h,
-                COUNT(*) AS checked_7d,
-                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS succeeded_7d,
-                SUM(CASE WHEN action = 'RESOLVE_RULE' OR COALESCE(TRIM(llm_response), '') <> '' THEN 1 ELSE 0 END) AS llm_calls_7d
-             FROM history
-              WHERE account_email = ?1
-                AND rule_id IS NOT NULL
-                AND created_at >= datetime('now', '-7 days')
-             GROUP BY rule_id",
-        )?;
-
-        let entries = stmt
-            .query_map(params![account_email], |row| {
-                Ok(RuleMetrics {
-                    rule_id: row.get(0)?,
-                    checked_24h: row.get(1)?,
-                    succeeded_24h: row.get(2)?,
-                    llm_calls_24h: row.get(3)?,
-                    checked_7d: row.get(4)?,
-                    succeeded_7d: row.get(5)?,
-                    llm_calls_7d: row.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(entries)
     }
 
     pub fn search(&self, account_email: &str, query: &str) -> Result<Vec<HistoryEntry>> {
@@ -304,17 +219,6 @@ pub struct HistoryEntry {
     pub email_sent_at: Option<String>,
     pub llm_provider: Option<String>,
     pub policy_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct RuleMetrics {
-    pub rule_id: i64,
-    pub checked_24h: i64,
-    pub succeeded_24h: i64,
-    pub llm_calls_24h: i64,
-    pub checked_7d: i64,
-    pub succeeded_7d: i64,
-    pub llm_calls_7d: i64,
 }
 
 #[cfg(test)]
