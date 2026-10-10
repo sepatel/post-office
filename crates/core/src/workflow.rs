@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 use crate::db::workflow::{
-    ActionPlan, ClaimedRun, NewLlmAttempt, TokenUsage, WorkflowActionPlan, WorkflowEvent,
-    WorkflowLlmAttempt, WorkflowMailbox, WorkflowRun, WorkflowStateCount, WorkflowStep,
-    WorkflowTokenUsage, MAX_ATTEMPTS,
+    ActionPlan, ClaimedRun, NewLlmAttempt, RuleOutcomeCount, TokenUsage, WorkflowActionPlan,
+    WorkflowEvent, WorkflowLlmAttempt, WorkflowMailbox, WorkflowRun, WorkflowStateCount,
+    WorkflowStep, WorkflowTokenUsage, MAX_ATTEMPTS,
 };
 use crate::db::Database;
 use crate::gmail::models::{HistoryRecord, Message};
@@ -112,6 +112,73 @@ pub struct WorkflowRetrySummary {
     pub automatic_retry_scheduled_count: usize,
     pub manual_retry_requested_count: usize,
     pub historical_retry_policy: bool,
+}
+
+/// One message run as it passed through one rule. Flattens the run so the row
+/// carries the same message fields the Queue shows, with the step's outcome
+/// alongside them.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleActivity {
+    #[serde(flatten)]
+    pub message: QueueItem,
+    pub outcome: String,
+    pub decision: Option<String>,
+    pub error: Option<String>,
+    pub step_created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleActivityPage {
+    pub items: Vec<RuleActivity>,
+    /// Steps matching the caller's outcome and window filter, for paging.
+    pub total: i64,
+    /// Per-outcome counts for the window, which stay put while the user
+    /// narrows to one outcome.
+    pub totals: Vec<RuleOutcomeCount>,
+    /// Steps for this rule with no window or outcome filter at all, so a
+    /// narrow view can still say the rule has history further back.
+    pub all_time_total: i64,
+}
+
+/// Every message run that evaluated one rule, with per-outcome counts for the
+/// same window so the caller can show what the rule did before the user filters
+/// down to one outcome.
+pub fn rule_activity(
+    db: &Database,
+    account_email: &str,
+    rule_id: i64,
+    outcome: Option<&str>,
+    since: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<RuleActivityPage, rusqlite::Error> {
+    let labels = label_names(db, account_email);
+    let (runs, total, totals, all_time_total) =
+        db.with_workflow(|repo| -> rusqlite::Result<(Vec<_>, i64, Vec<_>, i64)> {
+            let runs = repo.rule_activity(account_email, rule_id, outcome, since, page, per_page)?;
+            let total = repo.rule_activity_count(account_email, rule_id, outcome, since)?;
+            let totals = repo.rule_activity_totals(account_email, rule_id, since)?;
+            let all_time_total = repo.rule_activity_count(account_email, rule_id, None, None)?;
+            Ok((runs, total, totals, all_time_total))
+        })?;
+    let items = runs
+        .iter()
+        .map(|activity| {
+            Ok(RuleActivity {
+                message: queue_item(&activity.run, &labels)?,
+                outcome: activity.step.outcome.clone(),
+                decision: activity.step.decision.clone(),
+                error: activity.step.error.clone(),
+                step_created_at: activity.step.created_at.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    Ok(RuleActivityPage {
+        items,
+        total,
+        totals,
+        all_time_total,
+    })
 }
 
 pub fn queue_items(
@@ -490,7 +557,7 @@ pub fn publish_rule_set(
     account_email: &str,
     config: &AppConfig,
 ) -> Result<(), rusqlite::Error> {
-    let rules = db.with_rules(|repo| repo.list_all(account_email))?;
+    let rules = db.with_rules(|repo| repo.get_enabled_rules(account_email))?;
     let snapshots = rules
         .into_iter()
         .map(|rule| {
@@ -1310,6 +1377,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::db::rules::{CreateRuleRequest, UpdateRuleRequest};
 
     fn message_with_labels(labels: &[&str]) -> Message {
         Message {
@@ -1353,6 +1421,88 @@ mod tests {
             ),
             Some("Message was moved to Trash outside Post Office")
         );
+    }
+
+    #[test]
+    fn a_disabled_rule_leaves_the_published_ruleset() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        let account = "test@example.com";
+        let config = AppConfig::default();
+
+        let mut request = CreateRuleRequest {
+            name: "Receipts".into(),
+            description: None,
+            conditions: vec![],
+            prompt: "Is this a receipt?".into(),
+            choices: vec![],
+            choose_from_all_labels: false,
+            actions: vec![],
+            priority: 0,
+            enabled: true,
+            inference_policy: String::new(),
+            decision_reasoning_effort: ReasoningEffort::ServerDefault,
+            decision_max_tokens: None,
+            continue_after_match: false,
+            match_mode: crate::rules::models::MatchMode::Single,
+        };
+        db.with_rules(|repo| repo.create(account, &request)).unwrap();
+
+        request.name = "Alerts".into();
+        request.priority = 1;
+        let alerts = db.with_rules(|repo| repo.create(account, &request)).unwrap();
+
+        publish_rule_set(&db, account, &config).unwrap();
+        let names = || -> Vec<String> {
+            db.with_workflow(|repo| repo.active_rule_set(account))
+                .unwrap()
+                .map(|set| {
+                    serde_json::from_str::<RuleSetSnapshot>(&set.rules_json)
+                        .unwrap()
+                        .rules
+                        .into_iter()
+                        .map(|entry| entry.rule.name)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(names(), ["Receipts", "Alerts"]);
+
+        // Turning a rule off must take it out of the chain, not just flag it.
+        request.enabled = false;
+        request.priority = 0;
+        db.with_rules(|repo| {
+            repo.update(
+                account,
+                alerts.id,
+                &UpdateRuleRequest {
+                    name: "Alerts".into(),
+                    description: None,
+                    conditions: vec![],
+                    prompt: request.prompt.clone(),
+                    choices: vec![],
+                    choose_from_all_labels: false,
+                    actions: vec![],
+                    priority: 0,
+                    enabled: false,
+                    inference_policy: String::new(),
+                    decision_reasoning_effort: ReasoningEffort::ServerDefault,
+                    decision_max_tokens: None,
+                    continue_after_match: false,
+                    match_mode: crate::rules::models::MatchMode::Single,
+                },
+            )
+        })
+        .unwrap();
+        publish_rule_set(&db, account, &config).unwrap();
+        assert_eq!(names(), ["Receipts"]);
+
+        // The disabled rule keeps its id, so the activity recorded before it
+        // was switched off still resolves to it.
+        assert!(db
+            .with_rules(|repo| repo.get_by_id(account, alerts.id))
+            .unwrap()
+            .is_some());
     }
 
     fn taxonomy_config() -> AppConfig {

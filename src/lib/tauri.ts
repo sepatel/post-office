@@ -147,20 +147,6 @@ export async function backupImport(payload: string): Promise<BackupImportResult>
   return invoke("backup_import", { payload });
 }
 
-export interface RuleMetrics {
-  rule_id: number;
-  checked_24h: number;
-  succeeded_24h: number;
-  llm_calls_24h: number;
-  checked_7d: number;
-  succeeded_7d: number;
-  llm_calls_7d: number;
-}
-
-export async function ruleMetrics(): Promise<RuleMetrics[]> {
-  return invoke("rules_metrics");
-}
-
 export interface ChatMessage {
   id: number;
   rule_id: number;
@@ -515,60 +501,35 @@ export async function historySearch(query: string) {
   return invoke("history_search", { query });
 }
 
-export interface InferenceJob {
-  id: number;
-  email_id: string;
-  rule_id: number | null;
-  source: string;
-  status: string;
-  attempt_count: number;
-  next_attempt_at: string;
-  lease_until: string | null;
-  last_error: string | null;
-  created_at: string;
-  updated_at: string;
+export interface RuleOutcomeCount {
+  outcome: string;
+  count: number;
 }
 
-export async function inferenceJobsList(
-  page: number,
-  perPage: number,
-): Promise<InferenceJob[]> {
-  return invoke("inference_jobs_list", { page, perPage });
+/// A message run as it passed through one rule. Flattened, so the row carries
+/// the same message fields the Queue shows.
+export interface RuleActivityItem extends WorkflowQueueItem {
+  outcome: string;
+  decision: string | null;
+  error: string | null;
+  step_created_at: string;
+}
+
+export interface RuleActivityPage {
+  items: RuleActivityItem[];
+  total: number;
+  totals: RuleOutcomeCount[];
+  all_time_total: number;
 }
 
 export async function ruleActivity(
   ruleId: number,
+  outcome: string | null,
+  since: string | null,
   page: number,
   perPage: number,
-): Promise<HistoryEntry[]> {
-  return invoke("rule_activity", { ruleId, page, perPage });
-}
-
-export async function ruleInferenceJobs(
-  ruleId: number,
-  page: number,
-  perPage: number,
-): Promise<InferenceJob[]> {
-  return invoke("rule_inference_jobs", { ruleId, page, perPage });
-}
-
-export interface InferenceAttempt {
-  id: number;
-  job_id: number;
-  provider_id: string | null;
-  model: string | null;
-  status: string;
-  error: string | null;
-  duration_ms: number | null;
-  created_at: string;
-}
-
-export async function inferenceJobAttempts(jobId: number): Promise<InferenceAttempt[]> {
-  return invoke("inference_job_attempts", { jobId });
-}
-
-export async function inferenceJobRetry(jobId: number): Promise<boolean> {
-  return invoke("inference_job_retry", { jobId });
+): Promise<RuleActivityPage> {
+  return invoke("rule_activity", { ruleId, outcome, since, page, perPage });
 }
 
 export async function processingStatus() {
