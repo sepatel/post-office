@@ -15,6 +15,7 @@ pub mod labels;
 pub mod llm_endpoint_status;
 pub mod llm_provider_status;
 pub mod rule_chat;
+pub mod rule_label_overrides;
 pub mod rule_memory;
 pub mod rules;
 pub mod sync_state;
@@ -116,7 +117,7 @@ impl Database {
 
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock();
-        snapshot_before(&conn, 28);
+        snapshot_before(&conn, 29);
         let transaction = conn.unchecked_transaction()?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -254,6 +255,12 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (28)", [])?;
         }
+        if !migration_applied(&transaction, 29)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/029_rule_label_overrides.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (29)", [])?;
+        }
         transaction.commit()
     }
 
@@ -368,6 +375,18 @@ impl Database {
     {
         self.with_conn(|conn| {
             f(label_qualifications::LabelQualificationRepository::new(
+                conn,
+            ))
+        })
+    }
+
+    #[track_caller]
+    pub fn with_rule_label_overrides<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(rule_label_overrides::RuleLabelOverrideRepository<'_>) -> R,
+    {
+        self.with_conn(|conn| {
+            f(rule_label_overrides::RuleLabelOverrideRepository::new(
                 conn,
             ))
         })

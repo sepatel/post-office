@@ -11,6 +11,7 @@ import {
   evaluateMessages,
   configGet,
   gmailListLabels,
+  classifiableLabels,
   ruleMemoriesList,
   ruleMemoryDelete,
   type ChatProposal,
@@ -24,7 +25,7 @@ import {
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import RuleChatPanel from "../components/RuleChatPanel";
-import LabelQualificationsPanel from "../components/LabelQualificationsPanel";
+import RuleLabelOverridesPanel from "../components/RuleLabelOverridesPanel";
 import ConditionBuilder, {
   Condition,
   normalizeConditionLabelIds as normalizeConditionLabelIdsRecursive,
@@ -154,27 +155,34 @@ export default function RuleEditor() {
   );
   const hasMenu = chooseFromAllLabels || choices.length > 0;
 
+  const classifiableGmailLabels = useMemo(
+    () => classifiableLabels(gmailLabels),
+    [gmailLabels],
+  );
+
   // The exact trap: a prompt that enumerates outcomes the model is never offered
-  // can only ever produce a match that changes nothing.
+  // can only ever produce a match that changes nothing. Only classifiable
+  // labels are considered — mentioning INBOX or a CATEGORY_* in prose must
+  // not suggest adding it as a choice.
   const promptLabels = useMemo(
     () =>
-      gmailLabels.filter(
+      classifiableGmailLabels.filter(
         (label) => label.name.length > 2 && prompt.includes(label.name)
       ),
-    [prompt, gmailLabels]
+    [prompt, classifiableGmailLabels]
   );
 
   const offeredLabels = useMemo(() => {
-    if (chooseFromAllLabels) return gmailLabels;
+    if (chooseFromAllLabels) return classifiableGmailLabels;
     const values = new Set(
       choices
         .filter((choice) => needsLabelValue(choice.type))
         .map((choice) => choice.value)
     );
-    return gmailLabels.filter(
+    return classifiableGmailLabels.filter(
       (label) => values.has(label.id) || values.has(label.name) || values.has(label.name.toLowerCase())
     );
-  }, [chooseFromAllLabels, choices, gmailLabels]);
+  }, [chooseFromAllLabels, choices, classifiableGmailLabels]);
 
   const unofferedLabels = useMemo(() => {
     if (chooseFromAllLabels) return [];
@@ -205,7 +213,17 @@ export default function RuleEditor() {
     ).map((option) => option.label);
   }, [prompt, choices]);
 
+  // Classification pickers (choices + label actions) offer only classifiable
+  // user labels. System labels stay available in conditions below.
   const labelOptions = useMemo<DropdownOption[]>(
+    () =>
+      classifiableGmailLabels.map((label) => ({
+        value: label.id,
+        label: label.name,
+      })),
+    [classifiableGmailLabels]
+  );
+  const conditionLabelOptions = useMemo<DropdownOption[]>(
     () =>
       gmailLabels.map((label) => ({
         value: label.id,
@@ -714,7 +732,7 @@ export default function RuleEditor() {
           <ConditionBuilder
             conditions={conditions}
             onChange={setConditions}
-            labelOptions={labelOptions}
+            labelOptions={conditionLabelOptions}
             labelNameById={labelNameById}
             labelIdByName={labelIdByName}
             labelsError={labelsError}
@@ -748,12 +766,14 @@ export default function RuleEditor() {
               onChange={(event) => setChooseFromAllLabels(event.target.checked)}
               className="rounded"
             />
-            Offer every Gmail user label instead
+            Offer every classifiable label instead
           </label>
           {chooseFromAllLabels ? (
             <p className="text-xs text-amber-700 dark:text-amber-300">
-              Every user label is sent with each email, which grows the prompt. Prefer a
-              fixed list when the rule classifies into a known set.
+              Every classifiable label is sent with each email (system labels like Inbox,
+              Sent, Category_* are excluded), which grows the prompt. Prefer a fixed list
+              when the rule classifies into a known set. Defaults come from Settings →
+              Labels.
             </p>
           ) : (
             <>
@@ -849,7 +869,11 @@ export default function RuleEditor() {
               while still stopping lower-priority rules from running.
             </p>
           )}
-          <LabelQualificationsPanel labels={offeredLabels} matchMode={matchMode} />
+          <RuleLabelOverridesPanel
+            ruleId={isEdit ? ruleId : null}
+            labels={offeredLabels}
+            matchMode={matchMode}
+          />
         </div>}
 
         <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800">

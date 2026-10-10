@@ -12,6 +12,7 @@ use crate::db::Database;
 use crate::gmail::models::{Message, MessageRef};
 use crate::rules::email_view::EmailView;
 use crate::rules::engine::{no_action_reason, resolve_rule, Outcome, Resolved};
+use crate::rules::label_context::contexts_for_rule;
 use crate::rules::matcher;
 
 const LAST_RUN_KEY: &str = "last_run";
@@ -598,7 +599,8 @@ async fn process_inference_job(
     let labels = crate::gmail::cached_labels(db, gmail, account_email)
         .await
         .unwrap_or_default();
-    let resolved = resolve_rule(llm, &rule, &view, &memories, &labels)
+    let label_contexts = contexts_for_rule(db, account_email, rule.id);
+    let resolved = resolve_rule(llm, &rule, &view, &memories, &labels, &label_contexts)
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
     let attempt = AttemptMetadata::from(&resolved);
@@ -1276,7 +1278,9 @@ async fn process_message_refs(
         });
         let started = Instant::now();
         let view = EmailView::from_message(&item.email);
-        let resolved = match resolve_rule(llm, &rule, &view, &memories, labels_ref).await {
+        let label_contexts = contexts_for_rule(db, account_email, rule.id);
+        let resolved =
+            match resolve_rule(llm, &rule, &view, &memories, labels_ref, &label_contexts).await {
             Ok(result) => result,
             Err(e) => {
                 let error = e.to_string();
@@ -1531,7 +1535,9 @@ async fn process_fallthrough(
                 .unwrap_or_default()
         });
         let started = Instant::now();
-        let resolved = match resolve_rule(llm, rule, &view, &memories, labels).await {
+        let label_contexts = contexts_for_rule(db, account_email, rule.id);
+        let resolved =
+            match resolve_rule(llm, rule, &view, &memories, labels, &label_contexts).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 let error = error.to_string();

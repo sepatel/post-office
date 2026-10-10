@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::gmail::models::{Label, Message};
 use crate::llm::{InferenceRouter, ProcessKind, ProcessRequest};
 use crate::rules::email_view::EmailView;
@@ -5,6 +7,7 @@ use crate::rules::engine::{
     choice_catalog, display_action, effective_actions, estimated_tokens, memory_block, parse_row,
     ActionDisplay, Choice, Outcome, Resolved, Row, RuleError,
 };
+use crate::rules::label_context::ResolvedLabel;
 use crate::rules::matcher;
 use crate::rules::models::Rule;
 use crate::rules::prompts::decision_prompt;
@@ -44,8 +47,9 @@ pub async fn resolve_decision(
     view: &EmailView,
     memories: &[String],
     labels: &[Label],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Result<Resolved, RuleError> {
-    let Some(context) = decision_context(llm, rule, labels) else {
+    let Some(context) = decision_context(llm, rule, labels, label_contexts) else {
         let actions: Vec<ParsedAction> = rule.actions.iter().map(ParsedAction::from).collect();
         return Ok(Resolved::local(Outcome::Matched, actions));
     };
@@ -100,8 +104,9 @@ pub fn decision_estimate(
     view: &EmailView,
     memories: &[String],
     labels: &[Label],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Result<Option<DecisionEstimate>, RuleError> {
-    let Some(context) = decision_context(llm, rule, labels) else {
+    let Some(context) = decision_context(llm, rule, labels, label_contexts) else {
         return Ok(None);
     };
     let user_prompt = build_decision_prompt(rule, view, memories, context.budget)?;
@@ -132,13 +137,14 @@ fn decision_context(
     llm: &InferenceRouter,
     rule: &Rule,
     labels: &[Label],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Option<DecisionContext> {
     let menu = choice_catalog(rule, labels);
     if !crate::rules::engine::needs_llm_decision(rule, labels) {
         return None;
     }
     let has_instruction = !rule.prompt.trim().is_empty();
-    let system_prompt = decision_prompt(&menu, has_instruction, rule.match_mode);
+    let system_prompt = decision_prompt(&menu, has_instruction, rule.match_mode, label_contexts);
     let reserved_completion_tokens = llm.decision_context_reserve_tokens(rule.decision_max_tokens);
     let budget = llm
         .input_token_budget(&rule.inference_policy, reserved_completion_tokens)
@@ -156,6 +162,7 @@ pub async fn evaluate_messages(
     emails: &[Message],
     memories: &[String],
     labels: &[Label],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Result<Vec<EvaluationVerdict>, RuleError> {
     let mut verdicts: Vec<EvaluationVerdict> = emails
         .iter()
@@ -184,7 +191,8 @@ pub async fn evaluate_messages(
         return Ok(verdicts);
     }
     for index in matched {
-        let result = resolve_decision(llm, rule, &views[index], memories, labels).await?;
+        let result =
+            resolve_decision(llm, rule, &views[index], memories, labels, label_contexts).await?;
         verdicts[index].matched = result.outcome == Outcome::Matched;
         verdicts[index].indeterminate = result.outcome == Outcome::Unparsed;
         verdicts[index].actions = result.actions.iter().map(display_action).collect();

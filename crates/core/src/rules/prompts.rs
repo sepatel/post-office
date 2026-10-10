@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+
 use crate::rules::engine::Choice;
+use crate::rules::label_context::{describe_for_menu, ResolvedLabel};
 use crate::rules::models::MatchMode;
+use crate::rules::response_parser::ParsedAction;
 
 /// A rule with no instruction but a menu is a pure classifier: there is no
 /// applicability question, only which choice fits best.
@@ -31,13 +35,22 @@ fn contract(has_menu: bool, multi: bool) -> &'static str {
     }
 }
 
-fn menu_block(menu: &[Choice]) -> String {
+fn menu_block(menu: &[Choice], contexts: &HashMap<String, ResolvedLabel>) -> String {
     if menu.is_empty() {
         return String::new();
     }
     let entries = menu
         .iter()
-        .map(|choice| format!("- {}", choice.name))
+        .map(|choice| {
+            let label_id = match &choice.action {
+                ParsedAction::Label(id) | ParsedAction::RemoveLabel(id) => Some(id.as_str()),
+                _ => None,
+            };
+            let described = label_id
+                .and_then(|id| contexts.get(id))
+                .and_then(|resolved| describe_for_menu(&choice.name, Some(resolved)));
+            format!("- {}", described.unwrap_or_else(|| choice.name.clone()))
+        })
         .collect::<Vec<_>>()
         .join("\n");
     format!("\nChoices:\n{entries}\n")
@@ -76,7 +89,15 @@ fn rules(has_instruction: bool, has_menu: bool, multi: bool) -> String {
 /// choice; a single-match one for exactly one.
 ///
 /// Every request carries exactly one email.
-pub fn decision_prompt(menu: &[Choice], has_instruction: bool, match_mode: MatchMode) -> String {
+///
+/// `contexts` carries the resolved global + per-rule label descriptions, keyed
+/// by Gmail label id. Labels without a context fall back to their bare name.
+pub fn decision_prompt(
+    menu: &[Choice],
+    has_instruction: bool,
+    match_mode: MatchMode,
+    contexts: &HashMap<String, ResolvedLabel>,
+) -> String {
     let multi = !menu.is_empty() && match_mode == MatchMode::Multiple;
     format!(
         "You are an email classification filter for a user's Gmail.
@@ -88,7 +109,7 @@ Answer with exactly one decision line shaped like the examples below. Copy the c
 {}",
         task(has_instruction, !menu.is_empty(), multi),
         contract(!menu.is_empty(), multi),
-        menu_block(menu),
+        menu_block(menu, contexts),
         rules(has_instruction, !menu.is_empty(), multi)
     )
 }
@@ -130,7 +151,6 @@ Guidelines:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::response_parser::ParsedAction;
 
     fn menu() -> Vec<Choice> {
         vec![
@@ -142,11 +162,15 @@ mod tests {
         ]
     }
 
+    fn empty_contexts() -> HashMap<String, ResolvedLabel> {
+        HashMap::new()
+    }
+
     /// Offering a choice slot with nothing to draw from is what made the
     /// model invent names and stall the email.
     #[test]
     fn a_menuless_prompt_asks_only_for_match_or_no_match() {
-        let prompt = decision_prompt(&[], true, MatchMode::Single);
+        let prompt = decision_prompt(&[], true, MatchMode::Single, &empty_contexts());
 
         assert!(prompt.contains("1: MATCH |"));
         assert!(!prompt.contains("Choices:"));
@@ -154,11 +178,33 @@ mod tests {
 
     #[test]
     fn a_menu_prompt_lists_the_choices_verbatim() {
-        let prompt = decision_prompt(&menu(), true, MatchMode::Single);
+        let prompt = decision_prompt(&menu(), true, MatchMode::Single, &empty_contexts());
 
         assert!(prompt.contains("1: Bills |"));
         assert!(prompt.contains("1: NO_MATCH |"));
         assert!(prompt.contains("- \"Invoices\""));
+        assert!(prompt.contains("- TRASH"));
+    }
+
+    #[test]
+    fn a_menu_prompt_carries_label_descriptions() {
+        let mut contexts = HashMap::new();
+        contexts.insert(
+            "Label_1".into(),
+            ResolvedLabel {
+                label_id: "Label_1".into(),
+                description: "Bills from vendors".into(),
+                examples: vec!["invoice".into()],
+                negative_examples: vec![],
+                has_override: false,
+                source: "user".into(),
+            },
+        );
+        let prompt = decision_prompt(&menu(), true, MatchMode::Single, &contexts);
+
+        assert!(prompt.contains("- \"Invoices\" -- Bills from vendors"));
+        assert!(prompt.contains("invoice"));
+        // Actions have no label context and stay bare.
         assert!(prompt.contains("- TRASH"));
     }
 
@@ -168,8 +214,8 @@ mod tests {
     #[test]
     fn decision_examples_carry_no_angle_bracket_placeholders() {
         for prompt in [
-            decision_prompt(&[], true, MatchMode::Single),
-            decision_prompt(&menu(), true, MatchMode::Single),
+            decision_prompt(&[], true, MatchMode::Single, &empty_contexts()),
+            decision_prompt(&menu(), true, MatchMode::Single, &empty_contexts()),
         ] {
             assert!(!prompt.contains('<'));
             assert!(!prompt.contains('>'));
@@ -183,8 +229,8 @@ mod tests {
     #[test]
     fn examples_are_numbered_with_digits_not_a_placeholder() {
         for prompt in [
-            decision_prompt(&[], true, MatchMode::Single),
-            decision_prompt(&menu(), false, MatchMode::Single),
+            decision_prompt(&[], true, MatchMode::Single, &empty_contexts()),
+            decision_prompt(&menu(), false, MatchMode::Single, &empty_contexts()),
         ] {
             assert!(prompt.contains("1: "));
             assert!(!prompt.contains("N:"));
@@ -193,9 +239,9 @@ mod tests {
 
     #[test]
     fn only_a_prompted_rule_is_told_it_outranks_the_instruction() {
-        assert!(decision_prompt(&menu(), true, MatchMode::Single)
+        assert!(decision_prompt(&menu(), true, MatchMode::Single, &empty_contexts())
             .contains("It never changes this response format"));
-        assert!(!decision_prompt(&menu(), false, MatchMode::Single)
+        assert!(!decision_prompt(&menu(), false, MatchMode::Single, &empty_contexts())
             .contains("It never changes this response format"));
     }
 
@@ -203,7 +249,7 @@ mod tests {
     /// applicability question to answer.
     #[test]
     fn an_instruction_free_prompt_asks_for_the_best_fitting_choice() {
-        let prompt = decision_prompt(&menu(), false, MatchMode::Single);
+        let prompt = decision_prompt(&menu(), false, MatchMode::Single, &empty_contexts());
 
         assert!(prompt.contains("best fits"));
         assert!(!prompt.contains("rule instruction applies"));
@@ -211,13 +257,13 @@ mod tests {
 
     #[test]
     fn a_multiple_match_menu_asks_for_every_applicable_choice() {
-        let multi = decision_prompt(&menu(), true, MatchMode::Multiple);
+        let multi = decision_prompt(&menu(), true, MatchMode::Multiple, &empty_contexts());
         assert!(multi.contains("every choice that applies"));
         assert!(multi.contains("Bills, Work |"));
         assert!(multi.contains("NO_MATCH"));
         assert!(!multi.contains("exactly one choice"));
 
-        let single = decision_prompt(&menu(), true, MatchMode::Single);
+        let single = decision_prompt(&menu(), true, MatchMode::Single, &empty_contexts());
         assert!(single.contains("exactly one choice"));
         assert!(!single.contains("every choice that applies"));
     }

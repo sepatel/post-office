@@ -17,6 +17,7 @@ import InferenceStudio, {
   type InferenceConfig,
 } from "../components/InferenceStudio";
 import LocalDecisions from "../components/LocalDecisions";
+import LabelLibraryPanel from "../components/LabelLibraryPanel";
 
 interface Config extends InferenceConfig {
   gmail_account: string | null;
@@ -27,7 +28,7 @@ interface Config extends InferenceConfig {
   tray_theme: string;
 }
 
-type SettingsTab = "inference" | "mailbox";
+type SettingsTab = "inference" | "mailbox" | "labels";
 
 export default function Settings() {
   const { connection, accounts, activeEmail, refreshAccounts } = useGate();
@@ -38,7 +39,9 @@ export default function Settings() {
   const [connectError, setConnectError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const request = useRef(0);
-  const tab: SettingsTab = searchParams.get("tab") === "mailbox" ? "mailbox" : "inference";
+  const rawTab = searchParams.get("tab");
+  const tab: SettingsTab =
+    rawTab === "mailbox" ? "mailbox" : rawTab === "labels" ? "labels" : "inference";
 
   useEffect(() => {
     void loadConfig();
@@ -92,8 +95,8 @@ export default function Settings() {
 
   function selectTab(nextTab: SettingsTab) {
     const nextParams = new URLSearchParams(searchParams);
-    if (nextTab === "mailbox") nextParams.set("tab", nextTab);
-    else nextParams.delete("tab");
+    if (nextTab === "inference") nextParams.delete("tab");
+    else nextParams.set("tab", nextTab);
     setSearchParams(nextParams);
   }
 
@@ -156,7 +159,7 @@ export default function Settings() {
             Shape how Post Office connects, decides, and recovers.
           </p>
         </div>
-        {tab !== "inference" && (
+        {tab === "mailbox" && (
           <button
             type="button"
             onClick={() => void saveGeneralSettings()}
@@ -175,6 +178,9 @@ export default function Settings() {
         </TabButton>
         <TabButton active={tab === "mailbox"} onClick={() => selectTab("mailbox")}>
           Mailbox
+        </TabButton>
+        <TabButton active={tab === "labels"} onClick={() => selectTab("labels")}>
+          Labels
         </TabButton>
       </div>
 
@@ -338,6 +344,12 @@ export default function Settings() {
               </div>
             </div>
           </section>
+        </div>
+      )}
+
+      {tab === "labels" && (
+        <div className="max-w-3xl space-y-6">
+          <LabelLibraryPanel />
         </div>
       )}
 

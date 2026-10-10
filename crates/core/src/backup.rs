@@ -75,6 +75,22 @@ pub struct BackupRule {
     pub match_mode: MatchMode,
     #[serde(default)]
     pub memories: Vec<BackupMemory>,
+    /// Per-rule label description overrides nested with the rule so they
+    /// survive the new-id remapping on import.
+    #[serde(default)]
+    pub label_overrides: Vec<BackupLabelOverride>,
+}
+
+/// Portable form of a per-rule label override; `updated_at` is refreshed on import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupLabelOverride {
+    pub label_id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub examples: Vec<String>,
+    #[serde(default)]
+    pub negative_examples: Vec<String>,
 }
 
 /// Portable form of a `LabelQualification`; `updated_at` is refreshed on import.
@@ -283,6 +299,17 @@ pub fn build_export(
                 text: entry.text,
             })
             .collect();
+        let label_overrides = db
+            .with_rule_label_overrides(|repo| repo.list_for_rule(rule.id))
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|entry| BackupLabelOverride {
+                label_id: entry.label_id,
+                description: entry.description,
+                examples: entry.examples,
+                negative_examples: entry.negative_examples,
+            })
+            .collect();
         backup_rules.push(BackupRule {
             name: rule.name.clone(),
             description: rule.description.clone(),
@@ -299,6 +326,7 @@ pub fn build_export(
             continue_after_match: rule.continue_after_match,
             match_mode: rule.match_mode,
             memories,
+            label_overrides,
         });
     }
 
@@ -561,6 +589,24 @@ pub fn apply_import(
                 .map_err(|e| e.to_string())?;
             imported_memories += 1;
         }
+        for label_override in rule.label_overrides {
+            let label_id = resolver.resolve(&label_override.label_id);
+            if label_id.trim().is_empty() {
+                continue;
+            }
+            db.with_rule_label_overrides(|repo| {
+                repo.upsert(&crate::db::rule_label_overrides::RuleLabelOverride {
+                    account_email: account_email.to_string(),
+                    rule_id: created.id,
+                    label_id: label_id.clone(),
+                    description: label_override.description,
+                    examples: label_override.examples,
+                    negative_examples: label_override.negative_examples,
+                    updated_at: String::new(),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        }
     }
 
     for qualification in doc.label_qualifications {
@@ -648,6 +694,7 @@ mod tests {
                     kind: "note".into(),
                     text: "remember this".into(),
                 }],
+                label_overrides: vec![],
             }],
             llm: BackupLlm {
                 providers: vec![LlmProviderProfile {

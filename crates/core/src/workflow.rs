@@ -20,6 +20,7 @@ use crate::llm::{
 use crate::rules::actions::resolve_actions;
 use crate::rules::email_view::EmailView;
 use crate::rules::engine::{needs_llm_decision, resolve_rule, Outcome, Resolved};
+use crate::rules::label_context::contexts_for_rule;
 use crate::rules::matcher;
 use crate::rules::models::Rule;
 
@@ -840,8 +841,17 @@ pub async fn prepare_run(
         }
 
         if !needs_llm_decision(rule, &labels) {
-            let resolved =
-                resolve_rule(&llm, rule, &view, &rule_snapshot.memories, &labels).await?;
+            let label_contexts =
+                contexts_for_rule(db, &run.account_email, rule_snapshot.rule.id);
+            let resolved = resolve_rule(
+                &llm,
+                rule,
+                &view,
+                &rule_snapshot.memories,
+                &labels,
+                &label_contexts,
+            )
+            .await?;
             persist_decision(db, &run, rule, rule_index, &labels, &resolved)?;
             return Ok(());
         }
@@ -956,7 +966,16 @@ pub async fn process_routed_run(
     }
     let started = Instant::now();
     let view = EmailView::from_message(&message);
-    let resolved = match resolve_rule(&llm, rule, &view, &rule_snapshot.memories, &labels).await {
+    let label_contexts = contexts_for_rule(db, &run.account_email, rule_snapshot.rule.id);
+    let resolved = match resolve_rule(
+        &llm,
+        rule,
+        &view,
+        &rule_snapshot.memories,
+        &labels,
+        &label_contexts,
+    )
+    .await {
         Ok(resolved) => resolved,
         Err(error) => {
             record_decision_error(

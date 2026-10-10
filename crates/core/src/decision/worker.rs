@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::db::label_qualifications::LabelQualification;
 use crate::db::verdicts::{NewVerdict, PendingStep};
 use crate::db::Database;
 use crate::gmail::models::{Label, Message};
 use crate::rules::email_view::EmailView;
 use crate::rules::engine::choice_catalog;
+use crate::rules::label_context::{resolve_label_contexts, ResolvedLabel};
 use crate::workflow::snapshot_rule;
 
 use super::questions::{llm_answer, plan, verdict};
@@ -26,7 +26,7 @@ pub fn shadow_batch(
     let info = model.info().clone();
     let pending = db.with_verdicts(|repo| repo.pending_steps(&info.id, limit))?;
     let mut labels: HashMap<String, Vec<Label>> = HashMap::new();
-    let mut qualifications: HashMap<String, Vec<LabelQualification>> = HashMap::new();
+    let mut qualifications: HashMap<String, HashMap<String, ResolvedLabel>> = HashMap::new();
     for step in &pending {
         let labels = match labels.get(&step.account_email) {
             Some(labels) => labels,
@@ -41,11 +41,14 @@ pub fn shadow_batch(
         let qualifications = match qualifications.get(&step.account_email) {
             Some(qualifications) => qualifications,
             None => {
-                let cached = db
+                let globals = db
                     .with_label_qualifications(|repo| repo.list_for_account(&step.account_email))?;
+                // Shadow runs predate per-rule overrides in their snapshot; the
+                // global default is what the comparison can rely on.
+                let resolved = resolve_label_contexts(&globals, &[]);
                 qualifications
                     .entry(step.account_email.clone())
-                    .or_insert(cached)
+                    .or_insert(resolved)
             }
         };
         shadow_step(db, model, step, labels, qualifications)?;
@@ -58,7 +61,7 @@ fn shadow_step(
     model: &dyn DecisionModel,
     step: &PendingStep,
     labels: &[Label],
-    qualifications: &[LabelQualification],
+    qualifications: &HashMap<String, ResolvedLabel>,
 ) -> rusqlite::Result<()> {
     let info = model.info();
     let base = NewVerdict {

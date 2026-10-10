@@ -61,6 +61,67 @@ pub struct Label {
     pub label_list_visibility: Option<String>,
 }
 
+/// Gmail system labels that are mailbox state, not user topics. They must not
+/// appear as classifier choices or in the global label library — asking a user
+/// to describe `INBOX` or `CATEGORY_PROMOTIONS` interweaves Google's fixed
+/// taxonomy into their own labels. They remain usable in conditions.
+const EXCLUDED_CLASSIFICATION_IDS: [&str; 14] = [
+    "INBOX",
+    "SPAM",
+    "TRASH",
+    "DRAFT",
+    "SENT",
+    "STARRED",
+    "IMPORTANT",
+    "UNREAD",
+    "CHAT",
+    "CATEGORY_PERSONAL",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_FORUMS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_PROMOTIONS",
+];
+
+/// Whether this Gmail label is a user topic the classifier may choose.
+/// System labels (`INBOX`, `SENT`, `STARRED`, …) and Gmail's virtual names
+/// (`CATEGORY_*`, `[Imap]/…`, `[Gmail]/…`, `[Google Mail]/…`) are excluded
+/// even when they arrive typed as `user`.
+pub fn is_classifiable_label(label: &Label) -> bool {
+    if !label.label_type.eq_ignore_ascii_case("user") {
+        return false;
+    }
+    let id = label.id.trim();
+    if !id.is_empty()
+        && EXCLUDED_CLASSIFICATION_IDS
+            .iter()
+            .any(|excluded| id.eq_ignore_ascii_case(excluded))
+    {
+        return false;
+    }
+    let name = label.name.trim();
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("category_")
+        || lower.starts_with("[imap]/")
+        || lower.starts_with("[gmail]/")
+        || lower.starts_with("[google mail]/")
+    {
+        return false;
+    }
+    if lower == "chat" || lower == "draft" {
+        return false;
+    }
+    !name.is_empty()
+}
+
+/// The subset of `labels` the classifier may be offered.
+pub fn classifiable_labels(labels: &[Label]) -> Vec<Label> {
+    labels
+        .iter()
+        .filter(|label| is_classifiable_label(label))
+        .cloned()
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailProfile {
@@ -183,4 +244,86 @@ pub struct HistoryLabelEnvelope {
     pub message: MessageRef,
     #[serde(default)]
     pub label_ids: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label(id: &str, name: &str, label_type: &str) -> Label {
+        Label {
+            id: id.into(),
+            name: name.into(),
+            label_type: label_type.into(),
+            message_list_visibility: None,
+            label_list_visibility: None,
+        }
+    }
+
+    #[test]
+    fn system_labels_are_not_classifiable() {
+        for (id, name) in [
+            ("INBOX", "INBOX"),
+            ("SPAM", "SPAM"),
+            ("TRASH", "TRASH"),
+            ("DRAFT", "DRAFT"),
+            ("SENT", "SENT"),
+            ("STARRED", "STARRED"),
+            ("IMPORTANT", "IMPORTANT"),
+            ("UNREAD", "UNREAD"),
+            ("CHAT", "CHAT"),
+            ("CATEGORY_PROMOTIONS", "CATEGORY_PROMOTIONS"),
+            ("CATEGORY_SOCIAL", "CATEGORY_SOCIAL"),
+        ] {
+            assert!(
+                !is_classifiable_label(&label(id, name, "system")),
+                "{id} should be excluded"
+            );
+            // Even if Gmail ever types one as user, it stays excluded.
+            assert!(
+                !is_classifiable_label(&label(id, name, "user")),
+                "{id} as user should still be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_names_are_not_classifiable() {
+        assert!(!is_classifiable_label(&label(
+            "Label_99",
+            "[Imap]/Trash",
+            "user"
+        )));
+        assert!(!is_classifiable_label(&label(
+            "Label_99",
+            "[Gmail]/Trash",
+            "user"
+        )));
+        assert!(!is_classifiable_label(&label(
+            "Label_99",
+            "CATEGORY_FORUMS",
+            "user"
+        )));
+    }
+
+    #[test]
+    fn user_topics_are_classifiable() {
+        assert!(is_classifiable_label(&label("Label_1", "Finance", "user")));
+        assert!(is_classifiable_label(&label(
+            "Label_2",
+            "Education/High",
+            "user"
+        )));
+        assert_eq!(
+            classifiable_labels(&[
+                label("INBOX", "INBOX", "system"),
+                label("Label_1", "Finance", "user"),
+                label("Label_99", "[Imap]/Trash", "user"),
+            ])
+            .iter()
+            .map(|l| l.name.clone())
+            .collect::<Vec<_>>(),
+            vec!["Finance".to_string()]
+        );
+    }
 }
