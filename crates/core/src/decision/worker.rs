@@ -145,6 +145,7 @@ fn shadow_step(
                 probabilities_json: serde_json::to_string(&v.probabilities).ok(),
                 verdict_matched: Some(v.matched),
                 verdict_choice: v.choice.as_deref(),
+                target: asked.target.as_deref(),
                 confidence: Some(v.confidence),
                 llm_matched: llm.as_ref().map(|l| l.matched),
                 llm_choices_json: llm
@@ -355,6 +356,28 @@ pub(crate) mod tests {
             [
                 ("multi:0", Some(true), Some("\"Financial\"")),
                 ("multi:1", Some(false), Some("\"Work\"")),
+            ]
+        );
+    }
+
+    /// Without the target a "no" row cannot be traced to the label it asked
+    /// about, so it is stored whether or not rverdict matched it.
+    #[test]
+    fn a_multi_verdict_names_its_label_even_when_it_does_not_match() {
+        let db = seeded_multi();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        let rows = db.with_verdicts(|r| r.all(None)).unwrap();
+        let targets: Vec<_> = rows
+            .iter()
+            .filter(|v| v.step_id == 2)
+            .map(|v| (v.framing.as_str(), v.target.as_deref()))
+            .collect();
+
+        assert_eq!(
+            targets,
+            [
+                ("multi:0", Some("\"Financial\"")),
+                ("multi:1", Some("\"Work\""))
             ]
         );
     }

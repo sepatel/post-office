@@ -117,7 +117,7 @@ impl Database {
 
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock();
-        snapshot_before(&conn, 29);
+        snapshot_before(&conn, 30);
         let transaction = conn.unchecked_transaction()?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -261,6 +261,12 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (29)", [])?;
         }
+        if !migration_applied(&transaction, 30)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/030_verdict_target.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (30)", [])?;
+        }
         transaction.commit()
     }
 
@@ -385,11 +391,7 @@ impl Database {
     where
         F: FnOnce(rule_label_overrides::RuleLabelOverrideRepository<'_>) -> R,
     {
-        self.with_conn(|conn| {
-            f(rule_label_overrides::RuleLabelOverrideRepository::new(
-                conn,
-            ))
-        })
+        self.with_conn(|conn| f(rule_label_overrides::RuleLabelOverrideRepository::new(conn)))
     }
 }
 

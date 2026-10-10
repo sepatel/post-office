@@ -136,6 +136,20 @@ pub async fn verdict_rate(
         .map_err(|e| e.to_string())
 }
 
+/// Thumbs on the LLM's answer for one label of a multiple-match rule, as
+/// opposed to the step as a whole.
+#[tauri::command]
+pub async fn verdict_rate_row(
+    state: State<'_, AppState>,
+    verdict_id: i64,
+    up: Option<bool>,
+) -> Result<(), String> {
+    state
+        .db
+        .with_verdicts(|repo| repo.set_verdict_rating(verdict_id, up))
+        .map_err(|e| e.to_string())
+}
+
 /// Writes the decision export under the app data directory and returns
 /// where. The files contain email text and stay on this machine.
 #[tauri::command]

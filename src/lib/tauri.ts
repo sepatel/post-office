@@ -1088,6 +1088,7 @@ export interface VerdictRow {
   probabilities_json: string | null;
   verdict_matched: boolean | null;
   verdict_choice: string | null;
+  target: string | null;
   confidence: number | null;
   llm_matched: boolean | null;
   llm_choices_json: string | null;
@@ -1100,6 +1101,7 @@ export interface VerdictRow {
 
 export interface VerdictFeedback {
   step_id: number | null;
+  verdict_id: number | null;
   kind: string;
   label_id: string;
   created_at: string;
@@ -1131,6 +1133,10 @@ export async function verdictMessage(messageId: number): Promise<{ verdicts: Ver
 
 export async function verdictRate(stepId: number, up: boolean | null): Promise<void> {
   return invoke("verdict_rate", { stepId, up });
+}
+
+export async function verdictRateRow(verdictId: number, up: boolean | null): Promise<void> {
+  return invoke("verdict_rate_row", { verdictId, up });
 }
 
 export async function verdictExport(): Promise<VerdictExportSummary> {
