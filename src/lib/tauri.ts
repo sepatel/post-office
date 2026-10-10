@@ -743,6 +743,48 @@ export async function gmailListLabels(refresh = false): Promise<GmailLabel[]> {
   return invoke("gmail_list_labels", { refresh });
 }
 
+const EXCLUDED_CLASSIFICATION_IDS = new Set(
+  [
+    "INBOX",
+    "SPAM",
+    "TRASH",
+    "DRAFT",
+    "SENT",
+    "STARRED",
+    "IMPORTANT",
+    "UNREAD",
+    "CHAT",
+    "CATEGORY_PERSONAL",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_FORUMS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_PROMOTIONS",
+  ].map((id) => id.toUpperCase()),
+);
+
+/// Mirrors `is_classifiable_label` in the core crate: system labels and
+/// Gmail's virtual names are never classifier choices, even when typed as
+/// user. Conditions may still reference any label.
+export function isClassifiableLabel(label: GmailLabel): boolean {
+  if (label.type.toLowerCase() !== "user") return false;
+  if (EXCLUDED_CLASSIFICATION_IDS.has(label.id.trim().toUpperCase())) return false;
+  const lower = label.name.trim().toLowerCase();
+  if (
+    lower.startsWith("category_") ||
+    lower.startsWith("[imap]/") ||
+    lower.startsWith("[gmail]/") ||
+    lower.startsWith("[google mail]/")
+  ) {
+    return false;
+  }
+  if (lower === "chat" || lower === "draft") return false;
+  return lower.length > 0;
+}
+
+export function classifiableLabels(labels: GmailLabel[]): GmailLabel[] {
+  return labels.filter(isClassifiableLabel);
+}
+
 export interface LabelQualification {
   account_email: string;
   label_id: string;
@@ -783,6 +825,78 @@ export async function labelQualificationsGenerate(options?: {
     policyId: options?.policyId,
     overwrite: options?.overwrite,
   });
+}
+
+export interface LabelLibraryEntry {
+  label: GmailLabel;
+  classifiable: boolean;
+  qualification: LabelQualification | null;
+}
+
+export async function labelLibraryList(): Promise<LabelLibraryEntry[]> {
+  return invoke("label_library_list");
+}
+
+export interface RuleLabelOverride {
+  account_email: string;
+  rule_id: number;
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+  updated_at: string;
+}
+
+export async function ruleLabelOverridesList(ruleId: number): Promise<RuleLabelOverride[]> {
+  return invoke("rule_label_overrides_list", { ruleId });
+}
+
+export interface RuleLabelOverrideInput {
+  rule_id: number;
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+}
+
+export async function ruleLabelOverrideUpsert(input: RuleLabelOverrideInput): Promise<void> {
+  return invoke("rule_label_override_upsert", { input });
+}
+
+export async function ruleLabelOverrideClear(ruleId: number, labelId: string): Promise<void> {
+  return invoke("rule_label_override_clear", { ruleId, labelId });
+}
+
+export interface ResolvedLabel {
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+  has_override: boolean;
+  source: string;
+}
+
+export function resolveLabelPreview(
+  global: LabelQualification | undefined,
+  override: RuleLabelOverride | undefined,
+): ResolvedLabel | null {
+  if (!global && !override) return null;
+  return {
+    label_id: override?.label_id ?? global?.label_id ?? "",
+    description: override?.description?.trim()
+      ? override.description
+      : (global?.description ?? ""),
+    examples:
+      override && override.examples.length > 0
+        ? override.examples
+        : (global?.examples ?? []),
+    negative_examples:
+      override && override.negative_examples.length > 0
+        ? override.negative_examples
+        : (global?.negative_examples ?? []),
+    has_override: Boolean(override),
+    source: override ? "rule" : (global?.source ?? ""),
+  };
 }
 
 export interface LlmTestResult {

@@ -12,6 +12,7 @@ use crate::gmail::models::Label;
 use crate::llm::InferenceRouter;
 use crate::rules::email_view::EmailView;
 use crate::rules::evaluation::{decision_estimate, DecisionEstimate};
+use crate::rules::label_context::ResolvedLabel;
 
 const TRUNCATION_MARKER: &str = "\n\n[Body truncated; middle omitted]\n\n";
 
@@ -60,12 +61,15 @@ pub fn rules_after<'a>(rules: &'a [Rule], current_rule_id: i64, view: &EmailView
 /// Resolves one email against one rule.
 ///
 /// Rule decisions always use a single-email prompt and response contract.
+/// `label_contexts` carries the resolved global + per-rule descriptions, keyed
+/// by Gmail label id; labels without an entry fall back to their bare name.
 pub async fn resolve_rule(
     llm: &InferenceRouter,
     rule: &Rule,
     view: &EmailView,
     memories: &[String],
     labels: &[Label],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Result<Resolved, RuleError> {
     let conditions_match = rule
         .conditions
@@ -74,8 +78,15 @@ pub async fn resolve_rule(
     if !conditions_match {
         return Ok(Resolved::declined());
     }
-    let resolved =
-        crate::rules::evaluation::resolve_decision(llm, rule, view, memories, labels).await?;
+    let resolved = crate::rules::evaluation::resolve_decision(
+        llm,
+        rule,
+        view,
+        memories,
+        labels,
+        label_contexts,
+    )
+    .await?;
     if resolved.llm_unavailable {
         return Err(RuleError::Llm(crate::llm::LlmError::Routing(
             resolved
@@ -92,8 +103,9 @@ pub async fn test_rule(
     view: &EmailView,
     memories: &[String],
     labels: &[Label],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Result<TestResult, RuleError> {
-    let resolved = resolve_rule(llm, rule, view, memories, labels).await?;
+    let resolved = resolve_rule(llm, rule, view, memories, labels, label_contexts).await?;
     Ok(TestResult {
         matched: resolved.outcome == Outcome::Matched,
         indeterminate: resolved.outcome == Outcome::Unparsed,
@@ -229,6 +241,7 @@ pub async fn dry_run_pipeline(
     view: &EmailView,
     memories_by_rule: &HashMap<i64, Vec<String>>,
     labels: &[Label],
+    label_contexts_by_rule: &HashMap<i64, HashMap<String, ResolvedLabel>>,
     on_progress: &impl Fn(PipelineDryRunProgress),
 ) -> PipelineDryRun {
     let mut steps = Vec::new();
@@ -278,17 +291,22 @@ pub async fn dry_run_pipeline(
             .get(&rule.id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let label_contexts = label_contexts_by_rule
+            .get(&rule.id)
+            .cloned()
+            .unwrap_or_default();
         on_progress(PipelineDryRunProgress {
             phase: "evaluating".into(),
             rule_id: rule.id,
             rule_name: rule.name.clone(),
             priority: rule.priority,
-            decision_estimate: decision_estimate(llm, rule, view, memories, labels)
+            decision_estimate: decision_estimate(llm, rule, view, memories, labels, &label_contexts)
                 .ok()
                 .flatten(),
             step: None,
         });
-        let resolved = match resolve_rule(llm, rule, view, memories, labels).await {
+        let resolved = match resolve_rule(llm, rule, view, memories, labels, &label_contexts).await
+        {
             Ok(resolved) => resolved,
             Err(error) => {
                 steps.push(PipelineDryRunStep {
@@ -501,9 +519,8 @@ impl Choice {
 /// a stale menu entry is a rule to fix, not a reason to stall every email.
 pub fn choice_catalog(rule: &Rule, labels: &[Label]) -> Vec<Choice> {
     let candidates: Vec<Choice> = if rule.choose_from_all_labels {
-        labels
+        crate::gmail::models::classifiable_labels(labels)
             .iter()
-            .filter(|label| label.label_type.eq_ignore_ascii_case("user"))
             .map(|label| Choice::label(&label.id, &label.name))
             .collect()
     } else {

@@ -16,6 +16,7 @@ use post_office_core::rules::engine::{
     PipelineDryRunProgress, TestResult,
 };
 use post_office_core::rules::evaluation::EvaluationVerdict;
+use post_office_core::rules::label_context::{contexts_by_rule, contexts_for_rule, ResolvedLabel};
 use post_office_core::rules::models::{Action, Condition, MatchMode, Rule};
 use post_office_core::sync::{replay_history, start_watch, stop_watch, ReplayResult};
 use serde::{Deserialize, Serialize};
@@ -1184,12 +1185,17 @@ pub async fn rules_test(
 
     let rule_model = build_rule_model(&rule);
 
+    // Draft edits to per-rule overrides are not yet persisted, so a test of an
+    // unsaved draft falls back to the saved overrides for its source rule.
+    let label_contexts = contexts_for_rule(&state.db, &account_email, rule_model.id);
+
     let mut result = post_office_core::rules::engine::test_rule(
         &llm,
         &rule_model,
         &view,
         &rule_memories(&state, rule_model.id),
         &labels,
+        &label_contexts,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1202,12 +1208,14 @@ pub async fn rules_test(
             .with_rules(|repo| repo.list_all(&account_email))
             .unwrap_or_default();
         for candidate in rules_after(&rules, rule_model.id, &view) {
+            let candidate_contexts = contexts_for_rule(&state.db, &account_email, candidate.id);
             let step = post_office_core::rules::engine::test_rule(
                 &llm,
                 candidate,
                 &view,
                 &rule_memories(&state, candidate.id),
                 &labels,
+                &candidate_contexts,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -1279,12 +1287,15 @@ pub async fn evaluate_messages(
             .unwrap_or_default()
     });
 
+    let label_contexts = contexts_for_rule(&state.db, &account_email, rule_model.id);
+
     post_office_core::rules::evaluation::evaluate_messages(
         &llm,
         &rule_model,
         &emails,
         &memories,
         &labels,
+        &label_contexts,
     )
     .await
     .map_err(|e| e.to_string())
@@ -2009,6 +2020,154 @@ pub async fn label_qualification_delete(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Serialize)]
+pub struct LabelLibraryEntry {
+    pub label: Label,
+    pub classifiable: bool,
+    pub qualification:
+        Option<post_office_core::db::label_qualifications::LabelQualification>,
+}
+
+/// The globally managed label library for the active account: every cached
+/// Gmail label with its default qualification and whether the classifier may
+/// use it. System labels (`INBOX`, `CATEGORY_*`, `[Imap]/…`, …) are flagged
+/// `classifiable: false` so the UI can hide them from the "what labels mean"
+/// view while keeping them available for conditions.
+#[tauri::command]
+pub async fn label_library_list(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<LabelLibraryEntry>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    let labels = account_labels(&app, &state, &account_email).await?;
+    let qualifications = state
+        .db
+        .with_label_qualifications(|repo| repo.list_for_account(&account_email))
+        .map_err(|e| e.to_string())?;
+    let by_id: HashMap<&str, &post_office_core::db::label_qualifications::LabelQualification> =
+        qualifications
+            .iter()
+            .map(|q| (q.label_id.as_str(), q))
+            .collect();
+    Ok(labels
+        .into_iter()
+        .map(|label| {
+            let classifiable =
+                post_office_core::gmail::models::is_classifiable_label(&label);
+            let qualification = by_id.get(label.id.as_str()).cloned().cloned();
+            LabelLibraryEntry {
+                label,
+                classifiable,
+                qualification,
+            }
+        })
+        .collect())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RuleLabelOverrideInput {
+    pub rule_id: i64,
+    pub label_id: String,
+    pub description: String,
+    #[serde(default)]
+    pub examples: Vec<String>,
+    #[serde(default)]
+    pub negative_examples: Vec<String>,
+}
+
+fn ensure_rule_owned(
+    state: &AppState,
+    account_email: &str,
+    rule_id: i64,
+) -> Result<(), String> {
+    state
+        .db
+        .with_rules(|repo| repo.get_by_id(account_email, rule_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Rule not found".to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn rule_label_overrides_list(
+    state: State<'_, AppState>,
+    rule_id: i64,
+) -> Result<Vec<post_office_core::db::rule_label_overrides::RuleLabelOverride>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    ensure_rule_owned(&state, &account_email, rule_id)?;
+    state
+        .db
+        .with_rule_label_overrides(|repo| repo.list_for_rule(rule_id))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rule_label_override_upsert(
+    state: State<'_, AppState>,
+    input: RuleLabelOverrideInput,
+) -> Result<(), String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    ensure_rule_owned(&state, &account_email, input.rule_id)?;
+    if input.label_id.trim().is_empty() {
+        return Err("Unknown label".into());
+    }
+    state
+        .db
+        .with_rule_label_overrides(|repo| {
+            repo.upsert(&post_office_core::db::rule_label_overrides::RuleLabelOverride {
+                account_email: account_email.clone(),
+                rule_id: input.rule_id,
+                label_id: input.label_id.clone(),
+                description: input.description,
+                examples: input.examples,
+                negative_examples: input.negative_examples,
+                updated_at: String::new(),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    publish_current_rule_set(&state, &account_email).await
+}
+
+#[tauri::command]
+pub async fn rule_label_override_clear(
+    state: State<'_, AppState>,
+    rule_id: i64,
+    label_id: String,
+) -> Result<(), String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    ensure_rule_owned(&state, &account_email, rule_id)?;
+    state
+        .db
+        .with_rule_label_overrides(|repo| repo.delete(rule_id, &label_id))
+        .map_err(|e| e.to_string())?;
+    publish_current_rule_set(&state, &account_email).await
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResolvedLabelContext {
+    pub label_id: String,
+    pub resolved: ResolvedLabel,
+}
+
+/// Resolved global + per-rule label descriptions for one rule, for the rule
+/// editor's read-only defaults.
+#[tauri::command]
+pub async fn rule_label_contexts(
+    state: State<'_, AppState>,
+    rule_id: i64,
+) -> Result<Vec<ResolvedLabelContext>, String> {
+    let account_email = active_account(&*state.config.lock().await)?;
+    ensure_rule_owned(&state, &account_email, rule_id)?;
+    let contexts = contexts_for_rule(&state.db, &account_email, rule_id);
+    Ok(contexts
+        .into_iter()
+        .map(|(label_id, resolved)| ResolvedLabelContext {
+            label_id,
+            resolved,
+        })
+        .collect())
+}
+
 const LABEL_QUALIFICATIONS_SYSTEM_PROMPT: &str = "You describe a user's Gmail labels for an email classifier. For every label given, write a concise description plus short example and negative-example phrases. Use only the exact label_id values provided. Never ask for, quote, or summarize actual email content.";
 
 #[derive(Debug, Deserialize)]
@@ -2050,6 +2209,10 @@ pub async fn label_qualifications_generate(
     };
 
     let labels = account_labels(&app, &state, &account_email).await?;
+    let labels: Vec<Label> = labels
+        .into_iter()
+        .filter(|label| post_office_core::gmail::models::is_classifiable_label(label))
+        .collect();
     let known_ids: HashMap<&str, &Label> = labels
         .iter()
         .map(|label| (label.id.as_str(), label))
@@ -2466,6 +2629,9 @@ pub async fn pipeline_dry_run(
             .iter()
             .map(|rule| (rule.id, rule_memories(&state, rule.id)))
             .collect::<HashMap<_, _>>();
+        let rule_ids: Vec<i64> = rules.iter().map(|rule| rule.id).collect();
+        let label_contexts_by_rule =
+            contexts_by_rule(&state.db, &account_email, &rule_ids);
 
         let inner = EmailView::from_message(&email);
 
@@ -2475,6 +2641,7 @@ pub async fn pipeline_dry_run(
             &inner,
             &memories_by_rule,
             &labels,
+            &label_contexts_by_rule,
             &|progress| {
                 update_progress("evaluating", total_rules, Some(progress));
             },

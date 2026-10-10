@@ -191,6 +191,10 @@ impl<'a> RuleRepository<'a> {
 
     pub fn delete(&self, account_email: &str, id: i64) -> Result<()> {
         self.conn.execute(
+            "DELETE FROM rule_label_overrides WHERE rule_id = ?1",
+            params![id],
+        )?;
+        self.conn.execute(
             "DELETE FROM rules WHERE id = ?1 AND account_email = ?2",
             params![id, account_email],
         )?;

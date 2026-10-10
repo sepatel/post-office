@@ -5,9 +5,11 @@ use rverdict_core::{Calibration, Logits, RenderedKind, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::db::label_qualifications::LabelQualification;
+use std::collections::HashMap;
+
 use crate::rules::email_view::EmailView;
 use crate::rules::engine::{parse_row, Choice};
+use crate::rules::label_context::ResolvedLabel;
 use crate::rules::models::{MatchMode, Rule};
 use crate::rules::response_parser::ParsedAction;
 
@@ -203,7 +205,7 @@ pub fn plan(
     menu: &[Choice],
     view: &EmailView,
     memories: &[String],
-    qualifications: &[LabelQualification],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Option<Plan> {
     let prompt = parse_prompt(&rule.prompt, menu);
     let instruction = prompt.instruction.as_str();
@@ -237,7 +239,7 @@ pub fn plan(
             },
         ]
     } else if rule.match_mode == MatchMode::Multiple {
-        multi_questions(menu, &prompt, instruction, &notes, qualifications)
+        multi_questions(menu, &prompt, instruction, &notes, label_contexts)
     } else {
         let instructions = if instruction.is_empty() {
             format!("Which of these best describes this email?{notes}")
@@ -247,7 +249,13 @@ pub fn plan(
         let mut criteria = Map::new();
         let mut options = Vec::with_capacity(menu.len() + 1);
         for (index, choice) in menu.iter().enumerate() {
-            let text = match &prompt.descriptions[index] {
+            let resolved = resolved_for(choice, label_contexts);
+            let stored = resolved
+                .map(|r| r.description.trim())
+                .filter(|d| !d.is_empty())
+                .map(str::to_owned)
+                .or_else(|| prompt.descriptions[index].clone());
+            let text = match stored {
                 Some(description) => format!("{}: {description}", describe(choice)),
                 None => describe(choice),
             };
@@ -282,19 +290,19 @@ pub fn plan(
 
 /// One independent yes/no question per choice, so a multiple-match rule can
 /// pick any subset. Each question carries the choice's description and
-/// examples from its stored qualification, falling back to the description
-/// parsed out of the rule prompt.
+/// examples from its resolved global + per-rule context, falling back to the
+/// description parsed out of the rule prompt.
 fn multi_questions(
     menu: &[Choice],
     prompt: &Prompt,
     instruction: &str,
     notes: &str,
-    qualifications: &[LabelQualification],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Vec<Asked> {
     menu.iter()
         .enumerate()
         .map(|(index, choice)| {
-            let qualification = qualification_for(choice, qualifications);
+            let qualification = resolved_for(choice, label_contexts);
             let description = qualification
                 .map(|q| q.description.trim())
                 .filter(|d| !d.is_empty())
@@ -324,20 +332,20 @@ fn multi_questions(
         .collect()
 }
 
-fn qualification_for<'q>(
+fn resolved_for<'q>(
     choice: &Choice,
-    qualifications: &'q [LabelQualification],
-) -> Option<&'q LabelQualification> {
+    label_contexts: &'q HashMap<String, ResolvedLabel>,
+) -> Option<&'q ResolvedLabel> {
     let ParsedAction::Label(id) = &choice.action else {
         return None;
     };
-    qualifications.iter().find(|q| q.label_id == *id)
+    label_contexts.get(id)
 }
 
 fn yes_text(
     display: &str,
     description: Option<&str>,
-    qualification: Option<&LabelQualification>,
+    qualification: Option<&ResolvedLabel>,
 ) -> String {
     let base = description
         .map(str::to_owned)
@@ -350,7 +358,7 @@ fn yes_text(
     }
 }
 
-fn no_text(display: &str, qualification: Option<&LabelQualification>) -> String {
+fn no_text(display: &str, qualification: Option<&ResolvedLabel>) -> String {
     let base = format!("This email does not belong in {display}");
     let examples = qualification.map_or(&[][..], |q| q.negative_examples.as_slice());
     if examples.is_empty() {
@@ -547,9 +555,20 @@ mod tests {
         ]
     }
 
+    fn empty_contexts() -> HashMap<String, ResolvedLabel> {
+        HashMap::new()
+    }
+
     #[test]
     fn instruction_only_rules_are_asked_both_ways() {
-        let plan = plan(&rule("Is this a MongoDB alert?"), &[], &view(), &[], &[]).unwrap();
+        let plan = plan(
+            &rule("Is this a MongoDB alert?"),
+            &[],
+            &view(),
+            &[],
+            &empty_contexts(),
+        )
+        .unwrap();
         let framings: Vec<_> = plan.asked.iter().map(|a| a.framing).collect();
         assert_eq!(framings, [Framing::Noul, Framing::Binary]);
         assert_eq!(plan.request.questions.len(), 2);
@@ -567,7 +586,7 @@ mod tests {
             &menu(),
             &view(),
             &["Bills are Financial".into()],
-            &[],
+            &empty_contexts(),
         )
         .unwrap();
         let question = &plan.asked[0].question;
@@ -589,7 +608,7 @@ mod tests {
             - \"Financial\" -- is an invoice or billing to existing services.\n\
             - Education/High -- Generic school announcements\n\
             - NO_MATCH -- None of the above are appropriate";
-        let plan = plan(&rule(prompt), &menu(), &view(), &[], &[]).unwrap();
+        let plan = plan(&rule(prompt), &menu(), &view(), &[], &empty_contexts()).unwrap();
         let question = &plan.asked[0].question;
         assert_eq!(
             question["criteria"],
@@ -640,8 +659,30 @@ mod tests {
     }
 
     #[test]
+    fn stored_contexts_describe_menu_options() {
+        let mut contexts = HashMap::new();
+        contexts.insert(
+            "Label_1".into(),
+            ResolvedLabel {
+                label_id: "Label_1".into(),
+                description: "Bills from vendors".into(),
+                examples: vec![],
+                negative_examples: vec![],
+                has_override: false,
+                source: "user".into(),
+            },
+        );
+        let plan = plan(&rule(""), &menu(), &view(), &[], &contexts).unwrap();
+        let question = &plan.asked[0].question;
+        assert_eq!(
+            question["criteria"]["c0"],
+            serde_json::json!("Financial: Bills from vendors")
+        );
+    }
+
+    #[test]
     fn rules_without_a_model_decision_are_not_asked() {
-        assert!(plan(&rule("  "), &[], &view(), &[], &[]).is_none());
+        assert!(plan(&rule("  "), &[], &view(), &[], &empty_contexts()).is_none());
     }
 
     #[test]
@@ -660,7 +701,7 @@ mod tests {
     #[test]
     fn verdicts_are_compared_with_the_llm() {
         let menu = menu();
-        let plan = plan(&rule(""), &menu, &view(), &[], &[]).unwrap();
+        let plan = plan(&rule(""), &menu, &view(), &[], &empty_contexts()).unwrap();
         let asked = &plan.asked[0];
         let kind = RenderedKind::Choice {
             keys: vec!["c0".into(), "c1".into(), "c2".into(), "none".into()],
@@ -691,15 +732,18 @@ mod tests {
     fn multi_mode_asks_one_question_per_choice() {
         let mut rule = rule("File it.");
         rule.match_mode = MatchMode::Multiple;
-        let qualifications = vec![LabelQualification {
-            account_email: "a@x".into(),
-            label_id: "Label_1".into(),
-            description: "Bills from vendors".into(),
-            examples: vec!["invoice".into()],
-            negative_examples: vec!["newsletter".into()],
-            source: "user".into(),
-            updated_at: String::new(),
-        }];
+        let mut qualifications = HashMap::new();
+        qualifications.insert(
+            "Label_1".into(),
+            ResolvedLabel {
+                label_id: "Label_1".into(),
+                description: "Bills from vendors".into(),
+                examples: vec!["invoice".into()],
+                negative_examples: vec!["newsletter".into()],
+                has_override: false,
+                source: "user".into(),
+            },
+        );
         let menu = menu();
         let plan = plan(&rule, &menu, &view(), &[], &qualifications).unwrap();
 
@@ -739,7 +783,7 @@ mod tests {
         let mut rule = rule("File it.");
         rule.match_mode = MatchMode::Multiple;
         let menu = menu();
-        let plan = plan(&rule, &menu, &view(), &[], &[]).unwrap();
+        let plan = plan(&rule, &menu, &view(), &[], &empty_contexts()).unwrap();
         let kind = RenderedKind::Noul { explicit: true };
         let yes = Logits {
             logits: vec![3.0, 0.0],

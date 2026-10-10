@@ -118,6 +118,10 @@ impl<'a> AccountRepository<'a> {
             "DELETE FROM history_email_meta WHERE account_email = ?1",
             params![email],
         )?;
+        transaction.execute(
+            "DELETE FROM rule_label_overrides WHERE account_email = ?1",
+            params![email],
+        )?;
         transaction.execute("DELETE FROM rules WHERE account_email = ?1", params![email])?;
         transaction.execute(
             "DELETE FROM gmail_sync_state WHERE account_email = ?1",
