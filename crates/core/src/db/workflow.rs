@@ -1,3 +1,5 @@
+use std::collections::{BTreeSet, HashMap};
+
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result, Transaction};
 use serde::Serialize;
@@ -1107,6 +1109,42 @@ impl<'a> WorkflowRepository<'a> {
         rows.collect()
     }
 
+    /// The labels Post Office added to each run's message, net of what later
+    /// plans took back off. Only plans Gmail confirmed count, so a failed or
+    /// still-pending plan never claims a label. Folded in `id` order with
+    /// removals before additions, matching `apply_local_labels`.
+    pub fn applied_labels(&self, run_ids: &[i64]) -> Result<HashMap<i64, BTreeSet<String>>> {
+        if run_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = (1..=run_ids.len())
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT run_id, add_label_ids, remove_label_ids
+             FROM workflow_action_plans
+             WHERE state = 'succeeded' AND run_id IN ({placeholders}) ORDER BY id ASC"
+        ))?;
+        let rows = statement.query_map(params_from_iter(run_ids.iter()), |row| {
+            let ids =
+                |text: String| -> Vec<String> { serde_json::from_str(&text).unwrap_or_default() };
+            Ok((
+                row.get::<_, i64>(0)?,
+                ids(row.get::<_, String>(1)?),
+                ids(row.get::<_, String>(2)?),
+            ))
+        })?;
+        let mut applied: HashMap<i64, BTreeSet<String>> = HashMap::new();
+        for row in rows {
+            let (run_id, added, removed) = row?;
+            let labels = applied.entry(run_id).or_default();
+            labels.retain(|label| !removed.contains(label));
+            labels.extend(added);
+        }
+        Ok(applied)
+    }
+
     pub fn events(&self, run_id: i64) -> Result<Vec<WorkflowEvent>> {
         let mut statement = self.conn.prepare(
             "SELECT id, kind, detail, created_at
@@ -1678,6 +1716,68 @@ mod tests {
                 repo.action_for_rule(run.id, 0)?.unwrap().remove_label_ids,
                 ["INBOX"]
             );
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn applied_labels_net_additions_against_later_removals() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        db.with_workflow(|repo| {
+            repo.initialize_mailbox("test@example.com", "100")?;
+            repo.activate_rule_set("test@example.com", r#"{"rules":[]}"#)?;
+            repo.enqueue_arrivals("test@example.com", "101", &["message-1".into()])?;
+            let run = repo.claim_next("test@example.com", "lease-1")?.unwrap();
+
+            let first = repo
+                .plan_action(
+                    run.id,
+                    "lease-1",
+                    0,
+                    &["Label_1".into(), "Label_2".into()],
+                    &[],
+                )?
+                .unwrap();
+            repo.confirm_action(
+                first.id,
+                run.id,
+                "lease-1",
+                r#"{"label_ids":[]}"#,
+                r#"["Label_1","Label_2"]"#,
+                1,
+                true,
+            )?;
+
+            // Never confirmed, so it must not claim the label it would have added.
+            repo.plan_action(run.id, "lease-1", 1, &["Label_9".into()], &[])?;
+
+            let second = repo
+                .plan_action(
+                    run.id,
+                    "lease-1",
+                    2,
+                    &["Label_3".into()],
+                    &["Label_2".into()],
+                )?
+                .unwrap();
+            repo.confirm_action(
+                second.id,
+                run.id,
+                "lease-1",
+                r#"{"label_ids":[]}"#,
+                r#"["Label_1","Label_3"]"#,
+                3,
+                true,
+            )?;
+
+            let applied = repo.applied_labels(&[run.id])?;
+            assert_eq!(
+                applied.get(&run.id).unwrap().iter().collect::<Vec<_>>(),
+                ["Label_1", "Label_3"]
+            );
+            assert!(repo.applied_labels(&[])?.is_empty());
             Ok::<(), rusqlite::Error>(())
         })
         .unwrap();

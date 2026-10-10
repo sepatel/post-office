@@ -82,6 +82,12 @@ const EXCLUDED_CLASSIFICATION_IDS: [&str; 14] = [
     "CATEGORY_PROMOTIONS",
 ];
 
+/// Gmail ids for user-created labels are `Label_<random>`; system ids are
+/// readable words that mean something outside this mailbox's taxonomy.
+pub fn is_user_label_id(id: &str) -> bool {
+    id.starts_with("Label_")
+}
+
 /// Whether this Gmail label is a user topic the classifier may choose.
 /// System labels (`INBOX`, `SENT`, `STARRED`, …) and Gmail's virtual names
 /// (`CATEGORY_*`, `[Imap]/…`, `[Gmail]/…`, `[Google Mail]/…`) are excluded

@@ -285,7 +285,8 @@ export interface WorkflowQueueItem {
   sender: string | null;
   subject: string | null;
   preview: string;
-  labels: string[];
+  applied_labels: string[];
+  inherited_labels: string[];
   state: WorkflowRunState | string;
   next_rule_index: number;
   next_rule_name: string | null;

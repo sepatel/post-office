@@ -12,7 +12,9 @@ use crate::db::workflow::{
     WorkflowStep, WorkflowTokenUsage, MAX_ATTEMPTS,
 };
 use crate::db::Database;
-use crate::gmail::models::{HistoryRecord, Message};
+use crate::gmail::models::{
+    is_classifiable_label, is_user_label_id, HistoryRecord, Label, Message,
+};
 use crate::gmail::{cached_labels, GmailClient, GmailError};
 use crate::llm::{
     InferenceRouter, InferenceRuntime, LlmProviderProfile, LlmRoutingPolicy, ReasoningEffort,
@@ -26,6 +28,10 @@ use crate::rules::models::Rule;
 
 const RETRY_DELAY_SECS: u64 = 60;
 const MAX_RUNS_PER_TICK: usize = 20;
+
+/// Stand-in for a run whose plans never landed, so the map lookup at each call
+/// site does not need an `unwrap_or_default`.
+static EMPTY_APPLIED: BTreeSet<String> = BTreeSet::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IngestionResult {
@@ -44,7 +50,10 @@ pub struct QueueItem {
     pub sender: Option<String>,
     pub subject: Option<String>,
     pub preview: String,
-    pub labels: Vec<String>,
+    /// User labels on the message right now, split by who put them there:
+    /// Post Office added them, or they were already there when the run began.
+    pub applied_labels: Vec<String>,
+    pub inherited_labels: Vec<String>,
     pub state: String,
     pub next_rule_index: i64,
     pub next_rule_name: Option<String>,
@@ -152,20 +161,35 @@ pub fn rule_activity(
     page: u32,
     per_page: u32,
 ) -> Result<RuleActivityPage, rusqlite::Error> {
-    let labels = label_names(db, account_email);
-    let (runs, total, totals, all_time_total) =
-        db.with_workflow(|repo| -> rusqlite::Result<(Vec<_>, i64, Vec<_>, i64)> {
-            let runs = repo.rule_activity(account_email, rule_id, outcome, since, page, per_page)?;
+    let labels = label_map(db, account_email);
+    let (runs, applied, total, totals, all_time_total) =
+        db.with_workflow(|repo| -> rusqlite::Result<_> {
+            let runs =
+                repo.rule_activity(account_email, rule_id, outcome, since, page, per_page)?;
+            let run_ids = runs
+                .iter()
+                .map(|activity| activity.run.run_id)
+                .collect::<Vec<_>>();
             let total = repo.rule_activity_count(account_email, rule_id, outcome, since)?;
             let totals = repo.rule_activity_totals(account_email, rule_id, since)?;
             let all_time_total = repo.rule_activity_count(account_email, rule_id, None, None)?;
-            Ok((runs, total, totals, all_time_total))
+            Ok((
+                runs,
+                repo.applied_labels(&run_ids)?,
+                total,
+                totals,
+                all_time_total,
+            ))
         })?;
     let items = runs
         .iter()
         .map(|activity| {
             Ok(RuleActivity {
-                message: queue_item(&activity.run, &labels)?,
+                message: queue_item(
+                    &activity.run,
+                    &labels,
+                    applied.get(&activity.run.run_id).unwrap_or(&EMPTY_APPLIED),
+                )?,
                 outcome: activity.step.outcome.clone(),
                 decision: activity.step.decision.clone(),
                 error: activity.step.error.clone(),
@@ -188,10 +212,20 @@ pub fn queue_items(
     page: u32,
     per_page: u32,
 ) -> Result<Vec<QueueItem>, rusqlite::Error> {
-    let labels = label_names(db, account_email);
-    db.with_workflow(|repo| repo.list_runs(account_email, state, page, per_page))?
-        .iter()
-        .map(|run| queue_item(run, &labels))
+    let labels = label_map(db, account_email);
+    let (runs, applied) = db.with_workflow(|repo| -> rusqlite::Result<_> {
+        let runs = repo.list_runs(account_email, state, page, per_page)?;
+        let run_ids = runs.iter().map(|run| run.run_id).collect::<Vec<_>>();
+        Ok((runs, repo.applied_labels(&run_ids)?))
+    })?;
+    runs.iter()
+        .map(|run| {
+            queue_item(
+                run,
+                &labels,
+                applied.get(&run.run_id).unwrap_or(&EMPTY_APPLIED),
+            )
+        })
         .collect()
 }
 
@@ -220,8 +254,7 @@ pub fn message_detail(
     else {
         return Ok(None);
     };
-    let labels = label_names(db, account_email);
-    let message = queue_item(&run, &labels)?;
+    let labels = label_map(db, account_email);
     let body = parse_message(&run)
         .map(|message| EmailView::from_message(&message).body)
         .unwrap_or_default();
@@ -231,16 +264,21 @@ pub fn message_detail(
         .and_then(|snapshot| rule_context(snapshot, run.next_rule_index));
     db.with_workflow(|repo| {
         let mut action_plans = repo.action_plans(run.run_id)?;
+        let applied = repo
+            .applied_labels(&[run.run_id])?
+            .remove(&run.run_id)
+            .unwrap_or_default();
+        let message = queue_item(&run, &labels, &applied)?;
         for action in &mut action_plans {
             action.add_label_names = action
                 .add_label_ids
                 .iter()
-                .map(|label| labels.get(label).cloned().unwrap_or_else(|| label.clone()))
+                .map(|label| label_name(&labels, label))
                 .collect();
             action.remove_label_names = action
                 .remove_label_ids
                 .iter()
-                .map(|label| labels.get(label).cloned().unwrap_or_else(|| label.clone()))
+                .map(|label| label_name(&labels, label))
                 .collect();
         }
         let mut llm_attempts = repo.llm_attempts(run.run_id)?;
@@ -276,18 +314,17 @@ pub fn rule_set_status(
 
 fn queue_item(
     run: &WorkflowRun,
-    label_names: &HashMap<String, String>,
+    label_map: &HashMap<String, Label>,
+    applied: &BTreeSet<String>,
 ) -> Result<QueueItem, rusqlite::Error> {
     let message = parse_message(run);
-    let labels = run
+    let current = run
         .labels_json
         .as_deref()
         .and_then(|json| serde_json::from_str(json).ok())
         .or_else(|| message.as_ref().map(|message| message.label_ids.clone()))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|label| label_names.get(&label).cloned().unwrap_or(label))
-        .collect();
+        .unwrap_or_default();
+    let (applied_labels, inherited_labels) = split_labels(current, applied, label_map);
     let (sender, subject, preview) = message
         .as_ref()
         .map(|message| {
@@ -309,7 +346,8 @@ fn queue_item(
         sender,
         subject,
         preview,
-        labels,
+        applied_labels,
+        inherited_labels,
         state: run.state.clone(),
         next_rule_index: run.next_rule_index,
         next_rule_name,
@@ -432,17 +470,56 @@ fn retry_summary(attempt_count: i64, events: &[WorkflowEvent]) -> WorkflowRetryS
     }
 }
 
-fn label_names(db: &Database, account_email: &str) -> HashMap<String, String> {
+fn label_map(db: &Database, account_email: &str) -> HashMap<String, Label> {
     db.with_labels(|repo| {
         repo.get(account_email).map(|cached| {
             cached
                 .into_iter()
                 .flat_map(|cached| cached.labels)
-                .map(|label| (label.id, label.name))
+                .map(|label| (label.id.clone(), label))
                 .collect()
         })
     })
     .unwrap_or_default()
+}
+
+/// Whether a label id on a message is one the user would recognise as a topic,
+/// as opposed to Gmail's mailbox state. The cached label list can be stale, so
+/// an id we cannot resolve falls back to Gmail's own user-id prefix.
+fn is_user_label(label_map: &HashMap<String, Label>, id: &str) -> bool {
+    label_map
+        .get(id)
+        .map_or_else(|| is_user_label_id(id), is_classifiable_label)
+}
+
+fn label_name(label_map: &HashMap<String, Label>, id: &str) -> String {
+    label_map
+        .get(id)
+        .map_or_else(|| id.to_owned(), |label| label.name.clone())
+}
+
+/// Splits a message's current labels into the ones this run added and the ones
+/// it inherited, dropping system labels. Alphabetical, so a row does not
+/// reshuffle between polls.
+fn split_labels(
+    current: Vec<String>,
+    applied: &BTreeSet<String>,
+    label_map: &HashMap<String, Label>,
+) -> (Vec<String>, Vec<String>) {
+    let mut added = BTreeSet::new();
+    let mut inherited = BTreeSet::new();
+    for id in current {
+        if !is_user_label(label_map, &id) {
+            continue;
+        }
+        let name = label_name(label_map, &id);
+        if applied.contains(&id) {
+            added.insert(name);
+        } else {
+            inherited.insert(name);
+        }
+    }
+    (added.into_iter().collect(), inherited.into_iter().collect())
 }
 
 fn parse_message(run: &WorkflowRun) -> Option<Message> {
@@ -1390,6 +1467,53 @@ mod tests {
             size_estimate: 0,
             payload: None,
         }
+    }
+
+    fn user_label(id: &str, name: &str) -> Label {
+        Label {
+            id: id.into(),
+            name: name.into(),
+            label_type: "user".into(),
+            message_list_visibility: None,
+            label_list_visibility: None,
+        }
+    }
+
+    #[test]
+    fn system_labels_are_dropped_and_others_split_by_provenance() {
+        let label_map = HashMap::from([
+            ("Label_1".into(), user_label("Label_1", "Receipts")),
+            ("Label_2".into(), user_label("Label_2", "Recruiters")),
+            (
+                "CATEGORY_UPDATES".into(),
+                user_label("CATEGORY_UPDATES", "Updates"),
+            ),
+        ]);
+        let current = vec![
+            "Label_1".into(),
+            "Label_2".into(),
+            "INBOX".into(),
+            "CATEGORY_UPDATES".into(),
+        ];
+        let applied = BTreeSet::from(["Label_2".into()]);
+        assert_eq!(
+            split_labels(current, &applied, &label_map),
+            (vec!["Recruiters".to_string()], vec!["Receipts".to_string()])
+        );
+    }
+
+    #[test]
+    fn labels_missing_from_the_cache_fall_back_to_their_id() {
+        let applied = BTreeSet::from(["Label_9".into()]);
+        // Nothing cached, but the `Label_` prefix still marks it as a user topic.
+        assert_eq!(
+            split_labels(
+                vec!["Label_9".into(), "UNREAD".into()],
+                &applied,
+                &HashMap::new()
+            ),
+            (vec!["Label_9".to_string()], vec![])
+        );
     }
 
     #[test]
