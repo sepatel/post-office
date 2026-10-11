@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useMemo,
   useState,
   type ReactNode,
 } from "react";
@@ -48,11 +49,16 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [remove]
   );
 
-  const api: ToastApi = {
-    show,
-    success: (message: string) => show(message, "success"),
-    error: (message: string) => show(message, "error"),
-  };
+  // Stable across renders: consumers put this in effect dependencies, and a
+  // fresh object each render would re-run every effect that mentions it.
+  const api = useMemo<ToastApi>(
+    () => ({
+      show,
+      success: (message: string) => show(message, "success"),
+      error: (message: string) => show(message, "error"),
+    }),
+    [show]
+  );
 
   return (
     <ToastContext.Provider value={api}>

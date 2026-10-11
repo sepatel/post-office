@@ -16,8 +16,8 @@ import LoadError from "../components/LoadError";
 import InferenceStudio, {
   type InferenceConfig,
 } from "../components/InferenceStudio";
-import LocalDecisions from "../components/LocalDecisions";
 import LabelLibraryPanel from "../components/LabelLibraryPanel";
+import LocalDecisions from "./LocalDecisions";
 
 interface Config extends InferenceConfig {
   gmail_account: string | null;
@@ -28,7 +28,7 @@ interface Config extends InferenceConfig {
   tray_theme: string;
 }
 
-type SettingsTab = "inference" | "mailbox" | "labels";
+type SettingsTab = "inference" | "local" | "mailbox" | "labels";
 
 export default function Settings() {
   const { connection, accounts, activeEmail, refreshAccounts } = useGate();
@@ -41,7 +41,13 @@ export default function Settings() {
   const request = useRef(0);
   const rawTab = searchParams.get("tab");
   const tab: SettingsTab =
-    rawTab === "mailbox" ? "mailbox" : rawTab === "labels" ? "labels" : "inference";
+    rawTab === "mailbox"
+      ? "mailbox"
+      : rawTab === "labels"
+        ? "labels"
+        : rawTab === "local"
+          ? "local"
+          : "inference";
 
   useEffect(() => {
     void loadConfig();
@@ -172,9 +178,12 @@ export default function Settings() {
 
       {loadError && <div className="mb-6"><LoadError title="Some account data could not be refreshed" error={loadError} onRetry={() => void loadConfig()} /></div>}
 
-      <div className="mb-7 flex max-w-xl gap-1 rounded-xl border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
+      <div className="mb-7 flex max-w-2xl gap-1 rounded-xl border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
         <TabButton active={tab === "inference"} onClick={() => selectTab("inference")}>
           Inference
+        </TabButton>
+        <TabButton active={tab === "local"} onClick={() => selectTab("local")}>
+          Local decisions
         </TabButton>
         <TabButton active={tab === "mailbox"} onClick={() => selectTab("mailbox")}>
           Mailbox
@@ -185,14 +194,13 @@ export default function Settings() {
       </div>
 
       {tab === "inference" && (
-        <>
-          <InferenceStudio
-            config={config}
-            onConfigChange={(next) => setConfig({ ...config, ...next })}
-          />
-          <LocalDecisions />
-        </>
+        <InferenceStudio
+          config={config}
+          onConfigChange={(next) => setConfig({ ...config, ...next })}
+        />
       )}
+
+      {tab === "local" && <LocalDecisions />}
 
       {tab === "mailbox" && (
         <div className="max-w-3xl space-y-6">

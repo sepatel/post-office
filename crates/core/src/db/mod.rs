@@ -117,7 +117,7 @@ impl Database {
 
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock();
-        snapshot_before(&conn, 30);
+        snapshot_before(&conn, 32);
         let transaction = conn.unchecked_transaction()?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -272,6 +272,12 @@ impl Database {
                 "../../../../migrations/031_workflow_steps_by_rule.sql"
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (31)", [])?;
+        }
+        if !migration_applied(&transaction, 32)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/032_verdict_adjudication.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (32)", [])?;
         }
         transaction.commit()
     }

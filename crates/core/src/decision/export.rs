@@ -3,9 +3,11 @@
 //! and training) and `decisions.captures.jsonl` (the model's raw output, so
 //! calibration can be refit without running it again).
 //!
-//! Labels are the LLM's answers (`source: "llm"`), overridden by the user's
-//! where feedback says what the answer should have been (`source: "user"`).
-//! The files contain email text: keep them local.
+//! Labels start from the LLM's answers (`source: "llm"`). Where the user has
+//! ruled on a disagreement, their ruling is the label instead (`source:
+//! "user"`), and a decision they called hard for both is left out entirely
+//! rather than labelled with whichever answer was nearer. The files contain
+//! email text: keep them local.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -15,13 +17,13 @@ use rverdict_core::RenderedKind;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::db::verdicts::{Feedback, VerdictRow};
+use crate::db::verdicts::{Adjudication, Feedback, VerdictRow};
 use crate::db::Database;
 use crate::gmail::models::{Label, Message};
 use crate::rules::email_view::EmailView;
 
 use super::questions::{framing_group, state_text, Meaning};
-use super::report::{captures, is_negative};
+use super::report::{captures, is_negative, verdict_option};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportSummary {
@@ -50,10 +52,7 @@ fn user_option(
     feedback: &[&Feedback],
     label_names: &HashMap<String, String>,
 ) -> Option<usize> {
-    if feedback
-        .iter()
-        .any(|f| f.kind == "thumbs_up" || f.kind == "verdict_right")
-    {
+    if feedback.iter().any(|f| f.kind == "llm_right") {
         return row.llm_option.and_then(|o| usize::try_from(o).ok());
     }
     // A label the user added that is on the menu is the right answer.
@@ -154,11 +153,23 @@ pub fn export(
             .unwrap_or_default();
         // Feedback about this row alone decides this row; step-level feedback
         // still speaks for every row the step fanned out to.
-        let mut feedback = by_step.get(&row.step_id).cloned().unwrap_or_default();
-        if let Some(specific) = by_verdict.get(&row.id) {
-            feedback.extend(specific.iter().copied());
-        }
-        let user = user_option(&row, &meanings, &feedback, &label_names);
+        let step = by_step.get(&row.step_id).cloned().unwrap_or_default();
+        let specific = by_verdict.get(&row.id).cloned().unwrap_or_default();
+        let mut feedback = step.clone();
+        feedback.extend(specific.iter().copied());
+
+        // A decision the user called hard for both carries no answer to learn
+        // from, so it is dropped rather than labelled with the nearer miss.
+        let user = match Adjudication::from_feedback(&step, &specific) {
+            Some(Adjudication::Neither) => continue,
+            Some(Adjudication::Rverdict) => match verdict_option(&row) {
+                Some(option) => Some(option),
+                // Falling back would write back the very label the user
+                // rejected.
+                None => continue,
+            },
+            Some(Adjudication::Llm) | None => user_option(&row, &meanings, &feedback, &label_names),
+        };
         let (option, source) = match (user, row.llm_option) {
             (Some(option), _) => (option, "user"),
             (None, Some(option)) => (usize::try_from(option).unwrap_or(usize::MAX), "llm"),
@@ -214,6 +225,11 @@ mod tests {
     use crate::decision::worker::shadow_batch;
     use crate::decision::worker::tests::{seeded, FirstOption};
 
+    /// Each test needs its own: they run in parallel in one process.
+    fn dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("po-export-{}-{name}", std::process::id()))
+    }
+
     #[test]
     fn exports_llm_labels_and_user_corrections() {
         let db = seeded();
@@ -232,8 +248,7 @@ mod tests {
             )
         })
         .unwrap();
-        let dir = std::env::temp_dir().join(format!("po-export-{}", std::process::id()));
-        let summary = export(&db, &dir, None).unwrap();
+        let summary = export(&db, &dir("implicit"), None).unwrap();
         assert_eq!(
             (summary.decisions, summary.from_user, summary.captures),
             (3, 1, 3)
@@ -255,6 +270,75 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("Subject: Invoice 4411"));
-        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Reads back one exported line per question.
+    fn exported(summary: &ExportSummary) -> Vec<Value> {
+        std::fs::read_to_string(&summary.decisions_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn adjudicate(db: &Database, framing: &str, right: Adjudication) {
+        let row = db
+            .with_verdicts(|r| r.all(None))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.framing == framing)
+            .expect("a shadowed row");
+        db.with_verdicts(|r| r.set_adjudication(row.id, Some(right)))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_ruling_that_rverdict_was_right_labels_the_row_with_its_answer() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        adjudicate(&db, "menu", Adjudication::Rverdict);
+
+        let summary = export(&db, &dir("ruled"), None).unwrap();
+        let menu = exported(&summary)
+            .into_iter()
+            .find(|line| line["subset"] == "menu")
+            .unwrap();
+        assert_eq!(
+            (&menu["expected"], &menu["source"]),
+            (&json!("c0"), &json!("user"))
+        );
+        assert_eq!(summary.from_user, 1);
+    }
+
+    #[test]
+    fn a_ruling_that_the_llm_was_right_keeps_its_answer() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        adjudicate(&db, "menu", Adjudication::Llm);
+
+        let menu = exported(&export(&db, &dir("confirmed"), None).unwrap())
+            .into_iter()
+            .find(|line| line["subset"] == "menu")
+            .unwrap();
+        assert_eq!(
+            (&menu["expected"], &menu["source"]),
+            (&json!("c0"), &json!("user"))
+        );
+    }
+
+    /// Neither answer is worth learning from, so the decision is left out of
+    /// the export entirely rather than labelled with the nearer miss.
+    #[test]
+    fn a_ruling_that_neither_was_right_drops_the_decision() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        adjudicate(&db, "menu", Adjudication::Neither);
+
+        let summary = export(&db, &dir("neither"), None).unwrap();
+        assert_eq!(summary.decisions, 2);
+        assert_eq!(summary.captures, 2);
+        assert!(!exported(&summary)
+            .iter()
+            .any(|line| line["subset"] == "menu"));
     }
 }

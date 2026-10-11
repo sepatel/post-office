@@ -8,7 +8,7 @@ use rverdict_core::{Calibration, Logits, RenderedKind};
 use rverdict_eval::calibrate::{self, Capture, Form};
 use serde::Serialize;
 
-use crate::db::verdicts::{Feedback, VerdictRow};
+use crate::db::verdicts::{Adjudication, Feedback, VerdictRow};
 use crate::db::Database;
 use crate::decision::questions::framing_group;
 
@@ -48,6 +48,17 @@ pub struct RuleReport {
     /// Of the decisions the user marked wrong, how many rverdict disagreed
     /// with the LLM on.
     pub feedback_verdict_disagreed: usize,
+    /// Where the two answers differed.
+    pub disagreements: usize,
+    /// Of those, how far the user has ruled on who was right.
+    pub adjudicated: usize,
+    pub adjudications_llm_right: usize,
+    pub adjudications_rverdict_right: usize,
+    pub adjudications_both_wrong: usize,
+    /// Of the disagreements with a named winner, the share rverdict won. This
+    /// is the number a rule has to clear before its answers are worth acting
+    /// on, and it rests entirely on the user having ruled.
+    pub rverdict_wins: Option<f64>,
     pub calibration: Option<CalibrationReport>,
     pub median_ms: Option<i64>,
     pub truncated: usize,
@@ -75,9 +86,35 @@ pub fn is_negative(kind: &str) -> bool {
             | "restored_from_spam"
             | "unarchived"
             | "unstarred"
-            | "thumbs_down"
-            | "verdict_wrong"
+            | "llm_wrong"
+            | "rverdict_right"
     )
+}
+
+/// The option rverdict chose, as an index into the row's options.
+/// `verdict_choice` names it only on a match, so a declined row otherwise
+/// has no answer to write down. Ties keep the earlier option, as the
+/// worker does.
+pub fn verdict_option(row: &VerdictRow) -> Option<usize> {
+    let probabilities: Vec<f64> = serde_json::from_str(row.probabilities_json.as_deref()?).ok()?;
+    probabilities
+        .iter()
+        .copied()
+        .enumerate()
+        .fold(None, |best: Option<(usize, f64)>, (i, p)| match best {
+            Some((_, seen)) if seen >= p => best,
+            _ => Some((i, p)),
+        })
+        .map(|(index, _)| index)
+}
+
+/// Whether the user has settled what this row's gold label should be.
+/// Fitting against the LLM's answer would then score either a label
+/// already known to be wrong or the model's own output back at it.
+fn is_settled(feedback: &[&Feedback]) -> bool {
+    feedback
+        .iter()
+        .any(|f| f.kind == "llm_wrong" || Adjudication::from_kind(&f.kind).is_some())
 }
 
 pub fn rule_reports(
@@ -174,6 +211,7 @@ fn summarize(
 ) -> RuleReport {
     let compared: Vec<&&VerdictRow> = rows.iter().filter(|r| r.agrees.is_some()).collect();
     let agreed = compared.iter().filter(|r| r.agrees == Some(true)).count();
+    let disagreeing = compared.len() - agreed;
 
     let mut answers: HashMap<i64, usize> = HashMap::new();
     for row in rows {
@@ -198,6 +236,27 @@ fn summarize(
         .filter(|r| r.confidence.is_some_and(|c| c >= ACT_THRESHOLD))
         .collect();
     let confident_disagreements = confident.iter().filter(|r| r.agrees == Some(false)).count();
+
+    // Unlike the implicit counters below, a ruling is per label question: a
+    // 57-label step the user marked wrong on two of them is two answered
+    // questions, not one.
+    let mut rulings = [0usize; 3];
+    for row in compared.iter().filter(|r| r.agrees == Some(false)) {
+        let step = feedback
+            .get(&row.step_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let specific = per_row.get(&row.id).map(Vec::as_slice).unwrap_or_default();
+        let index = match Adjudication::from_feedback(step, specific) {
+            Some(Adjudication::Llm) => 0,
+            Some(Adjudication::Rverdict) => 1,
+            Some(Adjudication::Neither) => 2,
+            None => continue,
+        };
+        rulings[index] += 1;
+    }
+    let adjudicated = rulings.iter().sum();
+    let decided = rulings[0] + rulings[1];
 
     // A step is the LLM's one decision, but a step fans out to a row per
     // question — 57 labels for a multiple-match rule. Counting feedback per row
@@ -244,7 +303,13 @@ fn summarize(
         feedback: feedback_n,
         feedback_llm_wrong: llm_wrong,
         feedback_verdict_disagreed: verdict_disagreed,
-        calibration: calibration_report(rows, calibration),
+        disagreements: disagreeing,
+        adjudicated,
+        adjudications_llm_right: rulings[0],
+        adjudications_rverdict_right: rulings[1],
+        adjudications_both_wrong: rulings[2],
+        rverdict_wins: share(rulings[1], decided),
+        calibration: calibration_report(rows, feedback, per_row, calibration),
         median_ms: durations.get(durations.len() / 2).copied(),
         truncated: rows.iter().filter(|r| r.truncated == Some(true)).count(),
         ..RuleReport::default()
@@ -268,11 +333,31 @@ pub fn captures(rows: &[&VerdictRow]) -> Vec<Capture> {
         .collect()
 }
 
+/// Held-out comparison of the model's calibration with one refit on half of
+/// this rule's history. Rows the user has ruled on are left out: the fit would
+/// either chase a label already known to be wrong or score the model's own
+/// output back at itself.
+#[allow(clippy::too_many_arguments)]
 fn calibration_report(
     rows: &[&VerdictRow],
+    feedback: &HashMap<i64, Vec<&Feedback>>,
+    per_row: &HashMap<i64, Vec<&Feedback>>,
     calibration: &Calibration,
 ) -> Option<CalibrationReport> {
-    let captures = captures(rows);
+    let captures = captures(
+        &rows
+            .iter()
+            .filter(|row| {
+                !is_settled(
+                    feedback
+                        .get(&row.step_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                ) && !is_settled(per_row.get(&row.id).map(Vec::as_slice).unwrap_or_default())
+            })
+            .copied()
+            .collect::<Vec<_>>(),
+    );
     if captures.len() < MIN_FOR_CALIBRATION {
         return None;
     }
@@ -296,15 +381,35 @@ fn calibration_report(
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::params;
+    use rverdict_core::Logits;
+
     use super::*;
+    use crate::db::verdicts::NewVerdict;
     use crate::decision::worker::shadow_batch;
     use crate::decision::worker::tests::{seeded, seeded_multi, FirstOption};
+
+    fn report(db: &Database, rule_name: &str) -> RuleReport {
+        rule_reports(db, None, &Calibration::default())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.rule_name == rule_name)
+            .unwrap()
+    }
+
+    /// The one verdict row in `db` where the two answers differ.
+    fn disagreement(db: &Database) -> VerdictRow {
+        db.with_verdicts(|r| r.all(None))
+            .unwrap()
+            .into_iter()
+            .find(|v| v.agrees == Some(false))
+            .expect("a disagreement")
+    }
 
     #[test]
     fn reports_agreement_per_rule_and_framing() {
         let db = seeded();
         shadow_batch(&db, &FirstOption::default(), 10).unwrap();
-        db.with_verdicts(|r| r.set_rating(2, Some(false))).unwrap();
         let reports = rule_reports(&db, None, &Calibration::default()).unwrap();
         let summary: Vec<_> = reports
             .iter()
@@ -314,7 +419,7 @@ mod tests {
                     r.framing.as_str(),
                     r.decisions,
                     r.agreement,
-                    r.feedback_llm_wrong,
+                    r.disagreements,
                 )
             })
             .collect();
@@ -323,7 +428,7 @@ mod tests {
             [
                 ("Alerts", "binary", 1, Some(1.0), 0),
                 ("Alerts", "noul", 1, Some(1.0), 0),
-                ("Sort", "menu", 1, Some(1.0), 1),
+                ("Sort", "menu", 1, Some(1.0), 0),
             ]
         );
         assert!(reports.iter().all(|r| r.calibration.is_none()));
@@ -342,69 +447,144 @@ mod tests {
         assert_eq!(sort, [("multi", 2, Some(0.5))]);
     }
 
-    /// A step fans out to a row per label, so rating one label wrong must not
-    /// mark the step's other labels wrong too.
+    /// A ruling is about one label question, so the other label the step fanned
+    /// out to is neither counted nor answered by it.
     #[test]
-    fn a_row_rating_is_not_read_as_a_verdict_on_the_whole_step() {
+    fn a_ruling_about_one_label_leaves_the_step_other_labels_alone() {
         let db = seeded_multi();
         shadow_batch(&db, &FirstOption::default(), 10).unwrap();
-        let rows = db.with_verdicts(|r| r.all(None)).unwrap();
-        let work = rows
-            .iter()
-            .find(|v| v.target.as_deref() == Some("\"Work\""))
-            .expect("a Work row");
-        db.with_verdicts(|r| r.set_verdict_rating(work.id, Some(false)))
+        let work = disagreement(&db);
+        db.with_verdicts(|r| r.set_adjudication(work.id, Some(Adjudication::Rverdict)))
             .unwrap();
 
-        let sort = rule_reports(&db, None, &Calibration::default())
-            .unwrap()
-            .into_iter()
-            .find(|r| r.rule_name == "Sort")
-            .unwrap();
-        // One decision rated, not one per row.
-        assert_eq!(sort.feedback, 1);
-        assert_eq!(sort.feedback_llm_wrong, 1);
-        // Work was the row rverdict disagreed on, so it counts.
-        assert_eq!(sort.feedback_verdict_disagreed, 1);
-    }
-
-    /// A thumbs-down on the step still speaks for every row it fanned out to.
-    #[test]
-    fn a_step_rating_applies_to_all_of_its_rows() {
-        let db = seeded_multi();
-        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
-        db.with_verdicts(|r| r.set_rating(2, Some(false))).unwrap();
-
-        let sort = rule_reports(&db, None, &Calibration::default())
-            .unwrap()
-            .into_iter()
-            .find(|r| r.rule_name == "Sort")
-            .unwrap();
-        // Two rows, but one decision, so it is counted once.
+        let sort = report(&db, "Sort");
         assert_eq!(sort.decisions, 2);
-        assert_eq!(sort.feedback, 1);
-        assert_eq!(sort.feedback_llm_wrong, 1);
-        assert_eq!(sort.feedback_verdict_disagreed, 1);
+        assert_eq!(sort.disagreements, 1);
+        assert_eq!(sort.adjudicated, 1);
+        assert_eq!(sort.adjudications_rverdict_right, 1);
+        assert_eq!(sort.rverdict_wins, Some(1.0));
     }
 
-    /// Clearing or replacing the step's rating must leave the per-label ones
-    /// alone: they are separate signals about separate questions.
+    /// Re-ruling replaces the earlier statement rather than leaving both on the
+    /// row for the report to weigh.
     #[test]
-    fn a_step_rating_leaves_the_row_ratings_alone() {
+    fn a_second_ruling_replaces_the_first() {
         let db = seeded_multi();
         shadow_batch(&db, &FirstOption::default(), 10).unwrap();
-        let rows = db.with_verdicts(|r| r.all(None)).unwrap();
-        let work = rows
-            .iter()
-            .find(|v| v.target.as_deref() == Some("\"Work\""))
-            .expect("a Work row");
-        db.with_verdicts(|r| r.set_verdict_rating(work.id, Some(false)))
+        let work = disagreement(&db);
+        db.with_verdicts(|r| r.set_adjudication(work.id, Some(Adjudication::Rverdict)))
             .unwrap();
-        db.with_verdicts(|r| r.set_rating(2, Some(true))).unwrap();
+        db.with_verdicts(|r| r.set_adjudication(work.id, Some(Adjudication::Neither)))
+            .unwrap();
 
-        let feedback = db.with_verdicts(|r| r.feedback_for_steps()).unwrap();
-        let kinds: Vec<_> = feedback.iter().map(|f| f.kind.as_str()).collect();
-        assert!(kinds.contains(&"verdict_wrong"));
-        assert!(kinds.contains(&"thumbs_up"));
+        let sort = report(&db, "Sort");
+        assert_eq!(sort.adjudications_rverdict_right, 0);
+        assert_eq!(sort.adjudications_both_wrong, 1);
+        // Nobody won, so there is no share to report.
+        assert_eq!(sort.rverdict_wins, None);
+    }
+
+    /// Clearing a ruling takes the decision back out of the report.
+    #[test]
+    fn a_ruling_can_be_cleared() {
+        let db = seeded_multi();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        let work = disagreement(&db);
+        db.with_verdicts(|r| r.set_adjudication(work.id, Some(Adjudication::Llm)))
+            .unwrap();
+        db.with_verdicts(|r| r.set_adjudication(work.id, None))
+            .unwrap();
+
+        let sort = report(&db, "Sort");
+        assert_eq!(sort.adjudicated, 0);
+        assert_eq!(sort.adjudications_llm_right, 0);
+    }
+
+    /// The option a model picked is readable from a row, and where the two
+    /// answers agree the two indices must be the same.
+    #[test]
+    fn verdict_option_matches_the_llm_option_where_they_agree() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        for row in db.with_verdicts(|r| r.all(None)).unwrap() {
+            let option = verdict_option(&row).expect("an option");
+            if row.agrees == Some(true) {
+                assert_eq!(
+                    Some(i64::try_from(option).unwrap()),
+                    row.llm_option,
+                    "{row:?}"
+                );
+            }
+        }
+    }
+
+    /// A fit that scored the model's own output back at itself would flatter it,
+    /// and one that chased a label the user rejected would be chasing noise, so
+    /// ruled-on rows are held out of the calibration comparison entirely.
+    #[test]
+    fn ruled_on_rows_are_left_out_of_the_calibration_fit() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        bulk(&db, 60);
+        assert!(report(&db, BULK).calibration.is_some());
+
+        for row in db
+            .with_verdicts(|r| r.all(None))
+            .unwrap()
+            .iter()
+            .filter(|r| r.rule_name == BULK)
+        {
+            db.with_verdicts(|r| r.set_adjudication(row.id, Some(Adjudication::Llm)))
+                .unwrap();
+        }
+        assert!(report(&db, BULK).calibration.is_none());
+    }
+
+    const BULK: &str = "Bulk";
+
+    /// Gives one rule enough well-formed history for [`MIN_FOR_CALIBRATION`]
+    /// to report on, without the shadows of the other rules muddying the count.
+    fn bulk(db: &Database, count: usize) {
+        let kind = serde_json::to_string(&RenderedKind::Noul { explicit: true }).unwrap();
+        for index in 0..count {
+            let step = 100 + i64::try_from(index).unwrap();
+            let yes = index % 2 == 0;
+            let logits = Logits {
+                logits: if yes {
+                    vec![2.0, -1.0]
+                } else {
+                    vec![-1.0, 2.0]
+                },
+                null_logits: None,
+                state_tokens: 12,
+            };
+            db.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO workflow_steps (id, run_id, rule_index, rule_legacy_id, rule_name, outcome)
+                     VALUES (?1, 1, ?2, 9, ?3, 'no_match')",
+                    params![step, 9 + step, BULK],
+                )
+            })
+            .unwrap();
+            let new = NewVerdict {
+                step_id: step,
+                run_id: 1,
+                account_email: "a@x",
+                rule_index: 9,
+                rule_legacy_id: 9,
+                rule_name: BULK,
+                framing: "noul",
+                model: "stub@1",
+                status: "ok",
+                kind_json: Some(kind.clone()),
+                logits_json: Some(serde_json::to_string(&logits).unwrap()),
+                probabilities_json: Some(if yes { "[0.9,0.1]" } else { "[0.2,0.8]" }.into()),
+                llm_option: Some(i64::from(yes)),
+                agrees: Some(true),
+                confidence: Some(0.85),
+                ..NewVerdict::default()
+            };
+            db.with_verdicts(|r| r.insert(&new)).unwrap();
+        }
     }
 }
