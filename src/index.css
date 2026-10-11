@@ -28,3 +28,36 @@ button:disabled,
 [role="button"][aria-disabled="true"] {
   cursor: not-allowed;
 }
+
+/* Native controls pick their own palette from the platform, not from the app,
+   so an open dropdown stays light in a dark window unless it is told. This also
+   covers scrollbars and anything else the toolkit draws itself. The select
+   chevron lives here too: it is read from the ancestor, because a value set on
+   the select itself would win over inheritance and never change. */
+:root {
+  color-scheme: light;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 7.5l5 5 5-5'/%3E%3C/svg%3E");
+}
+
+.dark {
+  color-scheme: dark;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 7.5l5 5 5-5'/%3E%3C/svg%3E");
+}
+
+/* A select keeps its own chrome for the same reason, and `appearance-none` is
+   what lets the classes below reach the closed control. The open list is still
+   drawn by the platform, which reads `option` rather than the select, so both
+   are set. */
+@layer components {
+  .select-field {
+    @apply appearance-none rounded-lg border border-gray-300 bg-white py-1 pl-2 pr-7 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100;
+    background-image: var(--select-chevron);
+    background-repeat: no-repeat;
+    background-position: right 0.5rem center;
+    background-size: 0.7rem;
+  }
+
+  .select-field option {
+    @apply bg-white text-gray-900 dark:bg-gray-800 dark:text-gray-100;
+  }
+}
