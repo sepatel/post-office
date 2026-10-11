@@ -31,7 +31,7 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(command), Some(db_path)) = (args.first(), args.get(1)) else {
-        eprintln!("usage: verdict <shadow|report|export> <app.db> [...]");
+        eprintln!("usage: verdict <shadow|report|export|repair> <app.db> [...]");
         std::process::exit(2);
     };
     let db_path = PathBuf::from(db_path);
@@ -56,6 +56,14 @@ fn main() -> Result<()> {
                 summary.captures,
                 summary.decisions_path.display(),
                 summary.captures_path.display()
+            );
+            Ok(())
+        }
+        "repair" => {
+            let summary = post_office_core::decision::repair::repair_targets(&db)?;
+            println!(
+                "named {} rows, {} could not be resolved",
+                summary.named, summary.unresolved
             );
             Ok(())
         }

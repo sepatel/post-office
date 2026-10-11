@@ -1032,6 +1032,12 @@ export interface VerdictRuleReport {
   feedback: number;
   feedback_llm_wrong: number;
   feedback_verdict_disagreed: number;
+  disagreements: number;
+  adjudicated: number;
+  adjudications_llm_right: number;
+  adjudications_rverdict_right: number;
+  adjudications_both_wrong: number;
+  rverdict_wins: number | null;
   calibration: VerdictCalibration | null;
   median_ms: number | null;
   truncated: number;
@@ -1054,6 +1060,8 @@ export interface VerdictRow {
   confidence: number | null;
   llm_matched: boolean | null;
   llm_choices_json: string | null;
+  /** The LLM's answer as an index into `options_json`, for this row's question. */
+  llm_option: number | null;
   agrees: boolean | null;
   state_tokens: number | null;
   truncated: boolean | null;
@@ -1093,12 +1101,45 @@ export async function verdictMessage(messageId: number): Promise<{ verdicts: Ver
   return invoke("verdict_message", { messageId });
 }
 
-export async function verdictRate(stepId: number, up: boolean | null): Promise<void> {
-  return invoke("verdict_rate", { stepId, up });
+export type Adjudication = "llm" | "rverdict" | "neither";
+
+export interface DisagreementQuery {
+  account: string | null;
+  rule_legacy_id: number | null;
+  framing: string | null;
+  confident_only: boolean;
+  /** True keeps only decided disagreements, false only the open ones. */
+  adjudicated: boolean | null;
+  limit: number;
+  offset: number;
 }
 
-export async function verdictRateRow(verdictId: number, up: boolean | null): Promise<void> {
-  return invoke("verdict_rate_row", { verdictId, up });
+export interface Disagreement extends VerdictRow {
+  message_id: number;
+  subject: string;
+  sender: string;
+  snippet: string;
+  adjudication: Adjudication | null;
+}
+
+export const EMPTY_DISAGREEMENTS: DisagreementQuery = {
+  account: null,
+  rule_legacy_id: null,
+  framing: null,
+  confident_only: false,
+  adjudicated: null,
+  limit: 50,
+  offset: 0,
+};
+
+export async function verdictDisagreements(
+  query: DisagreementQuery,
+): Promise<{ rows: Disagreement[]; total: number }> {
+  return invoke("verdict_disagreements", { query });
+}
+
+export async function verdictAdjudicate(verdictId: number, right: Adjudication | null): Promise<void> {
+  return invoke("verdict_adjudicate", { verdictId, right });
 }
 
 export async function verdictExport(): Promise<VerdictExportSummary> {

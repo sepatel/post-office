@@ -9,6 +9,7 @@
 pub mod export;
 pub mod feedback;
 pub mod questions;
+pub mod repair;
 pub mod report;
 #[cfg(feature = "embedded")]
 pub mod service;

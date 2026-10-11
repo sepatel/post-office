@@ -3,9 +3,11 @@
 
 use std::path::PathBuf;
 
-use post_office_core::db::verdicts::{Feedback, VerdictRow};
+use post_office_core::db::verdicts::{
+    Adjudication, DisagreementPage, DisagreementQuery, Feedback, VerdictRow,
+};
 use post_office_core::decision::export::ExportSummary;
-use post_office_core::decision::report::{rule_reports, RuleReport};
+use post_office_core::decision::report::{rule_reports, RuleReport, ACT_THRESHOLD};
 use post_office_core::decision::VerdictSettings;
 use serde::Serialize;
 use tauri::State;
@@ -122,31 +124,35 @@ pub async fn verdict_message(
     Ok(MessageVerdicts { verdicts, feedback })
 }
 
-/// Thumbs up (`true`), down (`false`) or cleared (`null`) on the LLM's
-/// decision for a step.
+/// The recorded disagreements for the review queue, newest first.
 #[tauri::command]
-pub async fn verdict_rate(
+pub async fn verdict_disagreements(
     state: State<'_, AppState>,
-    step_id: i64,
-    up: Option<bool>,
-) -> Result<(), String> {
-    state
-        .db
-        .with_verdicts(|repo| repo.set_rating(step_id, up))
-        .map_err(|e| e.to_string())
+    mut query: DisagreementQuery,
+) -> Result<DisagreementPage, String> {
+    // The threshold lives with the report that promotes on it, so the queue
+    // and the table cannot drift apart on what counts as confident.
+    query.model = state.verdict.model();
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_verdicts(|repo| repo.disagreements(&query, ACT_THRESHOLD))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
-/// Thumbs on the LLM's answer for one label of a multiple-match rule, as
-/// opposed to the step as a whole.
+/// Records who was right about one decision, or clears the ruling.
 #[tauri::command]
-pub async fn verdict_rate_row(
+pub async fn verdict_adjudicate(
     state: State<'_, AppState>,
     verdict_id: i64,
-    up: Option<bool>,
+    right: Option<String>,
 ) -> Result<(), String> {
+    let right = right.as_deref().map(Adjudication::from_name).transpose()?;
     state
         .db
-        .with_verdicts(|repo| repo.set_verdict_rating(verdict_id, up))
+        .with_verdicts(|repo| repo.set_adjudication(verdict_id, right))
         .map_err(|e| e.to_string())
 }
 

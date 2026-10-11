@@ -210,8 +210,8 @@ fn main() {
             verdict::verdict_settings_set,
             verdict::verdict_report,
             verdict::verdict_message,
-            verdict::verdict_rate,
-            verdict::verdict_rate_row,
+            verdict::verdict_disagreements,
+            verdict::verdict_adjudicate,
             verdict::verdict_export,
         ])
         .build(tauri::generate_context!())

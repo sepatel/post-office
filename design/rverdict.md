@@ -452,6 +452,53 @@ these changed:
 - `QUESTIONS_VERSION` is `2` (`von-1.2.0@498ceba3/q2`), so the old single
   softmax comparisons are not mixed with per-label records.
 
+#### 6.9 Reviewing the disagreements
+
+Recording both answers is only half a comparison loop; without somewhere to
+put them, the agreement report stays a curiosity and the gold labels stay the
+LLM's.
+
+- **One settings tab, not a panel.** Settings → Local decisions holds the
+  switch, a plain-language explanation of the five steps, the disagreement
+  queue, and the per-rule report. The queue is the working surface, so it
+  sits above the report.
+- **`verdict_disagreements`** pages through rows where `agrees = 0`, filtered
+  by account, rule, framing family, confidence and whether they have been
+  ruled on. It carries subject, sender and snippet so a decision can be
+  settled without opening the message, and `total` outranks the page size so
+  the pager is honest. Migration 032 indexes the disagreeing rows.
+- **One writer: `set_adjudication`.** `llm_right`, `rverdict_right` and
+  `both_wrong`, each replacing whatever the row said before. The thumbs that
+  read "LLM right?" while meaning the opposite under their `thumbs_up` /
+  `verdict_right` names are gone; migration 032 renames the kinds in place so
+  the existing history keeps counting. A step-level rating stays a separate
+  signal — being wrong about one label must not condemn the other 56.
+- **Rulings become the label.** On export, a row ruled for rverdict is
+  labelled with rverdict's own option (`source: "user"`), one ruled for the
+  LLM keeps the LLM's, and one ruled hard for both is dropped from both files
+  rather than labelled with the nearer miss.
+- **They are held out of the calibration fit.** Labelling a row with the
+  model's own output measures self-agreement, not accuracy, so any row the
+  user has ruled on is excluded from `calibration_report`. What remains is
+  still fit against the LLM's answers, and the column says so: it is a
+  what-if, not a number in use. Applying the refit is still Phase 5.
+- **`rverdict_wins`** is the share of ruled-on disagreements the local model
+  won, counted per label question rather than per step. It is the number a
+  rule has to clear, and it rests entirely on the user having ruled.
+- **Reading an answer.** Both systems answer a question with an index into that
+  row's `options_json`, so that is the only faithful way to render either: the
+  step's match-or-not is a different question. The queue once showed it anyway,
+  beside the row's own answer, which made every `menu` row read "LLM: Match" and
+  hid the category the two actually disagreed about. 94% of queued rows were
+  rendered at the wrong granularity.
+- **Missing labels were recovered, not left.** Migration 030 added `target` and
+  left existing rows null, so 10,108 of 11,970 multiple-match rows were
+  addressable only by position. `decision::repair::repair_targets` names them
+  from the run's snapshot and the rule's menu — the framing already says the
+  position, so no model is needed — in 0.5s over 101 runs. Checked against the
+  874 rows whose name was recorded at shadow time: all agree. `verdict repair
+  <db>` runs it, and re-running changes nothing.
+
 ---
 
 ## 7. Phases
