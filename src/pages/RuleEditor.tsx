@@ -748,7 +748,7 @@ export default function RuleEditor() {
             <select
               value={matchMode}
               onChange={(event) => setMatchMode(event.target.value as "single" | "multiple")}
-              className="rounded-lg border border-gray-300 bg-white px-2 py-1 text-sm dark:border-gray-700 dark:bg-gray-900"
+              className="select-field"
             >
               <option value="single">One outcome</option>
               <option value="multiple">Multiple outcomes</option>
