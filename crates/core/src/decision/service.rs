@@ -21,6 +21,71 @@ use crate::db::Database;
 const BATCH: usize = 4;
 const IDLE_WAIT: Duration = Duration::from_secs(60);
 const ERROR_WAIT: Duration = Duration::from_secs(300);
+/// How long to stop trying after a backend has failed repeatedly. Long enough
+/// that a fault which clears on its own — the user closing something else that
+/// was holding GPU memory — is noticed, without logging every attempt.
+const BACKOFF_WAIT: Duration = Duration::from_secs(3600);
+/// Consecutive failures allowed on one backend before moving on. A reload
+/// demonstrably recovers a GPU that was momentarily short of memory, so the
+/// device is asked again rather than written off on the first fault.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// What to do after the model fails, by panicking or refusing to load.
+///
+/// Every attempt costs a full model reload, so the failures are bounded: past
+/// that, the same device is not going to do better and the worker moves to the
+/// CPU, which is always present. wgpu reports its own errors as fatal, so
+/// staying on a GPU that has failed this often only fills the log.
+///
+/// Failing on the CPU too points at something other than the device, so the
+/// worker then waits an hour rather than spinning on it. Long enough to notice
+/// a fault that clears on its own, short enough not to fill a log with it.
+fn recover(backend: Backend, attempts: u32) -> Recovery {
+    if attempts < MAX_ATTEMPTS {
+        Recovery::Retry
+    } else if backend == Backend::Cpu {
+        Recovery::BackOff
+    } else {
+        Recovery::Cpu
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    Retry,
+    Cpu,
+    BackOff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Gpu,
+    Cpu,
+}
+
+impl Backend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gpu => "the GPU backend",
+            Self::Cpu => "the CPU backend",
+        }
+    }
+}
+
+/// What a panic was complaining about. A GPU fault reaches us as cubecl's
+/// `unwrap` on a failed call, which says nothing useful on its own, so at
+/// least keep whatever text the panic carried.
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_else(|| "unknown panic".into())
+}
 
 /// The embedded engine behind [`DecisionModel`].
 pub struct LocalModel {
@@ -213,23 +278,33 @@ impl VerdictService {
     }
 
     fn fail(&self, notify: &Notify, detail: String) {
+        self.fail_after(notify, detail, ERROR_WAIT)
+    }
+
+    fn fail_after(&self, notify: &Notify, detail: String, wait: Duration) {
         tracing::warn!("Local decisions: {detail}");
         self.update(notify, |s| {
             s.state = "error".into();
             s.detail = Some(detail);
             s.download = None;
         });
-        self.wait(ERROR_WAIT);
+        self.wait(wait);
     }
 
     fn run(&self, db: &Database, settings: &dyn Fn() -> VerdictSettings, notify: &Notify) {
         let mut loaded: Option<(LocalModel, VerdictSettings)> = None;
+        // Where the session is running, and how many failures it has taken there
+        // in a row. Both reset when local decisions are turned off.
+        let mut backend = Backend::Gpu;
+        let mut attempts = 0;
         loop {
             let current = settings();
             if !current.enabled {
                 if loaded.take().is_some() {
                     tracing::info!("Local decisions turned off; model unloaded");
                 }
+                backend = Backend::Gpu;
+                attempts = 0;
                 self.update(notify, |s| {
                     *s = VerdictStatus {
                         state: "off".into(),
@@ -242,12 +317,34 @@ impl VerdictService {
             }
             if loaded.as_ref().is_some_and(|(_, used)| *used != current) {
                 loaded = None;
+                backend = Backend::Gpu;
+                attempts = 0;
             }
             if loaded.is_none() {
-                match self.prepare(&current, settings, notify) {
+                match self.prepare(&current, settings, notify, backend) {
                     Ok(model) => loaded = Some((model, current.clone())),
                     Err(detail) => {
-                        self.fail(notify, detail);
+                        attempts += 1;
+                        // A backend that cannot even hold the model is in the
+                        // same position as one that faults on it, and is only
+                        // worth telling apart to say so.
+                        match recover(backend, attempts) {
+                            Recovery::Retry => self.fail(notify, format!("{detail}; retrying")),
+                            Recovery::Cpu => {
+                                backend = Backend::Cpu;
+                                attempts = 0;
+                                self.fail_after(
+                                    notify,
+                                    format!("{detail}; continuing on the CPU, which is slower"),
+                                    Duration::ZERO,
+                                );
+                            }
+                            Recovery::BackOff => self.fail_after(
+                                notify,
+                                format!("the CPU backend will not load the model ({detail})"),
+                                BACKOFF_WAIT,
+                            ),
+                        }
                         continue;
                     }
                 }
@@ -262,6 +359,7 @@ impl VerdictService {
                 .ok();
             match outcome {
                 Ok(Ok(handled)) => {
+                    attempts = 0;
                     let info = model.info().clone();
                     self.update(notify, |s| {
                         s.state = if handled == 0 { "idle" } else { "running" }.into();
@@ -280,29 +378,59 @@ impl VerdictService {
                 }
                 Ok(Err(error)) => self.fail(notify, format!("database: {error}")),
                 Err(panic) => {
-                    // A GPU fault can leave the device unusable; reload it.
+                    // The device may be unusable now, but a reload clears more
+                    // than one fault, so the same backend is asked a few times
+                    // before it is given up on.
                     loaded = None;
-                    let detail = panic
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                        .unwrap_or_else(|| "unknown panic".into());
-                    self.fail(
-                        notify,
-                        format!("the model failed and will be reloaded: {detail}"),
-                    );
+                    attempts += 1;
+                    let detail = panic_detail(&panic);
+                    match recover(backend, attempts) {
+                        Recovery::Retry => self.fail(
+                            notify,
+                            format!(
+                                "{} failed, reloading ({attempts} of {MAX_ATTEMPTS}): {detail}",
+                                backend.label()
+                            ),
+                        ),
+                        Recovery::Cpu => {
+                            backend = Backend::Cpu;
+                            attempts = 0;
+                            self.fail_after(
+                                notify,
+                                format!(
+                                    "the GPU backend failed {MAX_ATTEMPTS} times in a row ({detail}); continuing on the CPU, which is slower"
+                                ),
+                                Duration::ZERO,
+                            );
+                        }
+                        Recovery::BackOff => self.fail_after(
+                            notify,
+                            format!("the CPU backend keeps failing ({detail})"),
+                            BACKOFF_WAIT,
+                        ),
+                    }
                 }
             }
         }
     }
 
-    /// Installs the model if needed, then loads it.
+    /// Installs the model if needed, then loads it. `backend` overrides the
+    /// configured one once the session has moved off the GPU.
     fn prepare(
         &self,
         current: &VerdictSettings,
         settings: &dyn Fn() -> VerdictSettings,
         notify: &Notify,
+        backend: Backend,
     ) -> Result<LocalModel, String> {
+        let wanted = if backend == Backend::Cpu {
+            VerdictSettings {
+                backend: "cpu".into(),
+                ..current.clone()
+            }
+        } else {
+            current.clone()
+        };
         let model = ModelRef::parse(DEFAULT_MODEL);
         if installed(&self.models_dir, &model).is_none() {
             self.update(notify, |s| {
@@ -341,9 +469,58 @@ impl VerdictService {
             s.detail = None;
         });
         catch_unwind(AssertUnwindSafe(|| {
-            LocalModel::load(&self.models_dir, current)
+            LocalModel::load(&self.models_dir, &wanted)
         }))
         .map_err(|_| "loading the model panicked".to_owned())?
         .map_err(|e| format!("loading the model: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this guards: a GPU that kept faulting was reloaded and asked
+    /// again every five minutes for seventeen hours, so the worker made no
+    /// progress and the log filled with the same panic.
+    #[test]
+    fn a_backend_is_asked_a_few_times_before_it_is_written_off() {
+        for attempts in 1..MAX_ATTEMPTS {
+            assert_eq!(
+                recover(Backend::Gpu, attempts),
+                Recovery::Retry,
+                "{attempts}"
+            );
+            assert_eq!(
+                recover(Backend::Cpu, attempts),
+                Recovery::Retry,
+                "{attempts}"
+            );
+        }
+        assert_eq!(recover(Backend::Gpu, MAX_ATTEMPTS), Recovery::Cpu);
+        assert_eq!(recover(Backend::Cpu, MAX_ATTEMPTS), Recovery::BackOff);
+    }
+
+    /// The attempts only count while they keep failing: one good batch resets
+    /// the run, so an occasional fault never accumulates into a demotion.
+    #[test]
+    fn progress_resets_the_attempt_run() {
+        let mut attempts = 0;
+        for _ in 0..(MAX_ATTEMPTS - 1) {
+            assert_eq!(recover(Backend::Gpu, attempts), Recovery::Retry);
+            attempts += 1;
+        }
+        // A step went through, so the count starts over.
+        attempts = 0;
+        assert_eq!(recover(Backend::Gpu, attempts), Recovery::Retry);
+    }
+
+    /// A panic carrying a `&str` payload is the common shape for a GPU fault,
+    /// and it has to reach the user rather than becoming "unknown panic".
+    #[test]
+    fn the_panic_detail_survives_both_payload_shapes() {
+        assert_eq!(panic_detail(&String::from("device lost")), "device lost");
+        assert_eq!(panic_detail(&"device lost"), "device lost");
+        assert_eq!(panic_detail(&7), "unknown panic");
     }
 }

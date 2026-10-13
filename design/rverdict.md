@@ -407,6 +407,23 @@ Where the build differs from the design above, and why.
 - **Verdicts are keyed by model and question format**
   (`von-1.2.0@498ceba3/q1`), so changing either re-shadows instead of mixing
   results.
+- **A faulting backend is bounded, not retried forever.** `catch_unwind`
+  around `shadow_batch` kept the thread alive, but a panic dropped the model and
+  asked for it again five minutes later, indefinitely: a machine whose GPU
+  could not hold the model made no progress at all and filled its log with the
+  same wgpu panic. A backend now gets three attempts, each after a reload —
+  which does clear a momentary shortage — and then the session moves to the CPU,
+  which is always present. Failing there too points at something other than the
+  device, so it waits an hour instead. Any successful batch resets the count.
+- **`select()` self-tests with a tiny model**, so it happily returns a GPU that
+  only fails once the real weights are loaded. Backend selection is therefore
+  not evidence that the backend can run this model, and a fault at inference
+  time has to be handled where it happens.
+- **On an integrated GPU the CPU can be the faster path.** Measured on a Radeon
+  680M against the `Auto Classification` rules, which ask one question per Gmail
+  label: 446s per step on Vulkan against 317s on `cpu (flex)`. The fallback is
+  not a punishment.
+
 - **Feedback.** Ingestion keeps the label changes it already fetches (only
   while the setting is on) and records undos of our actions (label removed,
   restored from Trash or Spam, moved back to the inbox, unstarred) and labels
