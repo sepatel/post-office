@@ -107,6 +107,8 @@ export interface RulePayload {
   decision_reasoning_effort: string;
   decision_max_tokens: number | null;
   continue_after_match: boolean;
+  /// 'single' asks the model for exactly one outcome; 'multiple' allows several.
+  match_mode?: "single" | "multiple";
   source_rule_id?: number;
 }
 
@@ -143,20 +145,6 @@ export async function backupExport(): Promise<unknown> {
 
 export async function backupImport(payload: string): Promise<BackupImportResult> {
   return invoke("backup_import", { payload });
-}
-
-export interface RuleMetrics {
-  rule_id: number;
-  checked_24h: number;
-  succeeded_24h: number;
-  llm_calls_24h: number;
-  checked_7d: number;
-  succeeded_7d: number;
-  llm_calls_7d: number;
-}
-
-export async function ruleMetrics(): Promise<RuleMetrics[]> {
-  return invoke("rules_metrics");
 }
 
 export interface ChatMessage {
@@ -297,7 +285,8 @@ export interface WorkflowQueueItem {
   sender: string | null;
   subject: string | null;
   preview: string;
-  labels: string[];
+  applied_labels: string[];
+  inherited_labels: string[];
   state: WorkflowRunState | string;
   next_rule_index: number;
   next_rule_name: string | null;
@@ -513,60 +502,35 @@ export async function historySearch(query: string) {
   return invoke("history_search", { query });
 }
 
-export interface InferenceJob {
-  id: number;
-  email_id: string;
-  rule_id: number | null;
-  source: string;
-  status: string;
-  attempt_count: number;
-  next_attempt_at: string;
-  lease_until: string | null;
-  last_error: string | null;
-  created_at: string;
-  updated_at: string;
+export interface RuleOutcomeCount {
+  outcome: string;
+  count: number;
 }
 
-export async function inferenceJobsList(
-  page: number,
-  perPage: number,
-): Promise<InferenceJob[]> {
-  return invoke("inference_jobs_list", { page, perPage });
+/// A message run as it passed through one rule. Flattened, so the row carries
+/// the same message fields the Queue shows.
+export interface RuleActivityItem extends WorkflowQueueItem {
+  outcome: string;
+  decision: string | null;
+  error: string | null;
+  step_created_at: string;
+}
+
+export interface RuleActivityPage {
+  items: RuleActivityItem[];
+  total: number;
+  totals: RuleOutcomeCount[];
+  all_time_total: number;
 }
 
 export async function ruleActivity(
   ruleId: number,
+  outcome: string | null,
+  since: string | null,
   page: number,
   perPage: number,
-): Promise<HistoryEntry[]> {
-  return invoke("rule_activity", { ruleId, page, perPage });
-}
-
-export async function ruleInferenceJobs(
-  ruleId: number,
-  page: number,
-  perPage: number,
-): Promise<InferenceJob[]> {
-  return invoke("rule_inference_jobs", { ruleId, page, perPage });
-}
-
-export interface InferenceAttempt {
-  id: number;
-  job_id: number;
-  provider_id: string | null;
-  model: string | null;
-  status: string;
-  error: string | null;
-  duration_ms: number | null;
-  created_at: string;
-}
-
-export async function inferenceJobAttempts(jobId: number): Promise<InferenceAttempt[]> {
-  return invoke("inference_job_attempts", { jobId });
-}
-
-export async function inferenceJobRetry(jobId: number): Promise<boolean> {
-  return invoke("inference_job_retry", { jobId });
+): Promise<RuleActivityPage> {
+  return invoke("rule_activity", { ruleId, outcome, since, page, perPage });
 }
 
 export async function processingStatus() {
@@ -741,6 +705,162 @@ export async function gmailListLabels(refresh = false): Promise<GmailLabel[]> {
   return invoke("gmail_list_labels", { refresh });
 }
 
+const EXCLUDED_CLASSIFICATION_IDS = new Set(
+  [
+    "INBOX",
+    "SPAM",
+    "TRASH",
+    "DRAFT",
+    "SENT",
+    "STARRED",
+    "IMPORTANT",
+    "UNREAD",
+    "CHAT",
+    "CATEGORY_PERSONAL",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_FORUMS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_PROMOTIONS",
+  ].map((id) => id.toUpperCase()),
+);
+
+/// Mirrors `is_classifiable_label` in the core crate: system labels and
+/// Gmail's virtual names are never classifier choices, even when typed as
+/// user. Conditions may still reference any label.
+export function isClassifiableLabel(label: GmailLabel): boolean {
+  if (label.type.toLowerCase() !== "user") return false;
+  if (EXCLUDED_CLASSIFICATION_IDS.has(label.id.trim().toUpperCase())) return false;
+  const lower = label.name.trim().toLowerCase();
+  if (
+    lower.startsWith("category_") ||
+    lower.startsWith("[imap]/") ||
+    lower.startsWith("[gmail]/") ||
+    lower.startsWith("[google mail]/")
+  ) {
+    return false;
+  }
+  if (lower === "chat" || lower === "draft") return false;
+  return lower.length > 0;
+}
+
+export function classifiableLabels(labels: GmailLabel[]): GmailLabel[] {
+  return labels.filter(isClassifiableLabel);
+}
+
+export interface LabelQualification {
+  account_email: string;
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+  source: string;
+  updated_at: string;
+}
+
+export async function labelQualificationsList(): Promise<LabelQualification[]> {
+  return invoke("label_qualifications_list");
+}
+
+export interface LabelQualificationInput {
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+  source: string;
+}
+
+export async function labelQualificationUpsert(input: LabelQualificationInput): Promise<void> {
+  return invoke("label_qualification_upsert", { input });
+}
+
+export async function labelQualificationDelete(labelId: string): Promise<void> {
+  return invoke("label_qualification_delete", { labelId });
+}
+
+export async function labelQualificationsGenerate(options?: {
+  accountEmail?: string;
+  policyId?: string;
+  overwrite?: boolean;
+}): Promise<number> {
+  return invoke("label_qualifications_generate", {
+    accountEmail: options?.accountEmail,
+    policyId: options?.policyId,
+    overwrite: options?.overwrite,
+  });
+}
+
+export interface LabelLibraryEntry {
+  label: GmailLabel;
+  classifiable: boolean;
+  qualification: LabelQualification | null;
+}
+
+export async function labelLibraryList(): Promise<LabelLibraryEntry[]> {
+  return invoke("label_library_list");
+}
+
+export interface RuleLabelOverride {
+  account_email: string;
+  rule_id: number;
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+  updated_at: string;
+}
+
+export async function ruleLabelOverridesList(ruleId: number): Promise<RuleLabelOverride[]> {
+  return invoke("rule_label_overrides_list", { ruleId });
+}
+
+export interface RuleLabelOverrideInput {
+  rule_id: number;
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+}
+
+export async function ruleLabelOverrideUpsert(input: RuleLabelOverrideInput): Promise<void> {
+  return invoke("rule_label_override_upsert", { input });
+}
+
+export async function ruleLabelOverrideClear(ruleId: number, labelId: string): Promise<void> {
+  return invoke("rule_label_override_clear", { ruleId, labelId });
+}
+
+export interface ResolvedLabel {
+  label_id: string;
+  description: string;
+  examples: string[];
+  negative_examples: string[];
+  has_override: boolean;
+  source: string;
+}
+
+export function resolveLabelPreview(
+  global: LabelQualification | undefined,
+  override: RuleLabelOverride | undefined,
+): ResolvedLabel | null {
+  if (!global && !override) return null;
+  return {
+    label_id: override?.label_id ?? global?.label_id ?? "",
+    description: override?.description?.trim()
+      ? override.description
+      : (global?.description ?? ""),
+    examples:
+      override && override.examples.length > 0
+        ? override.examples
+        : (global?.examples ?? []),
+    negative_examples:
+      override && override.negative_examples.length > 0
+        ? override.negative_examples
+        : (global?.negative_examples ?? []),
+    has_override: Boolean(override),
+    source: override ? "rule" : (global?.source ?? ""),
+  };
+}
+
 export interface LlmTestResult {
   ok: boolean;
   model: string;
@@ -854,4 +974,178 @@ export async function syncWatchStart(): Promise<WatchResponse> {
 
 export async function syncWatchStop(): Promise<void> {
   return invoke("sync_watch_stop");
+}
+
+// Local decisions (rverdict) running in shadow beside the LLM.
+
+export interface VerdictSettings {
+  enabled: boolean;
+  precision: "f32" | "f16" | string;
+  backend: string;
+  max_state_tokens: number;
+}
+
+export interface VerdictStatus {
+  state: "off" | "downloading" | "converting" | "loading" | "running" | "idle" | "error" | string;
+  detail: string | null;
+  model: string | null;
+  backend: string | null;
+  precision: string | null;
+  download: { file: string; done: number; total: number } | null;
+  pending: number | null;
+  done: number | null;
+  processed_this_session: number;
+}
+
+export interface VerdictOverview {
+  settings: VerdictSettings;
+  status: VerdictStatus;
+}
+
+export interface VerdictCalibration {
+  held_out: number;
+  nll_before: number;
+  nll_after: number;
+  ece_before: number;
+  ece_after: number;
+  accuracy_before: number;
+  accuracy_after: number;
+}
+
+export interface VerdictRuleReport {
+  account_email: string;
+  rule_legacy_id: number;
+  rule_name: string;
+  framing: "noul" | "binary" | "menu" | string;
+  model: string;
+  decisions: number;
+  skipped: number;
+  errors: number;
+  agreement: number | null;
+  llm_majority_share: number | null;
+  minority_agreement: number | null;
+  minority_decisions: number;
+  confident: number;
+  confident_share: number | null;
+  confident_disagreements: number;
+  confident_disagreement_rate: number | null;
+  feedback: number;
+  feedback_llm_wrong: number;
+  feedback_verdict_disagreed: number;
+  disagreements: number;
+  adjudicated: number;
+  adjudications_llm_right: number;
+  adjudications_rverdict_right: number;
+  adjudications_both_wrong: number;
+  rverdict_wins: number | null;
+  calibration: VerdictCalibration | null;
+  median_ms: number | null;
+  truncated: number;
+}
+
+export interface VerdictRow {
+  id: number;
+  step_id: number;
+  rule_index: number;
+  rule_name: string;
+  framing: string;
+  model: string;
+  status: string;
+  detail: string | null;
+  options_json: string | null;
+  probabilities_json: string | null;
+  verdict_matched: boolean | null;
+  verdict_choice: string | null;
+  target: string | null;
+  confidence: number | null;
+  llm_matched: boolean | null;
+  llm_choices_json: string | null;
+  /** The LLM's answer as an index into `options_json`, for this row's question. */
+  llm_option: number | null;
+  agrees: boolean | null;
+  state_tokens: number | null;
+  truncated: boolean | null;
+  duration_ms: number | null;
+  created_at: string;
+}
+
+export interface VerdictFeedback {
+  step_id: number | null;
+  verdict_id: number | null;
+  kind: string;
+  label_id: string;
+  created_at: string;
+}
+
+export interface VerdictExportSummary {
+  decisions: number;
+  from_user: number;
+  captures: number;
+  decisions_path: string;
+  captures_path: string;
+}
+
+export async function verdictOverview(): Promise<VerdictOverview> {
+  return invoke("verdict_overview");
+}
+
+export async function verdictSettingsSet(settings: VerdictSettings): Promise<void> {
+  return invoke("verdict_settings_set", { settings });
+}
+
+export async function verdictReport(): Promise<VerdictRuleReport[]> {
+  return invoke("verdict_report");
+}
+
+export async function verdictMessage(messageId: number): Promise<{ verdicts: VerdictRow[]; feedback: VerdictFeedback[] }> {
+  return invoke("verdict_message", { messageId });
+}
+
+export type Adjudication = "llm" | "rverdict" | "neither";
+
+export interface DisagreementQuery {
+  account: string | null;
+  rule_legacy_id: number | null;
+  framing: string | null;
+  confident_only: boolean;
+  /** True keeps only decided disagreements, false only the open ones. */
+  adjudicated: boolean | null;
+  limit: number;
+  offset: number;
+}
+
+export interface Disagreement extends VerdictRow {
+  message_id: number;
+  subject: string;
+  sender: string;
+  snippet: string;
+  adjudication: Adjudication | null;
+}
+
+export const EMPTY_DISAGREEMENTS: DisagreementQuery = {
+  account: null,
+  rule_legacy_id: null,
+  framing: null,
+  confident_only: false,
+  adjudicated: null,
+  limit: 50,
+  offset: 0,
+};
+
+export async function verdictDisagreements(
+  query: DisagreementQuery,
+): Promise<{ rows: Disagreement[]; total: number }> {
+  return invoke("verdict_disagreements", { query });
+}
+
+export async function verdictAdjudicate(verdictId: number, right: Adjudication | null): Promise<void> {
+  return invoke("verdict_adjudicate", { verdictId, right });
+}
+
+export async function verdictExport(): Promise<VerdictExportSummary> {
+  return invoke("verdict_export");
+}
+
+export function onVerdictStatus(handler: (status: VerdictStatus) => void) {
+  return listen<VerdictStatus>("verdict-status", (event) => handler(event.payload));
 }

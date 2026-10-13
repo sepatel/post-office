@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/relay", "src-tauri"]
+
+# The local decision model does tens of GFLOPs per email; unoptimised
+# dependencies make it 10-50x slower even in `tauri dev` builds.
+[profile.dev.package."*"]
+opt-level = 3

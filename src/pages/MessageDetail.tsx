@@ -8,7 +8,9 @@ import {
 } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import { useGate } from "../lib/gate";
+import LabelChips from "../components/LabelChips";
 import LoadError from "../components/LoadError";
+import VerdictPanel from "../components/VerdictPanel";
 
 function title(kind: string): string {
   return kind.replace(/_/g, " ").replace(/\b\w/g, (letter: string) => letter.toUpperCase());
@@ -226,8 +228,8 @@ export default function MessageDetail() {
       <div className="mt-6 grid min-h-0 flex-1 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(22rem,0.75fr)]">
         <section className="flex min-h-0 flex-col rounded-2xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-700 dark:bg-gray-800">
           <h2 className="text-lg font-semibold">Message snapshot</h2>
-          <div className="mt-3 flex flex-wrap gap-2">
-            {detail.labels.map((label) => <span key={label} className="rounded-full bg-gray-100 px-2 py-1 text-xs text-gray-600 dark:bg-gray-700 dark:text-gray-300">{label}</span>)}
+          <div className="mt-3">
+            <LabelChips applied={detail.applied_labels} inherited={detail.inherited_labels} size="md" />
           </div>
           <pre className="mt-5 min-h-0 flex-1 overflow-auto whitespace-pre-wrap rounded-xl bg-gray-50 p-4 text-sm leading-6 text-gray-700 dark:bg-gray-900 dark:text-gray-200">{detail.body || detail.preview || "No message body was available."}</pre>
           <details className="mt-4 shrink-0 text-xs text-gray-500 dark:text-gray-400">
@@ -239,6 +241,7 @@ export default function MessageDetail() {
           <h2 className="mb-5 text-lg font-semibold">Run timeline</h2>
           <div className="min-h-0 flex-1 overflow-y-auto px-4">
             <Timeline detail={detail} />
+            <VerdictPanel messageId={messageId} />
             {detail.steps.some((step) => step.decision) && (
               <details className="mt-6 rounded-xl bg-gray-50 p-3 text-xs dark:bg-gray-900/70">
                 <summary className="cursor-pointer font-medium text-gray-600 dark:text-gray-300">Decision evidence</summary>

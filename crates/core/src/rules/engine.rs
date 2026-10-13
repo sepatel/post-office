@@ -12,6 +12,7 @@ use crate::gmail::models::Label;
 use crate::llm::InferenceRouter;
 use crate::rules::email_view::EmailView;
 use crate::rules::evaluation::{decision_estimate, DecisionEstimate};
+use crate::rules::label_context::ResolvedLabel;
 
 const TRUNCATION_MARKER: &str = "\n\n[Body truncated; middle omitted]\n\n";
 
@@ -60,12 +61,15 @@ pub fn rules_after<'a>(rules: &'a [Rule], current_rule_id: i64, view: &EmailView
 /// Resolves one email against one rule.
 ///
 /// Rule decisions always use a single-email prompt and response contract.
+/// `label_contexts` carries the resolved global + per-rule descriptions, keyed
+/// by Gmail label id; labels without an entry fall back to their bare name.
 pub async fn resolve_rule(
     llm: &InferenceRouter,
     rule: &Rule,
     view: &EmailView,
     memories: &[String],
     labels: &[Label],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Result<Resolved, RuleError> {
     let conditions_match = rule
         .conditions
@@ -74,8 +78,15 @@ pub async fn resolve_rule(
     if !conditions_match {
         return Ok(Resolved::declined());
     }
-    let resolved =
-        crate::rules::evaluation::resolve_decision(llm, rule, view, memories, labels).await?;
+    let resolved = crate::rules::evaluation::resolve_decision(
+        llm,
+        rule,
+        view,
+        memories,
+        labels,
+        label_contexts,
+    )
+    .await?;
     if resolved.llm_unavailable {
         return Err(RuleError::Llm(crate::llm::LlmError::Routing(
             resolved
@@ -92,8 +103,9 @@ pub async fn test_rule(
     view: &EmailView,
     memories: &[String],
     labels: &[Label],
+    label_contexts: &HashMap<String, ResolvedLabel>,
 ) -> Result<TestResult, RuleError> {
-    let resolved = resolve_rule(llm, rule, view, memories, labels).await?;
+    let resolved = resolve_rule(llm, rule, view, memories, labels, label_contexts).await?;
     Ok(TestResult {
         matched: resolved.outcome == Outcome::Matched,
         indeterminate: resolved.outcome == Outcome::Unparsed,
@@ -229,6 +241,7 @@ pub async fn dry_run_pipeline(
     view: &EmailView,
     memories_by_rule: &HashMap<i64, Vec<String>>,
     labels: &[Label],
+    label_contexts_by_rule: &HashMap<i64, HashMap<String, ResolvedLabel>>,
     on_progress: &impl Fn(PipelineDryRunProgress),
 ) -> PipelineDryRun {
     let mut steps = Vec::new();
@@ -278,17 +291,29 @@ pub async fn dry_run_pipeline(
             .get(&rule.id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let label_contexts = label_contexts_by_rule
+            .get(&rule.id)
+            .cloned()
+            .unwrap_or_default();
         on_progress(PipelineDryRunProgress {
             phase: "evaluating".into(),
             rule_id: rule.id,
             rule_name: rule.name.clone(),
             priority: rule.priority,
-            decision_estimate: decision_estimate(llm, rule, view, memories, labels)
-                .ok()
-                .flatten(),
+            decision_estimate: decision_estimate(
+                llm,
+                rule,
+                view,
+                memories,
+                labels,
+                &label_contexts,
+            )
+            .ok()
+            .flatten(),
             step: None,
         });
-        let resolved = match resolve_rule(llm, rule, view, memories, labels).await {
+        let resolved = match resolve_rule(llm, rule, view, memories, labels, &label_contexts).await
+        {
             Ok(resolved) => resolved,
             Err(error) => {
                 steps.push(PipelineDryRunStep {
@@ -501,9 +526,8 @@ impl Choice {
 /// a stale menu entry is a rule to fix, not a reason to stall every email.
 pub fn choice_catalog(rule: &Rule, labels: &[Label]) -> Vec<Choice> {
     let candidates: Vec<Choice> = if rule.choose_from_all_labels {
-        labels
+        crate::gmail::models::classifiable_labels(labels)
             .iter()
-            .filter(|label| label.label_type.eq_ignore_ascii_case("user"))
             .map(|label| Choice::label(&label.id, &label.name))
             .collect()
     } else {
@@ -650,25 +674,49 @@ pub(crate) fn parse_row(line: &str, menu: &[Choice]) -> Result<Row, RowError> {
         .collect();
     let &head = fields.first().ok_or(RowError::NotADecision)?;
     // Everything that is not the decision or a selection is the explanation.
-    let reason = join_reason(fields.iter().enumerate().filter_map(|(index, field)| {
-        (index > 0 && selection_tag(field).is_none()).then_some(*field)
-    }));
+    // `skip` is the field the selection was read from, so a choice named in
+    // its own field is not repeated as the reason.
+    let reason_of = |skip: Option<usize>| {
+        join_reason(fields.iter().enumerate().filter_map(|(index, field)| {
+            (index > 0 && Some(index) != skip && selection_tag(field).is_none()).then_some(*field)
+        }))
+    };
 
     // The decline is read off the head before anything else, or a trailing
     // `LABELS: none` would turn "no match" into a match with no labels.
     let verdict = keyword(head);
     if let Some((Verdict::Decline, _)) = verdict {
-        return Ok(Row::declined(&text, reason));
+        return Ok(Row::declined(&text, reason_of(None)));
     }
 
     // A self-describing selection field outranks position, so `MATCH | CHOOSE:
     // Bills | why` and a bare `"Bills" | why` both land on the same selection.
-    let tagged = fields.iter().find_map(|field| selection_tag(field));
-    let declared_match = tagged.is_some() || verdict.is_some();
-    let selection = tagged.unwrap_or(match verdict {
-        Some((_, rest)) => rest,
-        None => head,
-    });
+    // A bare `MATCH` is a keyword rather than a choice, so the selection is the
+    // field after it: `MATCH | Bills, Work | why` keeps both labels instead of
+    // matching with none.
+    let selected: Option<(usize, &str)> = match fields
+        .iter()
+        .enumerate()
+        .find_map(|(index, field)| Some((index, selection_tag(field)?)))
+    {
+        Some(tagged) => Some(tagged),
+        None => match verdict {
+            Some((Verdict::Match, rest)) if !rest.is_empty() => Some((0, rest)),
+            // Nothing to resolve a name against without a menu, so a menuless
+            // rule reads the rest as prose and applies its own actions.
+            Some((Verdict::Match, _)) if !menu.is_empty() => fields.get(1).map(|field| (1, *field)),
+            _ => None,
+        },
+    };
+    let declared_match = selected.is_some() || verdict.is_some();
+    let reason = reason_of(selected.map(|(index, _)| index));
+    let selection = selected.map_or_else(
+        || match verdict {
+            Some((_, rest)) => rest,
+            None => head,
+        },
+        |(_, selection)| selection,
+    );
 
     // `none` is a deliberately empty answer only when no choice goes by that
     // name.
@@ -956,6 +1004,7 @@ mod tests {
             decision_reasoning_effort: crate::llm::ReasoningEffort::ServerDefault,
             decision_max_tokens: None,
             continue_after_match: false,
+            match_mode: crate::rules::models::MatchMode::Single,
         }
     }
 
@@ -1123,11 +1172,38 @@ mod tests {
     fn a_match_that_skips_the_menu_is_flagged() {
         let row = parse_row("MATCH | The email discusses college visits.", &menu()).unwrap();
         assert!(row.chosen.is_empty());
-        assert!(row.note.unwrap().contains("without choosing"));
+        assert!(row.note.unwrap().contains("not on the menu"));
 
         // With no menu on offer there is nothing to report.
         let row = parse_row("MATCH | The email discusses college visits.", &[]).unwrap();
         assert!(row.note.is_none());
+
+        // Nothing at all after the keyword is still an empty match, not a
+        // reason to read a later field as a choice.
+        let row = parse_row("MATCH", &menu()).unwrap();
+        assert!(row.chosen.is_empty());
+        assert!(row.note.unwrap().contains("without choosing"));
+    }
+
+    /// The prompt offers `MATCH` as a legal start for the line, so a model
+    /// that writes it and then lists its labels must not lose them.
+    #[test]
+    fn a_match_keyword_does_not_swallow_a_comma_separated_selection() {
+        let menu = vec![
+            Choice::label("Label_1", "Bills"),
+            Choice::label("Label_2", "Work"),
+        ];
+
+        assert_eq!(
+            chosen("MATCH | Bills, Work | both apply", &menu),
+            vec![
+                ParsedAction::Label("Label_1".into()),
+                ParsedAction::Label("Label_2".into())
+            ]
+        );
+        // The selection is not repeated as the reason.
+        let row = parse_row("MATCH | Bills, Work | both apply", &menu).unwrap();
+        assert_eq!(row.reason, "both apply");
     }
 
     /// A rule prompt authored against its own vocabulary ("reply with only
