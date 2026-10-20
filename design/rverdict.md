@@ -388,6 +388,17 @@ Where the build differs from the design above, and why.
   probe, no worker. On, the model installs into the app data directory
   (`models/`, about 1.6 GB, sha256-checked, PyTorch weights converted to
   safetensors), with rverdict's caches beside it (`rverdict/`).
+- **Startup no longer begins the heaviest work immediately.** Local decisions
+  default to delayed startup, can wait for an explicit start, and can pause
+  shadowing without unloading settings. Shadow batches are configurable and
+  large multi-label requests are evaluated in whole-question chunks, so one
+  100-label request does not become one very large dispatch. Answers are
+  unchanged by chunking.
+- **An f16 request does not mean f16 runs.** The service maps f16 to f32 until
+  an explicit f16 check passes for the selected backend, installed model, and
+  application build. A passing check is recorded beside the model and includes
+  the probe duration; changing any of those inputs invalidates it. Reported
+  backend and precision always describe the model actually loaded.
 - **Shadowing never touches the live path.** A background worker reads
   steps the LLM decided from `workflow_steps`, rebuilds the exact rule from
   the run's rule-set snapshot and the email from `workflow_messages`, and

@@ -8,7 +8,8 @@ use post_office_core::db::verdicts::{
 };
 use post_office_core::decision::export::ExportSummary;
 use post_office_core::decision::report::{rule_reports, RuleReport, ACT_THRESHOLD};
-use post_office_core::decision::VerdictSettings;
+use post_office_core::decision::worker::SHADOW_BATCH_RANGE;
+use post_office_core::decision::{StartupMode, VerdictSettings};
 use serde::Serialize;
 use tauri::State;
 
@@ -29,10 +30,30 @@ impl Verdict {
     ) -> Self {
         use tauri::Emitter;
         let handle = app.clone();
+        let accounts_db = db.clone();
         let service = post_office_core::decision::service::VerdictService::spawn(
             db,
             &data_dir,
-            move || config.blocking_lock().verdict_settings(),
+            move || {
+                let mut settings = config.blocking_lock().verdict_settings();
+                // Shadow work reads only locally recorded steps, so a Gmail
+                // outage would not block it — but an outage is exactly when
+                // the user stops expecting any background inference, so
+                // suspend until every account is back. The user's own
+                // setting is not consulted because a resume click while an
+                // account still cannot connect would silently do nothing.
+                let gmail_down = match accounts_db.with_accounts(|repo| {
+                    repo.list()
+                        .map(|accounts| accounts.iter().any(|account| account.status == "error"))
+                }) {
+                    Ok(any_error) => any_error,
+                    Err(_) => false,
+                };
+                if gmail_down && settings.enabled {
+                    settings.shadow_paused = true;
+                }
+                settings
+            },
             move |status| {
                 let _ = handle.emit("verdict-status", status);
             },
@@ -71,13 +92,27 @@ pub async fn verdict_overview(state: State<'_, AppState>) -> Result<VerdictOverv
 #[tauri::command]
 pub async fn verdict_settings_set(
     state: State<'_, AppState>,
-    settings: VerdictSettings,
+    mut settings: VerdictSettings,
 ) -> Result<(), String> {
+    settings.backend = settings.backend.trim().to_ascii_lowercase();
     if !["f32", "f16"].contains(&settings.precision.as_str()) {
         return Err(format!("unknown precision {:?}", settings.precision));
     }
+    if !["auto", "cpu", "wgpu", "cuda", "rocm"].contains(&settings.backend.as_str()) {
+        return Err(format!("unknown backend {:?}", settings.backend));
+    }
     if !(256..=8_192).contains(&settings.max_state_tokens) {
         return Err("max_state_tokens must be between 256 and 8192".into());
+    }
+    match settings.startup {
+        StartupMode::Immediate | StartupMode::Delayed | StartupMode::Manual => {}
+    }
+    if !SHADOW_BATCH_RANGE.contains(&settings.shadow_batch_size) {
+        return Err(format!(
+            "shadow_batch_size must be between {} and {}",
+            SHADOW_BATCH_RANGE.start(),
+            SHADOW_BATCH_RANGE.end()
+        ));
     }
     {
         let mut config = state.config.lock().await;
@@ -88,6 +123,44 @@ pub async fn verdict_settings_set(
             .map_err(|e| e.to_string())?;
     }
     state.verdict.wake();
+    Ok(())
+}
+
+/// Starts deferred or manual shadow work after an explicit user action.
+#[tauri::command]
+pub async fn verdict_start(state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.config.lock().await.verdict_settings();
+    if !settings.enabled {
+        return Err("turn on local decisions before starting shadow work".into());
+    }
+    if settings.shadow_paused {
+        return Err("resume shadowing before explicitly starting it".into());
+    }
+    state.verdict.service.request_start();
+    Ok(())
+}
+
+/// Runs one explicit f16 check. The requested precision stays f16, but the
+/// service only uses it after this check passes for the loaded model.
+#[tauri::command]
+pub async fn verdict_qualify_f16(state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.config.lock().await.verdict_settings();
+    if !settings.enabled {
+        return Err("turn on local decisions before checking f16".into());
+    }
+    if settings.precision != "f16" {
+        return Err("select f16 before checking it".into());
+    }
+    if ["cpu", "reference"].contains(&settings.backend.trim().to_ascii_lowercase().as_str()) {
+        return Err("f16 checks apply to GPU backends".into());
+    }
+    if settings.shadow_paused {
+        return Err("resume shadowing before checking f16".into());
+    }
+    if state.verdict.service.status().state == "qualifying" {
+        return Err("an f16 check is already running".into());
+    }
+    state.verdict.service.request_f16_qualification();
     Ok(())
 }
 

@@ -48,6 +48,13 @@ impl AppState {
 }
 
 fn main() {
+    // The local decision model's CPU backend parallelizes through rayon,
+    // which defaults to one thread per core and leaves nothing for the app or
+    // the user's other work. Cap it before anything has touched rayon.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        let cores = std::thread::available_parallelism().map_or(4, |v| v.get());
+        std::env::set_var("RAYON_NUM_THREADS", (cores / 2).clamp(1, 6).to_string());
+    }
     tracing_subscriber::fmt::init();
 
     tauri::Builder::default()
@@ -208,6 +215,8 @@ fn main() {
             commands::llm_provider_status_list,
             verdict::verdict_overview,
             verdict::verdict_settings_set,
+            verdict::verdict_start,
+            verdict::verdict_qualify_f16,
             verdict::verdict_report,
             verdict::verdict_message,
             verdict::verdict_disagreements,

@@ -8,6 +8,9 @@
 //! cargo run ... -- export <app.db> <out-dir>
 //! ```
 //!
+//! An f16 request runs as f32 here unless the models directory already
+//! contains a passing f16 qualification from the application.
+//!
 //! Use a copy of the database: `shadow` migrates it and writes verdicts.
 
 use std::path::{Path, PathBuf};
@@ -77,6 +80,7 @@ fn shadow(db: &Database, models: &Path, args: &[String]) -> Result<()> {
         precision: flag(args, "--precision").unwrap_or_else(|| "f32".into()),
         backend: flag(args, "--backend").unwrap_or_else(|| "auto".into()),
         max_state_tokens: flag(args, "--max-state-tokens").map_or(Ok(2_048), |v| v.parse())?,
+        ..VerdictSettings::default()
     };
     let limit: usize = flag(args, "--limit").map_or(Ok(usize::MAX), |v| v.parse())?;
     rverdict_core::set_cache_root(models.parent().unwrap_or(models).join("rverdict"));

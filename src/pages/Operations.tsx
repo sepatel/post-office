@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { processingPause, processingResume, processingStatus, workflowEndpointStatus, workflowQueueSummary, workflowTokenUsage, type TokenTotals, type WorkflowEndpointStatus, type WorkflowQueueSummary, type WorkflowTokenUsage } from "../lib/tauri";
+import { onSyncProgress, onVerdictStatus, onWorkflowQueueChanged, processingPause, processingResume, processingStatus, workflowEndpointStatus, workflowQueueSummary, workflowTokenUsage, type TokenTotals, type VerdictStatus, type WorkflowEndpointStatus, type WorkflowQueueSummary, type WorkflowTokenUsage } from "../lib/tauri";
 import { formatLocalDateTime } from "../lib/datetime";
 import { useGate } from "../lib/gate";
 import LoadError from "../components/LoadError";
@@ -12,6 +12,7 @@ export default function Operations() {
   const [endpoints, setEndpoints] = useState<WorkflowEndpointStatus[]>([]);
   const [tokens, setTokens] = useState<WorkflowTokenUsage | null>(null);
   const [paused, setPaused] = useState(false);
+  const [verdict, setVerdict] = useState<VerdictStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const loading = useRef(false);
   const request = useRef(0);
@@ -47,9 +48,33 @@ export default function Operations() {
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 10_000);
-    return () => window.clearInterval(timer);
+    // Event-driven refresh (see Layout): 60s timer is only a safety net.
+    const unlistens = [
+      onWorkflowQueueChanged(() => void load()),
+      onSyncProgress((progress) => {
+        if (progress.phase === "idle" || progress.phase === "error") void load();
+      }),
+    ];
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load();
+    }, 60_000);
+    const onVisible = () => {
+      if (!document.hidden) void load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      for (const unlisten of unlistens) void unlisten.then((stop) => stop());
+    };
   }, [activeEmail]);
+
+  useEffect(() => {
+    const unlistenVerdict = onVerdictStatus(setVerdict);
+    return () => {
+      void unlistenVerdict.then((stop) => stop());
+    };
+  }, []);
 
   async function togglePause() {
     try {
@@ -93,6 +118,32 @@ export default function Operations() {
               ))}
             </tbody>
           </table>
+        )}
+      </section>
+      <section className="mt-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-700 dark:bg-gray-800">
+        <h2 className="text-lg font-semibold">Local decisions</h2>
+        <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">Background shadow inference (rverdict). Records answers; never acts on mail.</p>
+        {verdict ? (
+          <div className="mt-4 grid gap-3 text-sm sm:grid-cols-2">
+            <div>
+              <span className="block text-xs text-gray-500">State</span>
+              <span className={verdict.state === "error" ? "text-red-600 dark:text-red-400" : ""}>{verdict.state}{verdict.detail ? ` — ${verdict.detail}` : ""}</span>
+            </div>
+            <div>
+              <span className="block text-xs text-gray-500">Model</span>
+              {verdict.model ? `${verdict.model} on ${verdict.backend} (${verdict.precision})` : "not loaded"}
+            </div>
+            <div>
+              <span className="block text-xs text-gray-500">Shadow progress</span>
+              {verdict.done != null && verdict.pending != null ? `${verdict.done.toLocaleString()} done · ${verdict.pending.toLocaleString()} pending for this model` : "no queue for the loaded model yet"}
+            </div>
+            <div>
+              <span className="block text-xs text-gray-500">This session</span>
+              {verdict.processed_this_session.toLocaleString()} decisions shadowed
+            </div>
+          </div>
+        ) : (
+          <p className="mt-3 text-sm text-gray-400">Local decisions have not reported yet (off or still starting).</p>
         )}
       </section>
       <section className="mt-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-700 dark:bg-gray-800">
