@@ -37,7 +37,23 @@ use crate::sync_runtime::SyncTrigger;
 use crate::tray;
 use crate::{AppState, PipelineDryRunStatus, ProcessingStates};
 
-const WORKFLOW_WORKER_IDLE_SECS: u64 = 2;
+const WORKFLOW_IDLE_FALLBACK_SECS: u64 = 60;
+
+static WORKFLOW_NOTIFY: std::sync::OnceLock<Arc<tokio::sync::Notify>> =
+    std::sync::OnceLock::new();
+
+fn workflow_notify() -> Arc<tokio::sync::Notify> {
+    WORKFLOW_NOTIFY
+        .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
+        .clone()
+}
+
+/// Wake the workflow worker immediately instead of waiting for the idle
+/// fallback. Call after anything that makes runs claimable (retry, resume,
+/// sync arrivals, finished decision tasks).
+pub fn kick_workflow_worker() {
+    workflow_notify().notify_one();
+}
 
 pub fn spawn_message_workflow_worker(
     app: tauri::AppHandle,
@@ -47,6 +63,7 @@ pub fn spawn_message_workflow_worker(
     inference_runtime: post_office_core::llm::InferenceRuntime,
 ) {
     tauri::async_runtime::spawn(async move {
+        let notify = workflow_notify();
         let mut attention_counts = HashMap::<String, i64>::new();
         loop {
             let cfg = config.lock().await.clone();
@@ -57,6 +74,7 @@ pub fn spawn_message_workflow_worker(
                 .filter(|account| !account.paused)
                 .collect::<Vec<_>>();
             let mut processed = false;
+            let mut queue_changed = false;
 
             for account in accounts {
                 let account_email = account.email;
@@ -84,168 +102,187 @@ pub fn spawn_message_workflow_worker(
                 if workflow_active_runs.fetch_add(1, Ordering::AcqRel) == 0 {
                     workflow_running.store(true, Ordering::Release);
                 }
-                let auth = match load_gmail_auth_for_account(&app, &cfg, &account_email) {
-                    Ok(auth) => auth,
-                    Err(error) => {
-                        let _ = db.with_accounts(|repo| repo.record_error(&account_email, &error));
-                        tracing::warn!(
-                            "Message workflow could not load Gmail credentials for {}: {}",
-                            account_email,
-                            error
-                        );
+                // Cheap DB-only probes first: no keyring or HTTP-client work
+                // happens unless something is actually claimable.
+                let has_unrouted = db
+                    .with_workflow(|repo| repo.has_claimable_unrouted(&account_email))
+                    .unwrap_or(false);
+                let probe_routes = db
+                    .with_workflow(|repo| repo.ready_routes(&account_email))
+                    .unwrap_or_default();
+                if !has_unrouted && probe_routes.is_empty() {
+                    if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        workflow_running.store(false, Ordering::Release);
+                    }
+                } else {
+                    let auth = match load_gmail_auth_for_account(&app, &cfg, &account_email) {
+                        Ok(auth) => auth,
+                        Err(error) => {
+                            let _ = db.with_accounts(|repo| repo.record_error(&account_email, &error));
+                            tracing::warn!(
+                                "Message workflow could not load Gmail credentials for {}: {}",
+                                account_email,
+                                error
+                            );
+                            if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                workflow_running.store(false, Ordering::Release);
+                            }
+                            continue;
+                        }
+                    };
+                    if stop_requested_flag.load(Ordering::Acquire) {
                         if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
                             workflow_running.store(false, Ordering::Release);
                         }
                         continue;
                     }
-                };
-                if stop_requested_flag.load(Ordering::Acquire) {
-                    if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
-                        workflow_running.store(false, Ordering::Release);
-                    }
-                    continue;
-                }
-                let mut gmail = GmailClient::new(auth);
+                    let mut gmail = GmailClient::new(auth);
 
-                let lease_token = post_office_core::workflow::new_lease_token();
-                let next_run =
-                    db.with_workflow(|repo| repo.claim_next_unrouted(&account_email, &lease_token));
-                match next_run {
-                    Ok(Some(run)) => {
-                        processed = true;
-                        if workflow_active_runs.fetch_add(1, Ordering::AcqRel) == 0 {
-                            workflow_running.store(true, Ordering::Release);
+                    let lease_token = post_office_core::workflow::new_lease_token();
+                    let next_run =
+                        db.with_workflow(|repo| repo.claim_next_unrouted(&account_email, &lease_token));
+                    match next_run {
+                        Ok(Some(run)) => {
+                            processed = true;
+                            if workflow_active_runs.fetch_add(1, Ordering::AcqRel) == 0 {
+                                workflow_running.store(true, Ordering::Release);
+                            }
+                            let result = post_office_core::workflow::prepare_run(
+                                &db,
+                                &mut gmail,
+                                &cfg,
+                                inference_runtime.clone(),
+                                run,
+                            )
+                            .await;
+                            if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                workflow_running.store(false, Ordering::Release);
+                            }
+                            if let Err(error) = result {
+                                tracing::warn!(
+                                    "Message workflow preparation failed for {}: {}",
+                                    account_email,
+                                    error
+                                );
+                            }
                         }
-                        let result = post_office_core::workflow::prepare_run(
-                            &db,
-                            &mut gmail,
-                            &cfg,
-                            inference_runtime.clone(),
-                            run,
-                        )
-                        .await;
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            "Message workflow could not claim preparation work for {}: {}",
+                            account_email,
+                            error
+                        ),
+                    }
+
+                    if stop_requested_flag.load(Ordering::Acquire) {
                         if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
                             workflow_running.store(false, Ordering::Release);
                         }
-                        if let Err(error) = result {
-                            tracing::warn!(
-                                "Message workflow preparation failed for {}: {}",
-                                account_email,
-                                error
-                            );
-                        }
+                        continue;
                     }
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(
-                        "Message workflow could not claim preparation work for {}: {}",
-                        account_email,
-                        error
-                    ),
-                }
 
-                if stop_requested_flag.load(Ordering::Acquire) {
+                    let routes = db.with_workflow(|repo| repo.ready_routes(&account_email));
+                    match routes {
+                        Ok(routes) => {
+                            for route in routes {
+                                while let Some(permit) = inference_runtime.try_acquire(
+                                    &route.endpoint,
+                                    &route.model,
+                                    route.max_concurrent_requests,
+                                ) {
+                                    let lease_token = post_office_core::workflow::new_lease_token();
+                                    let run = match db.with_workflow(|repo| {
+                                        repo.claim_next_for_route(
+                                            &account_email,
+                                            &route.endpoint,
+                                            &route.model,
+                                            &lease_token,
+                                        )
+                                    }) {
+                                        Ok(Some(run)) => run,
+                                        Ok(None) => break,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                "Message workflow could not claim routed work for {}: {}",
+                                                account_email,
+                                                error
+                                            );
+                                            break;
+                                        }
+                                    };
+                                    processed = true;
+                                    if workflow_active_runs.fetch_add(1, Ordering::AcqRel) == 0 {
+                                        workflow_running.store(true, Ordering::Release);
+                                    }
+                                    let task_db = Arc::clone(&db);
+                                    let task_config = cfg.clone();
+                                    let task_runtime = inference_runtime.clone();
+                                    let task_gmail = gmail.clone();
+                                    let task_route = route.clone();
+                                    let task_running = workflow_running.clone();
+                                    let task_active_runs = workflow_active_runs.clone();
+                                    let task_app = app.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        let mut task_gmail = task_gmail;
+                                        let decision_runtime = task_runtime.clone();
+                                        let renewal_run = run.clone();
+                                        let decision = task_runtime.with_reservation(
+                                            &task_route.endpoint,
+                                            &task_route.model,
+                                            permit,
+                                            post_office_core::workflow::process_routed_run(
+                                                &task_db,
+                                                &mut task_gmail,
+                                                &task_config,
+                                                decision_runtime,
+                                                run,
+                                            ),
+                                        );
+                                        tokio::pin!(decision);
+                                        let mut lease_renewal =
+                                            tokio::time::interval(Duration::from_secs(60));
+                                        lease_renewal.tick().await;
+                                        let result = loop {
+                                            tokio::select! {
+                                                result = &mut decision => break result,
+                                                _ = lease_renewal.tick() => {
+                                                    if !task_db.with_workflow(|repo| {
+                                                        repo.renew_lease(
+                                                            renewal_run.id,
+                                                            &renewal_run.lease_token,
+                                                        )
+                                                    }).unwrap_or(false) {
+                                                        tracing::warn!("Message workflow lost its decision lease");
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        if let Err(error) = result {
+                                            tracing::warn!(
+                                                "Message workflow decision failed: {}",
+                                                error
+                                            );
+                                        }
+                                        if task_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                            task_running.store(false, Ordering::Release);
+                                        }
+                                        // A finished decision may have queued follow-on
+                                        // work; wake the worker and refresh the UI.
+                                        kick_workflow_worker();
+                                        let _ = task_app.emit("workflow-queue-changed", ());
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            "Message workflow could not inspect routed work for {}: {}",
+                            account_email,
+                            error
+                        ),
+                    }
                     if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
                         workflow_running.store(false, Ordering::Release);
                     }
-                    continue;
-                }
-
-                let routes = db.with_workflow(|repo| repo.ready_routes(&account_email));
-                match routes {
-                    Ok(routes) => {
-                        for route in routes {
-                            while let Some(permit) = inference_runtime.try_acquire(
-                                &route.endpoint,
-                                &route.model,
-                                route.max_concurrent_requests,
-                            ) {
-                                let lease_token = post_office_core::workflow::new_lease_token();
-                                let run = match db.with_workflow(|repo| {
-                                    repo.claim_next_for_route(
-                                        &account_email,
-                                        &route.endpoint,
-                                        &route.model,
-                                        &lease_token,
-                                    )
-                                }) {
-                                    Ok(Some(run)) => run,
-                                    Ok(None) => break,
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            "Message workflow could not claim routed work for {}: {}",
-                                            account_email,
-                                            error
-                                        );
-                                        break;
-                                    }
-                                };
-                                processed = true;
-                                if workflow_active_runs.fetch_add(1, Ordering::AcqRel) == 0 {
-                                    workflow_running.store(true, Ordering::Release);
-                                }
-                                let task_db = Arc::clone(&db);
-                                let task_config = cfg.clone();
-                                let task_runtime = inference_runtime.clone();
-                                let task_gmail = gmail.clone();
-                                let task_route = route.clone();
-                                let task_running = workflow_running.clone();
-                                let task_active_runs = workflow_active_runs.clone();
-                                tauri::async_runtime::spawn(async move {
-                                    let mut task_gmail = task_gmail;
-                                    let decision_runtime = task_runtime.clone();
-                                    let renewal_run = run.clone();
-                                    let decision = task_runtime.with_reservation(
-                                        &task_route.endpoint,
-                                        &task_route.model,
-                                        permit,
-                                        post_office_core::workflow::process_routed_run(
-                                            &task_db,
-                                            &mut task_gmail,
-                                            &task_config,
-                                            decision_runtime,
-                                            run,
-                                        ),
-                                    );
-                                    tokio::pin!(decision);
-                                    let mut lease_renewal =
-                                        tokio::time::interval(Duration::from_secs(60));
-                                    lease_renewal.tick().await;
-                                    let result = loop {
-                                        tokio::select! {
-                                            result = &mut decision => break result,
-                                            _ = lease_renewal.tick() => {
-                                                if !task_db.with_workflow(|repo| {
-                                                    repo.renew_lease(
-                                                        renewal_run.id,
-                                                        &renewal_run.lease_token,
-                                                    )
-                                                }).unwrap_or(false) {
-                                                    tracing::warn!("Message workflow lost its decision lease");
-                                                }
-                                            }
-                                        }
-                                    };
-                                    if let Err(error) = result {
-                                        tracing::warn!(
-                                            "Message workflow decision failed: {}",
-                                            error
-                                        );
-                                    }
-                                    if task_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                        task_running.store(false, Ordering::Release);
-                                    }
-                                });
-                            }
-                        }
-                    }
-                    Err(error) => tracing::warn!(
-                        "Message workflow could not inspect routed work for {}: {}",
-                        account_email,
-                        error
-                    ),
-                }
-                if workflow_active_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    workflow_running.store(false, Ordering::Release);
                 }
 
                 let attention = db
@@ -259,6 +296,9 @@ pub fn spawn_message_workflow_worker(
                     })
                     .unwrap_or(0);
                 if let Some(previous) = attention_counts.insert(account_email.clone(), attention) {
+                    if attention != previous {
+                        queue_changed = true;
+                    }
                     if attention > previous {
                         let _ = app
                             .notification()
@@ -275,8 +315,22 @@ pub fn spawn_message_workflow_worker(
                 }
             }
 
-            if !processed {
-                tokio::time::sleep(Duration::from_secs(WORKFLOW_WORKER_IDLE_SECS)).await;
+            if processed {
+                queue_changed = true;
+            }
+            if queue_changed {
+                let _ = app.emit("workflow-queue-changed", ());
+            }
+            if processed {
+                // Real work was claimed: loop immediately to drain the queue.
+                continue;
+            }
+            // Nothing claimable: park until kicked or the safety-net
+            // interval elapses (covers retry-wait leases maturing and any
+            // kick emitted before this wait).
+            tokio::select! {
+                _ = notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(WORKFLOW_IDLE_FALLBACK_SECS)) => {},
             }
         }
     });
@@ -718,6 +772,8 @@ pub async fn accounts_set_paused(
         .store(paused, std::sync::atomic::Ordering::Relaxed);
     if paused {
         state.inference_runtime.cancel_all();
+    } else {
+        kick_workflow_worker();
     }
 
     Ok(())
@@ -1360,8 +1416,12 @@ pub async fn workflow_message_get(
 #[tauri::command]
 pub async fn workflow_retry_now(state: State<'_, AppState>, run_id: i64) -> Result<bool, String> {
     let account_email = active_account(&*state.config.lock().await)?;
-    post_office_core::workflow::retry_now(&state.db, &account_email, run_id)
-        .map_err(|error| error.to_string())
+    let retried = post_office_core::workflow::retry_now(&state.db, &account_email, run_id)
+        .map_err(|error| error.to_string())?;
+    if retried {
+        kick_workflow_worker();
+    }
+    Ok(retried)
 }
 
 #[tauri::command]
@@ -1496,6 +1556,7 @@ pub async fn processing_resume(state: State<'_, AppState>) -> Result<(), String>
     let ps = processing_state.lock().await;
     ps.paused.store(false, std::sync::atomic::Ordering::Relaxed);
     drop(ps);
+    kick_workflow_worker();
     Ok(())
 }
 
@@ -1608,6 +1669,10 @@ pub async fn sync_replay_now(
                     current_email_sent_at: None,
                 },
             );
+            if result.touched_messages > 0 {
+                kick_workflow_worker();
+                let _ = app.emit("workflow-queue-changed", ());
+            }
             Ok(result)
         }
         Err(e) => {
