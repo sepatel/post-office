@@ -591,6 +591,13 @@ export function onSyncProgress(cb: (p: OpProgress) => void): Promise<UnlistenFn>
   return listen<OpProgress>("sync-progress", (e) => cb(e.payload));
 }
 
+// Emitted by the backend whenever queue counts may have changed (worker
+// pass, sync arrivals, retry, finished decision task). Prefer subscribing
+// to this over polling the queue summaries.
+export function onWorkflowQueueChanged(handler: () => void): Promise<UnlistenFn> {
+  return listen("workflow-queue-changed", () => handler());
+}
+
 export type UnlistenFn = () => void;
 
 export async function gmailAuthenticate() {
@@ -978,15 +985,20 @@ export async function syncWatchStop(): Promise<void> {
 
 // Local decisions (rverdict) running in shadow beside the LLM.
 
+export type VerdictStartupMode = "immediate" | "delayed" | "manual";
+
 export interface VerdictSettings {
   enabled: boolean;
   precision: "f32" | "f16" | string;
   backend: string;
   max_state_tokens: number;
+  startup: VerdictStartupMode;
+  shadow_paused: boolean;
+  shadow_batch_size: number;
 }
 
 export interface VerdictStatus {
-  state: "off" | "downloading" | "converting" | "loading" | "running" | "idle" | "error" | string;
+  state: "off" | "scheduled" | "manual" | "paused" | "qualifying" | "downloading" | "converting" | "loading" | "running" | "idle" | "error" | string;
   detail: string | null;
   model: string | null;
   backend: string | null;
@@ -995,6 +1007,12 @@ export interface VerdictStatus {
   pending: number | null;
   done: number | null;
   processed_this_session: number;
+  f16_qualification: {
+    backend: string;
+    model: string;
+    app_version: string;
+    probe_ms: number;
+  } | null;
 }
 
 export interface VerdictOverview {
@@ -1091,6 +1109,14 @@ export async function verdictOverview(): Promise<VerdictOverview> {
 
 export async function verdictSettingsSet(settings: VerdictSettings): Promise<void> {
   return invoke("verdict_settings_set", { settings });
+}
+
+export async function verdictStart(): Promise<void> {
+  return invoke("verdict_start");
+}
+
+export async function verdictQualifyF16(): Promise<void> {
+  return invoke("verdict_qualify_f16");
 }
 
 export async function verdictReport(): Promise<VerdictRuleReport[]> {

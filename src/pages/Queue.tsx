@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  onSyncProgress,
+  onWorkflowQueueChanged,
   workflowMessagesList,
   workflowQueueSummary,
   workflowRetryNow,
@@ -91,8 +93,25 @@ export default function Queue() {
   useEffect(() => {
     activeStateRef.current = activeState;
     void load();
-    const timer = window.setInterval(() => void load(), 5_000);
-    return () => window.clearInterval(timer);
+    // Event-driven refresh (see Layout): 60s timer is only a safety net.
+    const unlistens = [
+      onWorkflowQueueChanged(() => void load()),
+      onSyncProgress((progress) => {
+        if (progress.phase === "idle" || progress.phase === "error") void load();
+      }),
+    ];
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load();
+    }, 60_000);
+    const onVisible = () => {
+      if (!document.hidden) void load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      for (const unlisten of unlistens) void unlisten.then((stop) => stop());
+    };
   }, [activeEmail, activeState]);
 
   async function retry(item: WorkflowQueueItem) {

@@ -148,6 +148,24 @@ impl<'a> WorkflowRepository<'a> {
         self.claim_next_unrouted(account_email, lease_token)
     }
 
+    /// Non-claiming probe mirroring the `claim_next_unrouted` predicate. Lets
+    /// idle workers check for work without taking leases, loading credentials,
+    /// or building HTTP clients.
+    pub fn has_claimable_unrouted(&self, account_email: &str) -> Result<bool> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM workflow_runs
+               WHERE account_email = ?1
+                 AND state IN ('queued', 'retry_wait')
+                 AND next_attempt_at <= datetime('now')
+                 AND route_endpoint IS NULL
+             )",
+            [account_email],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     pub fn claim_next_unrouted(
         &self,
         account_email: &str,
@@ -1587,6 +1605,29 @@ mod tests {
             assert_eq!(usage.by_model_7d[0].totals.total_tokens, 360);
             assert_eq!(usage.by_model_7d[1].provider.as_deref(), Some("Local"));
             assert_eq!(repo.token_usage("other@example.com")?.all_time.requests, 0);
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn claimable_unrouted_probe_ignores_routed_and_leased_runs() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        db.with_workflow(|repo| {
+            repo.initialize_mailbox("test@example.com", "100")?;
+            repo.activate_rule_set("test@example.com", r#"{"rules":[]}"#)?;
+            assert!(!repo.has_claimable_unrouted("test@example.com")?);
+
+            repo.enqueue_arrivals("test@example.com", "101", &["message-1".into()])?;
+            assert!(repo.has_claimable_unrouted("test@example.com")?);
+
+            let run = repo.claim_next_unrouted("test@example.com", "lease-1")?.unwrap();
+            assert!(!repo.has_claimable_unrouted("test@example.com")?);
+
+            repo.queue_for_route(run.id, "lease-1", "local", "http://llm/v1", "small", 1)?;
+            assert!(!repo.has_claimable_unrouted("test@example.com")?);
+            assert_eq!(repo.ready_routes("test@example.com")?.len(), 1);
             Ok::<(), rusqlite::Error>(())
         })
         .unwrap();
