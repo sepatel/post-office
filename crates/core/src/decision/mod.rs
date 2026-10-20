@@ -34,6 +34,12 @@ pub struct VerdictSettings {
     /// Longer emails keep their start and end; attention cost grows with
     /// the square of the length.
     pub max_state_tokens: u32,
+    #[serde(default = "default_startup_mode")]
+    pub startup: StartupMode,
+    #[serde(default)]
+    pub shadow_paused: bool,
+    #[serde(default = "default_shadow_batch_size")]
+    pub shadow_batch_size: usize,
 }
 
 impl Default for VerdictSettings {
@@ -43,8 +49,45 @@ impl Default for VerdictSettings {
             precision: "f32".into(),
             backend: "auto".into(),
             max_state_tokens: 2_048,
+            startup: StartupMode::default(),
+            shadow_paused: false,
+            shadow_batch_size: default_shadow_batch_size(),
         }
     }
+}
+
+impl VerdictSettings {
+    pub(crate) fn model_config(&self) -> ModelConfig {
+        ModelConfig {
+            precision: self.precision.clone(),
+            backend: self.backend.clone(),
+            max_state_tokens: self.max_state_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelConfig {
+    precision: String,
+    backend: String,
+    max_state_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupMode {
+    Immediate,
+    #[default]
+    Delayed,
+    Manual,
+}
+
+fn default_startup_mode() -> StartupMode {
+    StartupMode::default()
+}
+
+fn default_shadow_batch_size() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,4 +118,36 @@ pub trait DecisionModel {
     fn info(&self) -> &ModelInfo;
     fn calibration(&self) -> &Calibration;
     fn evaluate(&self, request: &Request) -> Result<Evaluation, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Older payloads predate the startup controls, so they must gain the safe
+    /// delayed default rather than failing to parse.
+    #[test]
+    fn older_settings_payloads_gain_safe_startup_defaults() {
+        let settings: VerdictSettings = serde_json::from_str(
+            r#"{"enabled":true,"precision":"f16","backend":"auto","max_state_tokens":2048}"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.startup, StartupMode::Delayed);
+        assert!(!settings.shadow_paused);
+        assert_eq!(settings.shadow_batch_size, 4);
+    }
+
+    #[test]
+    fn startup_controls_do_not_change_the_loaded_model() {
+        let scheduled = VerdictSettings::default();
+        let manual = VerdictSettings {
+            startup: StartupMode::Manual,
+            shadow_paused: true,
+            shadow_batch_size: 1,
+            ..scheduled.clone()
+        };
+
+        assert_eq!(scheduled.model_config(), manual.model_config());
+    }
 }

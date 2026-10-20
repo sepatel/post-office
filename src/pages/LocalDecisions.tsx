@@ -3,15 +3,19 @@ import {
   onVerdictStatus,
   verdictExport,
   verdictOverview,
+  verdictQualifyF16,
   verdictReport,
   verdictSettingsSet,
+  verdictStart,
   type VerdictOverview,
   type VerdictRuleReport,
   type VerdictSettings,
+  type VerdictStartupMode,
   type VerdictStatus,
 } from "../lib/tauri";
 import { FRAMING, percent } from "../lib/verdict";
 import { useToast } from "../lib/toast";
+import { useGate } from "../lib/gate";
 import VerdictDisagreements from "../components/VerdictDisagreements";
 import VerdictExplainer from "../components/VerdictExplainer";
 
@@ -24,6 +28,14 @@ function statusText(status: VerdictStatus | null): string {
   switch (status.state) {
     case "off":
       return "Off";
+    case "scheduled":
+      return "Starting shadow work shortly";
+    case "manual":
+      return "Waiting for an explicit start";
+    case "paused":
+      return "Shadow work paused";
+    case "qualifying":
+      return "Checking f16 on this machine";
     case "downloading":
       return status.download
         ? `Downloading ${status.download.file}: ${megabytes(status.download.done)} of ${megabytes(status.download.total)}`
@@ -43,21 +55,56 @@ function statusText(status: VerdictStatus | null): string {
   }
 }
 
+const STARTUP_MODES: { value: VerdictStartupMode; label: string; title: string }[] = [
+  { value: "immediate", label: "Start right away", title: "Load the model and begin shadowing as soon as the feature is on." },
+  { value: "delayed", label: "Wait after startup", title: "Let application startup settle for two minutes before loading the model." },
+  { value: "manual", label: "Wait for Start now", title: "Do not load the model until explicitly started." },
+];
+
+const BACKENDS = ["auto", "cpu", "wgpu", "cuda", "rocm"] as const;
+const BATCH_SIZES = [1, 2, 4, 8];
+const STATE_TOKEN_OPTIONS = [512, 1024, 2048, 4096, 8192];
+
+function optionsWithCurrent(options: number[], current: number): number[] {
+  if (options.includes(current)) return options;
+  return [...options, current].sort((a, b) => a - b);
+}
+
 function StatusCard({
   overview,
   status,
   saving,
+  gmailDown,
   onSave,
   onToggle,
+  onStart,
+  onQualify,
 }: {
   overview: VerdictOverview;
   status: VerdictStatus | null;
   saving: boolean;
+  gmailDown: boolean;
   onSave: (settings: VerdictSettings) => void;
   onToggle: () => void;
-}) {
+  onStart: () => void;
+  onQualify: () => void;
+ }) {
   const { settings } = overview;
   const download = status?.state === "downloading" ? status.download : null;
+  const qualification = status?.f16_qualification ?? null;
+  const f16Requested = settings.precision === "f16";
+  const batchOptions = optionsWithCurrent(BATCH_SIZES, settings.shadow_batch_size);
+  const tokenOptions = optionsWithCurrent(STATE_TOKEN_OPTIONS, settings.max_state_tokens);
+
+  function checkF16() {
+    if (
+      confirm(
+        "Check f16 now? This loads the full model on the GPU and runs one small probe. It can take several minutes and cannot be interrupted while loading. Pause shadowing first if the machine is already busy.",
+      )
+    ) {
+      onQualify();
+    }
+  }
 
   return (
     <div className="flex flex-wrap items-start justify-between gap-4">
@@ -89,6 +136,15 @@ function StatusCard({
           <p className={status?.state === "error" ? "text-red-600 dark:text-red-400" : "text-gray-700 dark:text-gray-200"}>
             {statusText(status)}
           </p>
+          {status?.detail && status.state !== "error" && (
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{status.detail}</p>
+          )}
+          {status?.state === "paused" && gmailDown && (
+            <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+              Paused automatically while Gmail needs reconnecting; shadowing resumes on its own once
+              every account can connect.
+            </p>
+          )}
           {download && download.total > 0 && (
             <div className="mt-2 h-1.5 max-w-sm overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
               <div className="h-full bg-blue-600" style={{ width: `${(100 * download.done) / download.total}%` }} />
@@ -100,26 +156,138 @@ function StatusCard({
               {status.done != null && status.pending != null && ` · ${status.done.toLocaleString()} shadowed, ${status.pending.toLocaleString()} to go`}
             </p>
           )}
+          {settings.enabled && f16Requested && (
+            <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+              <p>
+                {status?.precision === "f16"
+                  ? "Running f16 after a passing check."
+                  : status?.precision
+                    ? `Running ${status.precision} until f16 passes its check.`
+                    : "f16 stays off until its check passes."}
+              </p>
+              {qualification && (
+                <p>
+                  Last check passed on {qualification.backend} in {(qualification.probe_ms / 1000).toFixed(1)}s.
+                </p>
+              )}
+              {status?.state !== "qualifying" && (
+                <button
+                  type="button"
+                  onClick={checkF16}
+                  disabled={saving}
+                  className="mt-1 rounded-lg border border-gray-300 px-3 py-1 font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
+                >
+                  Check f16
+                </button>
+              )}
+            </div>
+          )}
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-500 dark:text-gray-400">Precision</span>
-          <div className="flex rounded-lg border border-gray-200 bg-gray-100 p-0.5 dark:border-gray-700 dark:bg-gray-900">
-            {(["f32", "f16"] as const).map((precision) => (
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-gray-500 dark:text-gray-400">Precision</span>
+            <div className="flex rounded-lg border border-gray-200 bg-gray-100 p-0.5 dark:border-gray-700 dark:bg-gray-900">
+              {(["f32", "f16"] as const).map((precision) => (
+                <button
+                  key={precision}
+                  type="button"
+                  disabled={saving}
+                  onClick={() => onSave({ ...settings, precision })}
+                  className={`rounded-md px-3 py-1 text-xs font-medium ${
+                    settings.precision === precision
+                      ? "bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-gray-100"
+                      : "text-gray-500 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200"
+                  }`}
+                  title={precision === "f16" ? "Runs only after f16 passes a check on this machine. Otherwise the service uses f32." : "Full precision"}
+                >
+                  {precision}
+                </button>
+              ))}
+            </div>
+          </div>
+          <label className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+            Backend
+            <select
+              value={settings.backend}
+              disabled={saving}
+              onChange={(event) => onSave({ ...settings, backend: event.target.value })}
+              className="select-field"
+              title="Which local backend shadows decisions. Automatic selection falls back to the CPU when needed."
+            >
+              {BACKENDS.map((backend) => (
+                <option key={backend} value={backend}>
+                  {backend}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+            Starts
+            <select
+              value={settings.startup}
+              disabled={saving}
+              onChange={(event) => onSave({ ...settings, startup: event.target.value as VerdictStartupMode })}
+              className="select-field"
+              title="Delayed waits two minutes after startup. Manual waits for Start now."
+            >
+              {STARTUP_MODES.map((mode) => (
+                <option key={mode.value} value={mode.value} title={mode.title}>
+                  {mode.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+            Batch
+            <select
+              value={settings.shadow_batch_size}
+              disabled={saving}
+              onChange={(event) => onSave({ ...settings, shadow_batch_size: Number(event.target.value) })}
+              className="select-field"
+              title="Shadowed steps per background pass. Smaller batches leave shorter background work."
+            >
+              {batchOptions.map((size) => (
+                <option key={size} value={size}>
+                  {size}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+            Max tokens
+            <select
+              value={settings.max_state_tokens}
+              disabled={saving}
+              onChange={(event) => onSave({ ...settings, max_state_tokens: Number(event.target.value) })}
+              className="select-field"
+              title="Long emails keep their start and end; attention cost grows with the square of the length."
+            >
+              {tokenOptions.map((tokens) => (
+                <option key={tokens} value={tokens}>
+                  {tokens.toLocaleString()}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="flex items-center gap-2">
+            {(status?.state === "manual" || status?.state === "scheduled") && !settings.shadow_paused && (
               <button
-                key={precision}
                 type="button"
+                onClick={onStart}
                 disabled={saving}
-                onClick={() => onSave({ ...settings, precision })}
-                className={`rounded-md px-3 py-1 text-xs font-medium ${
-                  settings.precision === precision
-                    ? "bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-gray-100"
-                    : "text-gray-500 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200"
-                }`}
-                title={precision === "f16" ? "About 3× faster on GPUs. Use once this machine's GPU has passed rverdict's backend check." : "Full precision"}
+                className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
               >
-                {precision}
+                Start now
               </button>
-            ))}
+            )}
+            <button
+              type="button"
+              disabled={saving || !settings.enabled}
+              onClick={() => onSave({ ...settings, shadow_paused: !settings.shadow_paused })}
+              className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
+            >
+              {settings.shadow_paused ? "Resume shadowing" : "Pause shadowing"}
+            </button>
           </div>
         </div>
       </div>
@@ -219,6 +387,8 @@ function AgreementTable({ reports }: { reports: VerdictRuleReport[] }) {
 
 export default function LocalDecisions() {
   const toast = useToast();
+  const { accounts } = useGate();
+  const gmailDown = accounts.some((account) => account.status === "error");
   const [overview, setOverview] = useState<VerdictOverview | null>(null);
   const [status, setStatus] = useState<VerdictStatus | null>(null);
   const [reports, setReports] = useState<VerdictRuleReport[]>([]);
@@ -278,12 +448,28 @@ export default function LocalDecisions() {
     }
   }
 
+  async function startNow() {
+    try {
+      await verdictStart();
+    } catch (error) {
+      toast.error(`Could not start shadowing: ${String(error)}`);
+    }
+  }
+
+  async function qualifyF16() {
+    try {
+      await verdictQualifyF16();
+    } catch (error) {
+      toast.error(`Could not start the f16 check: ${String(error)}`);
+    }
+  }
+
   if (!overview) return <div className="text-gray-400 dark:text-gray-500">Loading local decisions...</div>;
 
   return (
     <div className="max-w-6xl space-y-6">
       <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800 sm:p-5">
-        <StatusCard overview={overview} status={status} saving={saving} onSave={(next) => void save(next)} onToggle={() => void toggle()} />
+        <StatusCard overview={overview} status={status} saving={saving} gmailDown={gmailDown} onSave={(next) => void save(next)} onToggle={() => void toggle()} onStart={() => void startNow()} onQualify={() => void qualifyF16()} />
       </section>
 
       <VerdictExplainer />

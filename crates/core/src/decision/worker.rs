@@ -12,8 +12,15 @@ use crate::rules::engine::choice_catalog;
 use crate::rules::label_context::{resolve_label_contexts, ResolvedLabel};
 use crate::workflow::snapshot_rule;
 
-use super::questions::{llm_answer, plan, verdict};
-use super::DecisionModel;
+use rverdict_core::Request;
+use serde_json::Map;
+
+use super::questions::{llm_answer, plan, verdict, Plan};
+use super::{DecisionModel, Evaluation};
+
+/// Valid shadowed steps per worker pass. The command layer and the worker must
+/// agree on the same range.
+pub const SHADOW_BATCH_RANGE: std::ops::RangeInclusive<usize> = 1..=8;
 
 /// Shadows up to `limit` pending steps, newest first. Returns how many were
 /// handled; 0 means nothing is pending. The database is not held while the
@@ -54,6 +61,33 @@ pub fn shadow_batch(
         shadow_step(db, model, step, labels, qualifications)?;
     }
     Ok(pending.len())
+}
+
+/// Evaluates a plan in whole-question chunks, so one 100-label request does not
+/// become one very large dispatch. Splitting here never changes an answer.
+fn evaluate_plan(
+    model: &dyn DecisionModel,
+    plan: &Plan,
+    max_questions: usize,
+) -> Result<Evaluation, String> {
+    let mut answers = Vec::with_capacity(plan.asked.len());
+    let mut truncated = false;
+    for chunk in plan.asked.chunks(max_questions.max(1)) {
+        let mut questions = Map::new();
+        for asked in chunk {
+            if let Some(question) = plan.request.questions.get(&asked.id) {
+                questions.insert(asked.id.clone(), question.clone());
+            }
+        }
+        let evaluation = model.evaluate(&Request {
+            state: plan.request.state.clone(),
+            model: plan.request.model.clone(),
+            questions,
+        })?;
+        truncated = truncated || evaluation.truncated;
+        answers.extend(evaluation.answers);
+    }
+    Ok(Evaluation { answers, truncated })
 }
 
 fn shadow_step(
@@ -108,7 +142,7 @@ fn shadow_step(
     let llm = llm_answer(&step.outcome, step.reply.as_deref(), &menu);
 
     let started = Instant::now();
-    let evaluation = match model.evaluate(&plan.request) {
+    let evaluation = match evaluate_plan(model, &plan, 8) {
         Ok(evaluation) => evaluation,
         Err(error) => {
             return db.with_verdicts(|repo| {
@@ -165,12 +199,14 @@ fn shadow_step(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::{Cell, RefCell};
     use std::path::Path;
 
     use rverdict_core::{Calibration, Logits, Request};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::*;
+    use crate::decision::questions::{Asked, Framing, Meaning, Plan};
     use crate::decision::{Answered, Evaluation, ModelInfo};
 
     /// Always prefers the first option.
@@ -380,5 +416,163 @@ pub(crate) mod tests {
                 ("multi:1", Some("\"Work\""))
             ]
         );
+    }
+
+    struct ChunkRecorder {
+        model: FirstOption,
+        calls: Cell<usize>,
+        sizes: RefCell<Vec<usize>>,
+    }
+
+    impl DecisionModel for ChunkRecorder {
+        fn info(&self) -> &ModelInfo {
+            &self.model.info
+        }
+
+        fn calibration(&self) -> &Calibration {
+            &self.model.calibration
+        }
+
+        fn evaluate(&self, request: &Request) -> Result<Evaluation, String> {
+            let questions = request.parse_questions().map_err(|e| e.to_string())?;
+            self.calls.set(self.calls.get() + 1);
+            self.sizes.borrow_mut().push(questions.len());
+            let answers = questions
+                .into_iter()
+                .map(|(id, question)| {
+                    let rendered = rverdict_core::render(&question);
+                    Answered {
+                        id,
+                        kind: rendered.kind,
+                        logits: Logits {
+                            logits: vec![0.0; rendered.options.len()],
+                            null_logits: None,
+                            state_tokens: 7,
+                        },
+                    }
+                })
+                .collect();
+            Ok(Evaluation {
+                answers,
+                truncated: self.calls.get() == 1,
+            })
+        }
+    }
+
+    fn chunked_plan(questions: usize) -> Plan {
+        let mut asked = Vec::with_capacity(questions);
+        let mut wire = serde_json::Map::new();
+        for index in 0..questions {
+            let id = format!("q{index}");
+            let question = json!({
+                "type": "noul",
+                "instructions": format!("Is question {index} about this email?"),
+            });
+            wire.insert(id.clone(), question.clone());
+            asked.push(Asked {
+                id,
+                framing: Framing::Noul,
+                question,
+                options: vec![Meaning::Applies, Meaning::DoesNotApply],
+                target: None,
+            });
+        }
+        Plan {
+            request: Request {
+                state: Value::String("Subject: test".into()),
+                model: None,
+                questions: wire,
+            },
+            asked,
+        }
+    }
+
+    #[test]
+    fn large_requests_are_split_without_changing_answers() {
+        let recorder = ChunkRecorder {
+            model: FirstOption::default(),
+            calls: Cell::new(0),
+            sizes: RefCell::new(Vec::new()),
+        };
+        let evaluation = evaluate_plan(&recorder, &chunked_plan(5), 2).unwrap();
+
+        assert_eq!(recorder.calls.get(), 3);
+        assert_eq!(*recorder.sizes.borrow(), [2, 2, 1]);
+        assert_eq!(
+            evaluation
+                .answers
+                .iter()
+                .map(|answer| answer.id.as_str())
+                .collect::<Vec<_>>(),
+            ["q0", "q1", "q2", "q3", "q4"]
+        );
+        assert!(evaluation.truncated);
+        assert_eq!(
+            evaluate_plan(&recorder, &chunked_plan(1), 0)
+                .unwrap()
+                .answers
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_failed_chunk_stops_before_any_answer_is_used() {
+        struct FailSecond {
+            info: ModelInfo,
+            calibration: Calibration,
+            calls: Cell<usize>,
+        }
+
+        impl DecisionModel for FailSecond {
+            fn info(&self) -> &ModelInfo {
+                &self.info
+            }
+
+            fn calibration(&self) -> &Calibration {
+                &self.calibration
+            }
+
+            fn evaluate(&self, request: &Request) -> Result<Evaluation, String> {
+                self.calls.set(self.calls.get() + 1);
+                if self.calls.get() == 2 {
+                    return Err("second chunk failed".into());
+                }
+                let questions = request.parse_questions().map_err(|e| e.to_string())?;
+                let answers = questions
+                    .into_iter()
+                    .map(|(id, question)| {
+                        let rendered = rverdict_core::render(&question);
+                        Answered {
+                            id,
+                            kind: rendered.kind,
+                            logits: Logits {
+                                logits: vec![0.0; rendered.options.len()],
+                                null_logits: None,
+                                state_tokens: 7,
+                            },
+                        }
+                    })
+                    .collect();
+                Ok(Evaluation {
+                    answers,
+                    truncated: false,
+                })
+            }
+        }
+
+        let model = FailSecond {
+            info: ModelInfo {
+                id: "stub@1".into(),
+                backend: "test".into(),
+                precision: "f32".into(),
+            },
+            calibration: Calibration::default(),
+            calls: Cell::new(0),
+        };
+        let result = evaluate_plan(&model, &chunked_plan(3), 1);
+
+        assert_eq!(result.unwrap_err(), "second chunk failed");
+        assert_eq!(model.calls.get(), 2);
     }
 }
