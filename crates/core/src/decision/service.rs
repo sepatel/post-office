@@ -37,12 +37,13 @@ const MAX_ATTEMPTS: u32 = 3;
 /// at a fraction of the throughput.
 const CPU_FALLBACK_RETRY: Duration = Duration::from_secs(30 * 60);
 /// Shadow work has no deadline, so the loop rests between batches instead of
-/// pinning the CPU at full duty. The rest is proportional to the last batch's
-/// duration (roughly a third of wall time belongs to inference), bounded so
-/// short batches do not crawl and long ones do not stall for ever. A wake —
-/// settings change, explicit start — still cuts any wait short.
+/// pinning the CPU at full duty. The rest is a multiple of the last batch's
+/// duration — inference owns about a fifth of wall time — bounded so short
+/// batches do not crawl and long ones do not stall for ever. A wake — settings
+/// change, explicit start — still cuts any wait short.
 const BATCH_PACE_MIN: Duration = Duration::from_secs(15);
-const BATCH_PACE_MAX: Duration = Duration::from_secs(600);
+const BATCH_PACE_MAX: Duration = Duration::from_secs(1200);
+const BATCH_REST_FACTOR: u32 = 4;
 
 /// What to do after the model fails, by panicking or refusing to load.
 ///
@@ -745,7 +746,7 @@ impl VerdictService {
                         self.wait(IDLE_WAIT);
                     } else {
                         self.wait(
-                            (batch_started.elapsed() * 2)
+                            (batch_started.elapsed() * BATCH_REST_FACTOR)
                                 .max(BATCH_PACE_MIN)
                                 .min(BATCH_PACE_MAX),
                         );
