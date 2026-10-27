@@ -16,6 +16,8 @@ import LoadError from "../components/LoadError";
 import InferenceStudio, {
   type InferenceConfig,
 } from "../components/InferenceStudio";
+import LabelLibraryPanel from "../components/LabelLibraryPanel";
+import LocalDecisions from "./LocalDecisions";
 
 interface Config extends InferenceConfig {
   gmail_account: string | null;
@@ -26,7 +28,7 @@ interface Config extends InferenceConfig {
   tray_theme: string;
 }
 
-type SettingsTab = "inference" | "mailbox";
+type SettingsTab = "inference" | "local" | "mailbox" | "labels";
 
 export default function Settings() {
   const { connection, accounts, activeEmail, refreshAccounts } = useGate();
@@ -37,7 +39,15 @@ export default function Settings() {
   const [connectError, setConnectError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const request = useRef(0);
-  const tab: SettingsTab = searchParams.get("tab") === "mailbox" ? "mailbox" : "inference";
+  const rawTab = searchParams.get("tab");
+  const tab: SettingsTab =
+    rawTab === "mailbox"
+      ? "mailbox"
+      : rawTab === "labels"
+        ? "labels"
+        : rawTab === "local"
+          ? "local"
+          : "inference";
 
   useEffect(() => {
     void loadConfig();
@@ -91,8 +101,8 @@ export default function Settings() {
 
   function selectTab(nextTab: SettingsTab) {
     const nextParams = new URLSearchParams(searchParams);
-    if (nextTab === "mailbox") nextParams.set("tab", nextTab);
-    else nextParams.delete("tab");
+    if (nextTab === "inference") nextParams.delete("tab");
+    else nextParams.set("tab", nextTab);
     setSearchParams(nextParams);
   }
 
@@ -155,7 +165,7 @@ export default function Settings() {
             Shape how Post Office connects, decides, and recovers.
           </p>
         </div>
-        {tab !== "inference" && (
+        {tab === "mailbox" && (
           <button
             type="button"
             onClick={() => void saveGeneralSettings()}
@@ -168,12 +178,18 @@ export default function Settings() {
 
       {loadError && <div className="mb-6"><LoadError title="Some account data could not be refreshed" error={loadError} onRetry={() => void loadConfig()} /></div>}
 
-      <div className="mb-7 flex max-w-xl gap-1 rounded-xl border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
+      <div className="mb-7 flex max-w-2xl gap-1 rounded-xl border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
         <TabButton active={tab === "inference"} onClick={() => selectTab("inference")}>
           Inference
         </TabButton>
+        <TabButton active={tab === "local"} onClick={() => selectTab("local")}>
+          Local decisions
+        </TabButton>
         <TabButton active={tab === "mailbox"} onClick={() => selectTab("mailbox")}>
           Mailbox
+        </TabButton>
+        <TabButton active={tab === "labels"} onClick={() => selectTab("labels")}>
+          Labels
         </TabButton>
       </div>
 
@@ -183,6 +199,8 @@ export default function Settings() {
           onConfigChange={(next) => setConfig({ ...config, ...next })}
         />
       )}
+
+      {tab === "local" && <LocalDecisions />}
 
       {tab === "mailbox" && (
         <div className="max-w-3xl space-y-6">
@@ -334,6 +352,12 @@ export default function Settings() {
               </div>
             </div>
           </section>
+        </div>
+      )}
+
+      {tab === "labels" && (
+        <div className="max-w-3xl space-y-6">
+          <LabelLibraryPanel />
         </div>
       )}
 

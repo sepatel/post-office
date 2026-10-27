@@ -194,6 +194,10 @@ pub fn spawn(
                 {
                     Ok(result) => {
                         let _ = app_loop.emit("sync-cycle", &result);
+                        if result.touched_messages > 0 {
+                            crate::commands::kick_workflow_worker();
+                            let _ = app_loop.emit("workflow-queue-changed", ());
+                        }
                         mark_last_successful(&db_loop, &state_loop, &account_email, Utc::now())
                             .await;
                         let _ = db_loop.with_accounts(|repo| repo.record_success(&account_email));

@@ -3,11 +3,12 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
+use crate::db::label_qualifications::LabelQualification;
 use crate::db::rules::CreateRuleRequest;
 use crate::db::Database;
 use crate::gmail::models::Label;
 use crate::llm::{LlmProviderProfile, LlmRoutingPolicy, ReasoningEffort};
-use crate::rules::models::{Action, Condition};
+use crate::rules::models::{Action, Condition, MatchMode};
 
 pub const BACKUP_VERSION: u32 = 1;
 pub const BACKUP_APP: &str = "post-office";
@@ -71,7 +72,39 @@ pub struct BackupRule {
     #[serde(default)]
     pub continue_after_match: bool,
     #[serde(default)]
+    pub match_mode: MatchMode,
+    #[serde(default)]
     pub memories: Vec<BackupMemory>,
+    /// Per-rule label description overrides nested with the rule so they
+    /// survive the new-id remapping on import.
+    #[serde(default)]
+    pub label_overrides: Vec<BackupLabelOverride>,
+}
+
+/// Portable form of a per-rule label override; `updated_at` is refreshed on import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupLabelOverride {
+    pub label_id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub examples: Vec<String>,
+    #[serde(default)]
+    pub negative_examples: Vec<String>,
+}
+
+/// Portable form of a `LabelQualification`; `updated_at` is refreshed on import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupLabelQualification {
+    pub label_id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub examples: Vec<String>,
+    #[serde(default)]
+    pub negative_examples: Vec<String>,
+    #[serde(default)]
+    pub source: String,
 }
 
 fn default_true() -> bool {
@@ -194,6 +227,8 @@ pub struct BackupDoc {
     #[serde(default)]
     pub label_names: HashMap<String, String>,
     #[serde(default)]
+    pub label_qualifications: Vec<BackupLabelQualification>,
+    #[serde(default)]
     pub rules: Vec<BackupRule>,
     #[serde(default)]
     pub llm: BackupLlm,
@@ -264,6 +299,17 @@ pub fn build_export(
                 text: entry.text,
             })
             .collect();
+        let label_overrides = db
+            .with_rule_label_overrides(|repo| repo.list_for_rule(rule.id))
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|entry| BackupLabelOverride {
+                label_id: entry.label_id,
+                description: entry.description,
+                examples: entry.examples,
+                negative_examples: entry.negative_examples,
+            })
+            .collect();
         backup_rules.push(BackupRule {
             name: rule.name.clone(),
             description: rule.description.clone(),
@@ -278,9 +324,24 @@ pub fn build_export(
             decision_reasoning_effort: rule.decision_reasoning_effort,
             decision_max_tokens: rule.decision_max_tokens,
             continue_after_match: rule.continue_after_match,
+            match_mode: rule.match_mode,
             memories,
+            label_overrides,
         });
     }
+
+    let label_qualifications = db
+        .with_label_qualifications(|repo| repo.list_for_account(account_email))
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|q| BackupLabelQualification {
+            label_id: q.label_id,
+            description: q.description,
+            examples: q.examples,
+            negative_examples: q.negative_examples,
+            source: q.source,
+        })
+        .collect();
 
     let label_names = db
         .with_labels(|repo| repo.get(account_email))
@@ -300,6 +361,7 @@ pub fn build_export(
         exported_at: chrono::Utc::now().to_rfc3339(),
         account_email: Some(account_email.to_string()),
         label_names,
+        label_qualifications,
         rules: backup_rules,
         llm: BackupLlm {
             providers: config.llm_providers.clone(),
@@ -509,6 +571,7 @@ pub fn apply_import(
                         decision_reasoning_effort: rule.decision_reasoning_effort,
                         decision_max_tokens: rule.decision_max_tokens,
                         continue_after_match: rule.continue_after_match,
+                        match_mode: rule.match_mode,
                     },
                 )
             })
@@ -526,6 +589,44 @@ pub fn apply_import(
                 .map_err(|e| e.to_string())?;
             imported_memories += 1;
         }
+        for label_override in rule.label_overrides {
+            let label_id = resolver.resolve(&label_override.label_id);
+            if label_id.trim().is_empty() {
+                continue;
+            }
+            db.with_rule_label_overrides(|repo| {
+                repo.upsert(&crate::db::rule_label_overrides::RuleLabelOverride {
+                    account_email: account_email.to_string(),
+                    rule_id: created.id,
+                    label_id: label_id.clone(),
+                    description: label_override.description,
+                    examples: label_override.examples,
+                    negative_examples: label_override.negative_examples,
+                    updated_at: String::new(),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    for qualification in doc.label_qualifications {
+        let label_id = resolver.resolve(&qualification.label_id);
+        db.with_label_qualifications(|repo| {
+            repo.upsert(
+                account_email,
+                &label_id,
+                &LabelQualification {
+                    account_email: account_email.to_string(),
+                    label_id: label_id.clone(),
+                    description: qualification.description,
+                    examples: qualification.examples,
+                    negative_examples: qualification.negative_examples,
+                    source: qualification.source,
+                    updated_at: String::new(),
+                },
+            )
+        })
+        .map_err(|e| e.to_string())?;
     }
 
     for policy in unknown_policies {
@@ -568,6 +669,7 @@ mod tests {
             exported_at: "2026-09-14T00:00:00Z".into(),
             account_email: Some("a@example.com".into()),
             label_names: HashMap::from([("Label_1".into(), "Finance".into())]),
+            label_qualifications: vec![],
             rules: vec![BackupRule {
                 name: "Receipts".into(),
                 description: Some("d".into()),
@@ -587,10 +689,12 @@ mod tests {
                 decision_reasoning_effort: ReasoningEffort::Low,
                 decision_max_tokens: Some(1024),
                 continue_after_match: true,
+                match_mode: MatchMode::Single,
                 memories: vec![BackupMemory {
                     kind: "note".into(),
                     text: "remember this".into(),
                 }],
+                label_overrides: vec![],
             }],
             llm: BackupLlm {
                 providers: vec![LlmProviderProfile {

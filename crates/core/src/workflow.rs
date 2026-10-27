@@ -7,12 +7,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 use crate::db::workflow::{
-    ActionPlan, ClaimedRun, NewLlmAttempt, TokenUsage, WorkflowActionPlan, WorkflowEvent,
-    WorkflowLlmAttempt, WorkflowMailbox, WorkflowRun, WorkflowStateCount, WorkflowStep,
-    WorkflowTokenUsage, MAX_ATTEMPTS,
+    ActionPlan, ClaimedRun, NewLlmAttempt, RuleOutcomeCount, TokenUsage, WorkflowActionPlan,
+    WorkflowEvent, WorkflowLlmAttempt, WorkflowMailbox, WorkflowRun, WorkflowStateCount,
+    WorkflowStep, WorkflowTokenUsage, MAX_ATTEMPTS,
 };
 use crate::db::Database;
-use crate::gmail::models::{HistoryRecord, Message};
+use crate::gmail::models::{
+    is_classifiable_label, is_user_label_id, HistoryRecord, Label, Message,
+};
 use crate::gmail::{cached_labels, GmailClient, GmailError};
 use crate::llm::{
     InferenceRouter, InferenceRuntime, LlmProviderProfile, LlmRoutingPolicy, ReasoningEffort,
@@ -20,11 +22,16 @@ use crate::llm::{
 use crate::rules::actions::resolve_actions;
 use crate::rules::email_view::EmailView;
 use crate::rules::engine::{needs_llm_decision, resolve_rule, Outcome, Resolved};
+use crate::rules::label_context::contexts_for_rule;
 use crate::rules::matcher;
 use crate::rules::models::Rule;
 
 const RETRY_DELAY_SECS: u64 = 60;
 const MAX_RUNS_PER_TICK: usize = 20;
+
+/// Stand-in for a run whose plans never landed, so the map lookup at each call
+/// site does not need an `unwrap_or_default`.
+static EMPTY_APPLIED: BTreeSet<String> = BTreeSet::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IngestionResult {
@@ -43,7 +50,10 @@ pub struct QueueItem {
     pub sender: Option<String>,
     pub subject: Option<String>,
     pub preview: String,
-    pub labels: Vec<String>,
+    /// User labels on the message right now, split by who put them there:
+    /// Post Office added them, or they were already there when the run began.
+    pub applied_labels: Vec<String>,
+    pub inherited_labels: Vec<String>,
     pub state: String,
     pub next_rule_index: i64,
     pub next_rule_name: Option<String>,
@@ -113,6 +123,88 @@ pub struct WorkflowRetrySummary {
     pub historical_retry_policy: bool,
 }
 
+/// One message run as it passed through one rule. Flattens the run so the row
+/// carries the same message fields the Queue shows, with the step's outcome
+/// alongside them.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleActivity {
+    #[serde(flatten)]
+    pub message: QueueItem,
+    pub outcome: String,
+    pub decision: Option<String>,
+    pub error: Option<String>,
+    pub step_created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleActivityPage {
+    pub items: Vec<RuleActivity>,
+    /// Steps matching the caller's outcome and window filter, for paging.
+    pub total: i64,
+    /// Per-outcome counts for the window, which stay put while the user
+    /// narrows to one outcome.
+    pub totals: Vec<RuleOutcomeCount>,
+    /// Steps for this rule with no window or outcome filter at all, so a
+    /// narrow view can still say the rule has history further back.
+    pub all_time_total: i64,
+}
+
+/// Every message run that evaluated one rule, with per-outcome counts for the
+/// same window so the caller can show what the rule did before the user filters
+/// down to one outcome.
+pub fn rule_activity(
+    db: &Database,
+    account_email: &str,
+    rule_id: i64,
+    outcome: Option<&str>,
+    since: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<RuleActivityPage, rusqlite::Error> {
+    let labels = label_map(db, account_email);
+    let (runs, applied, total, totals, all_time_total) =
+        db.with_workflow(|repo| -> rusqlite::Result<_> {
+            let runs =
+                repo.rule_activity(account_email, rule_id, outcome, since, page, per_page)?;
+            let run_ids = runs
+                .iter()
+                .map(|activity| activity.run.run_id)
+                .collect::<Vec<_>>();
+            let total = repo.rule_activity_count(account_email, rule_id, outcome, since)?;
+            let totals = repo.rule_activity_totals(account_email, rule_id, since)?;
+            let all_time_total = repo.rule_activity_count(account_email, rule_id, None, None)?;
+            Ok((
+                runs,
+                repo.applied_labels(&run_ids)?,
+                total,
+                totals,
+                all_time_total,
+            ))
+        })?;
+    let items = runs
+        .iter()
+        .map(|activity| {
+            Ok(RuleActivity {
+                message: queue_item(
+                    &activity.run,
+                    &labels,
+                    applied.get(&activity.run.run_id).unwrap_or(&EMPTY_APPLIED),
+                )?,
+                outcome: activity.step.outcome.clone(),
+                decision: activity.step.decision.clone(),
+                error: activity.step.error.clone(),
+                step_created_at: activity.step.created_at.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    Ok(RuleActivityPage {
+        items,
+        total,
+        totals,
+        all_time_total,
+    })
+}
+
 pub fn queue_items(
     db: &Database,
     account_email: &str,
@@ -120,10 +212,20 @@ pub fn queue_items(
     page: u32,
     per_page: u32,
 ) -> Result<Vec<QueueItem>, rusqlite::Error> {
-    let labels = label_names(db, account_email);
-    db.with_workflow(|repo| repo.list_runs(account_email, state, page, per_page))?
-        .iter()
-        .map(|run| queue_item(run, &labels))
+    let labels = label_map(db, account_email);
+    let (runs, applied) = db.with_workflow(|repo| -> rusqlite::Result<_> {
+        let runs = repo.list_runs(account_email, state, page, per_page)?;
+        let run_ids = runs.iter().map(|run| run.run_id).collect::<Vec<_>>();
+        Ok((runs, repo.applied_labels(&run_ids)?))
+    })?;
+    runs.iter()
+        .map(|run| {
+            queue_item(
+                run,
+                &labels,
+                applied.get(&run.run_id).unwrap_or(&EMPTY_APPLIED),
+            )
+        })
         .collect()
 }
 
@@ -152,8 +254,7 @@ pub fn message_detail(
     else {
         return Ok(None);
     };
-    let labels = label_names(db, account_email);
-    let message = queue_item(&run, &labels)?;
+    let labels = label_map(db, account_email);
     let body = parse_message(&run)
         .map(|message| EmailView::from_message(&message).body)
         .unwrap_or_default();
@@ -163,16 +264,21 @@ pub fn message_detail(
         .and_then(|snapshot| rule_context(snapshot, run.next_rule_index));
     db.with_workflow(|repo| {
         let mut action_plans = repo.action_plans(run.run_id)?;
+        let applied = repo
+            .applied_labels(&[run.run_id])?
+            .remove(&run.run_id)
+            .unwrap_or_default();
+        let message = queue_item(&run, &labels, &applied)?;
         for action in &mut action_plans {
             action.add_label_names = action
                 .add_label_ids
                 .iter()
-                .map(|label| labels.get(label).cloned().unwrap_or_else(|| label.clone()))
+                .map(|label| label_name(&labels, label))
                 .collect();
             action.remove_label_names = action
                 .remove_label_ids
                 .iter()
-                .map(|label| labels.get(label).cloned().unwrap_or_else(|| label.clone()))
+                .map(|label| label_name(&labels, label))
                 .collect();
         }
         let mut llm_attempts = repo.llm_attempts(run.run_id)?;
@@ -208,18 +314,17 @@ pub fn rule_set_status(
 
 fn queue_item(
     run: &WorkflowRun,
-    label_names: &HashMap<String, String>,
+    label_map: &HashMap<String, Label>,
+    applied: &BTreeSet<String>,
 ) -> Result<QueueItem, rusqlite::Error> {
     let message = parse_message(run);
-    let labels = run
+    let current = run
         .labels_json
         .as_deref()
         .and_then(|json| serde_json::from_str(json).ok())
         .or_else(|| message.as_ref().map(|message| message.label_ids.clone()))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|label| label_names.get(&label).cloned().unwrap_or(label))
-        .collect();
+        .unwrap_or_default();
+    let (applied_labels, inherited_labels) = split_labels(current, applied, label_map);
     let (sender, subject, preview) = message
         .as_ref()
         .map(|message| {
@@ -241,7 +346,8 @@ fn queue_item(
         sender,
         subject,
         preview,
-        labels,
+        applied_labels,
+        inherited_labels,
         state: run.state.clone(),
         next_rule_index: run.next_rule_index,
         next_rule_name,
@@ -364,17 +470,56 @@ fn retry_summary(attempt_count: i64, events: &[WorkflowEvent]) -> WorkflowRetryS
     }
 }
 
-fn label_names(db: &Database, account_email: &str) -> HashMap<String, String> {
+fn label_map(db: &Database, account_email: &str) -> HashMap<String, Label> {
     db.with_labels(|repo| {
         repo.get(account_email).map(|cached| {
             cached
                 .into_iter()
                 .flat_map(|cached| cached.labels)
-                .map(|label| (label.id, label.name))
+                .map(|label| (label.id.clone(), label))
                 .collect()
         })
     })
     .unwrap_or_default()
+}
+
+/// Whether a label id on a message is one the user would recognise as a topic,
+/// as opposed to Gmail's mailbox state. The cached label list can be stale, so
+/// an id we cannot resolve falls back to Gmail's own user-id prefix.
+fn is_user_label(label_map: &HashMap<String, Label>, id: &str) -> bool {
+    label_map
+        .get(id)
+        .map_or_else(|| is_user_label_id(id), is_classifiable_label)
+}
+
+fn label_name(label_map: &HashMap<String, Label>, id: &str) -> String {
+    label_map
+        .get(id)
+        .map_or_else(|| id.to_owned(), |label| label.name.clone())
+}
+
+/// Splits a message's current labels into the ones this run added and the ones
+/// it inherited, dropping system labels. Alphabetical, so a row does not
+/// reshuffle between polls.
+fn split_labels(
+    current: Vec<String>,
+    applied: &BTreeSet<String>,
+    label_map: &HashMap<String, Label>,
+) -> (Vec<String>, Vec<String>) {
+    let mut added = BTreeSet::new();
+    let mut inherited = BTreeSet::new();
+    for id in current {
+        if !is_user_label(label_map, &id) {
+            continue;
+        }
+        let name = label_name(label_map, &id);
+        if applied.contains(&id) {
+            added.insert(name);
+        } else {
+            inherited.insert(name);
+        }
+    }
+    (added.into_iter().collect(), inherited.into_iter().collect())
 }
 
 fn parse_message(run: &WorkflowRun) -> Option<Message> {
@@ -425,6 +570,14 @@ struct LlmSnapshot {
     providers: Vec<LlmProviderProfile>,
     routing_policies: Vec<LlmRoutingPolicy>,
     default_policy: String,
+}
+
+/// The rule and its memories at `index` of a stored rule-set snapshot, as the
+/// run that used it saw them.
+pub(crate) fn snapshot_rule(rules_json: &str, index: usize) -> Option<(Rule, Vec<String>)> {
+    let snapshot: RuleSetSnapshot = serde_json::from_str(rules_json).ok()?;
+    let entry = snapshot.rules.into_iter().nth(index)?;
+    Some((entry.rule, entry.memories))
 }
 
 impl LlmSnapshot {
@@ -481,7 +634,7 @@ pub fn publish_rule_set(
     account_email: &str,
     config: &AppConfig,
 ) -> Result<(), rusqlite::Error> {
-    let rules = db.with_rules(|repo| repo.list_all(account_email))?;
+    let rules = db.with_rules(|repo| repo.get_enabled_rules(account_email))?;
     let snapshots = rules
         .into_iter()
         .map(|rule| {
@@ -553,6 +706,9 @@ pub async fn ingest_history(
     let mut page_token = None;
     let mut to_history_id = from_history_id.clone();
     let mut message_ids = BTreeSet::new();
+    // Label changes are read only for shadow-mode feedback, and only when
+    // local decisions are enabled; they never queue work.
+    let mut label_events = Vec::new();
     loop {
         let page = match gmail
             .list_history_page(&from_history_id, page_token.as_deref())
@@ -579,6 +735,9 @@ pub async fn ingest_history(
         for record in page.history.as_deref().unwrap_or_default() {
             to_history_id = max_history_id(to_history_id, &record.id);
             collect_arrivals(&mut message_ids, record);
+            if config.verdict_enabled {
+                crate::decision::feedback::collect(record, &mut label_events);
+            }
         }
         page_token = page.next_page_token;
         if page_token.is_none() {
@@ -586,6 +745,11 @@ pub async fn ingest_history(
         }
     }
 
+    if !label_events.is_empty() {
+        if let Err(error) = crate::decision::feedback::record(db, account_email, &label_events) {
+            tracing::warn!("Could not record label feedback for {account_email}: {error}");
+        }
+    }
     let ids = message_ids.into_iter().collect::<Vec<_>>();
     let queued_messages =
         db.with_workflow(|repo| repo.enqueue_arrivals(account_email, &to_history_id, &ids))?;
@@ -821,8 +985,17 @@ pub async fn prepare_run(
         }
 
         if !needs_llm_decision(rule, &labels) {
-            let resolved =
-                resolve_rule(&llm, rule, &view, &rule_snapshot.memories, &labels).await?;
+            let label_contexts =
+                contexts_for_rule(db, &run.account_email, rule_snapshot.rule.id);
+            let resolved = resolve_rule(
+                &llm,
+                rule,
+                &view,
+                &rule_snapshot.memories,
+                &labels,
+                &label_contexts,
+            )
+            .await?;
             persist_decision(db, &run, rule, rule_index, &labels, &resolved)?;
             return Ok(());
         }
@@ -937,7 +1110,16 @@ pub async fn process_routed_run(
     }
     let started = Instant::now();
     let view = EmailView::from_message(&message);
-    let resolved = match resolve_rule(&llm, rule, &view, &rule_snapshot.memories, &labels).await {
+    let label_contexts = contexts_for_rule(db, &run.account_email, rule_snapshot.rule.id);
+    let resolved = match resolve_rule(
+        &llm,
+        rule,
+        &view,
+        &rule_snapshot.memories,
+        &labels,
+        &label_contexts,
+    )
+    .await {
         Ok(resolved) => resolved,
         Err(error) => {
             record_decision_error(
@@ -1272,6 +1454,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::db::rules::{CreateRuleRequest, UpdateRuleRequest};
 
     fn message_with_labels(labels: &[&str]) -> Message {
         Message {
@@ -1284,6 +1467,53 @@ mod tests {
             size_estimate: 0,
             payload: None,
         }
+    }
+
+    fn user_label(id: &str, name: &str) -> Label {
+        Label {
+            id: id.into(),
+            name: name.into(),
+            label_type: "user".into(),
+            message_list_visibility: None,
+            label_list_visibility: None,
+        }
+    }
+
+    #[test]
+    fn system_labels_are_dropped_and_others_split_by_provenance() {
+        let label_map = HashMap::from([
+            ("Label_1".into(), user_label("Label_1", "Receipts")),
+            ("Label_2".into(), user_label("Label_2", "Recruiters")),
+            (
+                "CATEGORY_UPDATES".into(),
+                user_label("CATEGORY_UPDATES", "Updates"),
+            ),
+        ]);
+        let current = vec![
+            "Label_1".into(),
+            "Label_2".into(),
+            "INBOX".into(),
+            "CATEGORY_UPDATES".into(),
+        ];
+        let applied = BTreeSet::from(["Label_2".into()]);
+        assert_eq!(
+            split_labels(current, &applied, &label_map),
+            (vec!["Recruiters".to_string()], vec!["Receipts".to_string()])
+        );
+    }
+
+    #[test]
+    fn labels_missing_from_the_cache_fall_back_to_their_id() {
+        let applied = BTreeSet::from(["Label_9".into()]);
+        // Nothing cached, but the `Label_` prefix still marks it as a user topic.
+        assert_eq!(
+            split_labels(
+                vec!["Label_9".into(), "UNREAD".into()],
+                &applied,
+                &HashMap::new()
+            ),
+            (vec!["Label_9".to_string()], vec![])
+        );
     }
 
     #[test]
@@ -1315,6 +1545,88 @@ mod tests {
             ),
             Some("Message was moved to Trash outside Post Office")
         );
+    }
+
+    #[test]
+    fn a_disabled_rule_leaves_the_published_ruleset() {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        let account = "test@example.com";
+        let config = AppConfig::default();
+
+        let mut request = CreateRuleRequest {
+            name: "Receipts".into(),
+            description: None,
+            conditions: vec![],
+            prompt: "Is this a receipt?".into(),
+            choices: vec![],
+            choose_from_all_labels: false,
+            actions: vec![],
+            priority: 0,
+            enabled: true,
+            inference_policy: String::new(),
+            decision_reasoning_effort: ReasoningEffort::ServerDefault,
+            decision_max_tokens: None,
+            continue_after_match: false,
+            match_mode: crate::rules::models::MatchMode::Single,
+        };
+        db.with_rules(|repo| repo.create(account, &request)).unwrap();
+
+        request.name = "Alerts".into();
+        request.priority = 1;
+        let alerts = db.with_rules(|repo| repo.create(account, &request)).unwrap();
+
+        publish_rule_set(&db, account, &config).unwrap();
+        let names = || -> Vec<String> {
+            db.with_workflow(|repo| repo.active_rule_set(account))
+                .unwrap()
+                .map(|set| {
+                    serde_json::from_str::<RuleSetSnapshot>(&set.rules_json)
+                        .unwrap()
+                        .rules
+                        .into_iter()
+                        .map(|entry| entry.rule.name)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(names(), ["Receipts", "Alerts"]);
+
+        // Turning a rule off must take it out of the chain, not just flag it.
+        request.enabled = false;
+        request.priority = 0;
+        db.with_rules(|repo| {
+            repo.update(
+                account,
+                alerts.id,
+                &UpdateRuleRequest {
+                    name: "Alerts".into(),
+                    description: None,
+                    conditions: vec![],
+                    prompt: request.prompt.clone(),
+                    choices: vec![],
+                    choose_from_all_labels: false,
+                    actions: vec![],
+                    priority: 0,
+                    enabled: false,
+                    inference_policy: String::new(),
+                    decision_reasoning_effort: ReasoningEffort::ServerDefault,
+                    decision_max_tokens: None,
+                    continue_after_match: false,
+                    match_mode: crate::rules::models::MatchMode::Single,
+                },
+            )
+        })
+        .unwrap();
+        publish_rule_set(&db, account, &config).unwrap();
+        assert_eq!(names(), ["Receipts"]);
+
+        // The disabled rule keeps its id, so the activity recorded before it
+        // was switched off still resolves to it.
+        assert!(db
+            .with_rules(|repo| repo.get_by_id(account, alerts.id))
+            .unwrap()
+            .is_some());
     }
 
     fn taxonomy_config() -> AppConfig {
@@ -1369,6 +1681,7 @@ mod tests {
                     decision_reasoning_effort: ReasoningEffort::ServerDefault,
                     decision_max_tokens: None,
                     continue_after_match: false,
+                    match_mode: crate::rules::models::MatchMode::Single,
                 },
                 memories: vec![],
             }],

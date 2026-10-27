@@ -10,13 +10,16 @@ pub mod accounts;
 pub mod config;
 pub mod history;
 pub mod inference;
+pub mod label_qualifications;
 pub mod labels;
 pub mod llm_endpoint_status;
 pub mod llm_provider_status;
 pub mod rule_chat;
+pub mod rule_label_overrides;
 pub mod rule_memory;
 pub mod rules;
 pub mod sync_state;
+pub mod verdicts;
 pub mod workflow;
 
 const SLOW_LOCK_WARNING: Duration = Duration::from_secs(10);
@@ -51,7 +54,7 @@ impl Drop for HolderReset<'_> {
 
 impl Database {
     #[track_caller]
-    fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+    pub(crate) fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
         let location = Location::caller();
         let waiting_since = Instant::now();
         let conn = loop {
@@ -114,6 +117,7 @@ impl Database {
 
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock();
+        snapshot_before(&conn, 32);
         let transaction = conn.unchecked_transaction()?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -237,6 +241,44 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (25)", [])?;
         }
+        // 26 is deliberately unused: a development build applied a migration 26
+        // that was later removed, so databases may already record it.
+        if !migration_applied(&transaction, 27)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/027_verdict_shadow.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (27)", [])?;
+        }
+        if !migration_applied(&transaction, 28)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/028_rule_match_mode.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (28)", [])?;
+        }
+        if !migration_applied(&transaction, 29)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/029_rule_label_overrides.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (29)", [])?;
+        }
+        if !migration_applied(&transaction, 30)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/030_verdict_target.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (30)", [])?;
+        }
+        if !migration_applied(&transaction, 31)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/031_workflow_steps_by_rule.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (31)", [])?;
+        }
+        if !migration_applied(&transaction, 32)? {
+            transaction.execute_batch(include_str!(
+                "../../../../migrations/032_verdict_adjudication.sql"
+            ))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (32)", [])?;
+        }
         transaction.commit()
     }
 
@@ -329,11 +371,70 @@ impl Database {
     }
 
     #[track_caller]
+    pub fn with_verdicts<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(verdicts::VerdictRepository<'_>) -> R,
+    {
+        self.with_conn(|conn| f(verdicts::VerdictRepository::new(conn)))
+    }
+
+    #[track_caller]
     pub fn with_labels<F, R>(&self, f: F) -> R
     where
         F: FnOnce(labels::LabelRepository<'_>) -> R,
     {
         self.with_conn(|conn| f(labels::LabelRepository::new(conn)))
+    }
+
+    #[track_caller]
+    pub fn with_label_qualifications<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(label_qualifications::LabelQualificationRepository<'_>) -> R,
+    {
+        self.with_conn(|conn| {
+            f(label_qualifications::LabelQualificationRepository::new(
+                conn,
+            ))
+        })
+    }
+
+    #[track_caller]
+    pub fn with_rule_label_overrides<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(rule_label_overrides::RuleLabelOverrideRepository<'_>) -> R,
+    {
+        self.with_conn(|conn| f(rule_label_overrides::RuleLabelOverrideRepository::new(conn)))
+    }
+}
+
+/// Copies an existing database to `<file>.pre-<version>.bak` before
+/// `version` is applied, so a migration can be undone by restoring the copy.
+/// Best effort: a failed copy is logged and the migration still runs.
+fn snapshot_before(conn: &Connection, version: i64) {
+    let pending = conn
+        .query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = ?1)
+                 AND EXISTS (SELECT 1 FROM schema_migrations)",
+            [version],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if !pending {
+        return;
+    }
+    let file: String = conn
+        .query_row("PRAGMA database_list", [], |row| row.get(2))
+        .unwrap_or_default();
+    if file.is_empty() {
+        return;
+    }
+    let backup = format!("{file}.pre-{version:03}.bak");
+    if Path::new(&backup).exists() {
+        return;
+    }
+    match conn.execute("VACUUM INTO ?1", [&backup]) {
+        Ok(_) => tracing::info!("Saved the database to {backup} before migration {version}"),
+        Err(error) => tracing::warn!("Could not save {backup} before migration {version}: {error}"),
     }
 }
 

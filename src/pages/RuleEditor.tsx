@@ -11,6 +11,7 @@ import {
   evaluateMessages,
   configGet,
   gmailListLabels,
+  classifiableLabels,
   ruleMemoriesList,
   ruleMemoryDelete,
   type ChatProposal,
@@ -24,6 +25,8 @@ import {
 import Dropdown, { DropdownOption } from "../components/Dropdown";
 import { useToast } from "../lib/toast";
 import RuleChatPanel from "../components/RuleChatPanel";
+import RuleActivityPanel from "../components/RuleActivityPanel";
+import RuleLabelOverridesPanel from "../components/RuleLabelOverridesPanel";
 import ConditionBuilder, {
   Condition,
   normalizeConditionLabelIds as normalizeConditionLabelIdsRecursive,
@@ -116,6 +119,7 @@ export default function RuleEditor() {
   const [decisionMaxTokens, setDecisionMaxTokens] = useState("server_default");
   const [chooseFromAllLabels, setChooseFromAllLabels] = useState(false);
   const [continueAfterMatch, setContinueAfterMatch] = useState(false);
+  const [matchMode, setMatchMode] = useState<"single" | "multiple">("single");
   const [routingPolicies, setRoutingPolicies] = useState<RoutingPolicy[]>([]);
   const [conditions, setConditions] = useState<Condition[]>([]);
 
@@ -152,15 +156,34 @@ export default function RuleEditor() {
   );
   const hasMenu = chooseFromAllLabels || choices.length > 0;
 
+  const classifiableGmailLabels = useMemo(
+    () => classifiableLabels(gmailLabels),
+    [gmailLabels],
+  );
+
   // The exact trap: a prompt that enumerates outcomes the model is never offered
-  // can only ever produce a match that changes nothing.
+  // can only ever produce a match that changes nothing. Only classifiable
+  // labels are considered — mentioning INBOX or a CATEGORY_* in prose must
+  // not suggest adding it as a choice.
   const promptLabels = useMemo(
     () =>
-      gmailLabels.filter(
+      classifiableGmailLabels.filter(
         (label) => label.name.length > 2 && prompt.includes(label.name)
       ),
-    [prompt, gmailLabels]
+    [prompt, classifiableGmailLabels]
   );
+
+  const offeredLabels = useMemo(() => {
+    if (chooseFromAllLabels) return classifiableGmailLabels;
+    const values = new Set(
+      choices
+        .filter((choice) => needsLabelValue(choice.type))
+        .map((choice) => choice.value)
+    );
+    return classifiableGmailLabels.filter(
+      (label) => values.has(label.id) || values.has(label.name) || values.has(label.name.toLowerCase())
+    );
+  }, [chooseFromAllLabels, choices, classifiableGmailLabels]);
 
   const unofferedLabels = useMemo(() => {
     if (chooseFromAllLabels) return [];
@@ -191,7 +214,17 @@ export default function RuleEditor() {
     ).map((option) => option.label);
   }, [prompt, choices]);
 
+  // Classification pickers (choices + label actions) offer only classifiable
+  // user labels. System labels stay available in conditions below.
   const labelOptions = useMemo<DropdownOption[]>(
+    () =>
+      classifiableGmailLabels.map((label) => ({
+        value: label.id,
+        label: label.name,
+      })),
+    [classifiableGmailLabels]
+  );
+  const conditionLabelOptions = useMemo<DropdownOption[]>(
     () =>
       gmailLabels.map((label) => ({
         value: label.id,
@@ -290,6 +323,7 @@ export default function RuleEditor() {
         choices?: unknown[];
         choose_from_all_labels?: boolean;
         continue_after_match?: boolean;
+        match_mode?: "single" | "multiple";
       }[];
       const rule = rules.find((r) => r.id === ruleId);
       if (rule) {
@@ -325,6 +359,7 @@ export default function RuleEditor() {
         setDecisionMaxTokens(rule.decision_max_tokens?.toString() || "server_default");
         setChooseFromAllLabels(rule.choose_from_all_labels || false);
         setContinueAfterMatch(rule.continue_after_match || false);
+        setMatchMode(rule.match_mode === "multiple" ? "multiple" : "single");
         setConditions(normalizedConditions);
         setActions(normalizedActions);
         setChoices(normalizedChoices);
@@ -436,6 +471,7 @@ export default function RuleEditor() {
       decision_reasoning_effort: decisionReasoningEffort,
       decision_max_tokens: decisionMaxTokens === "server_default" ? null : Number(decisionMaxTokens),
       continue_after_match: continueAfterMatch,
+      match_mode: matchMode,
       source_rule_id: isEdit ? ruleId : undefined,
     };
   }
@@ -618,7 +654,8 @@ export default function RuleEditor() {
 
         {isEdit && activeTab === "activity" && (
           <div className="mb-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-100">
-            Saving applies this rule to every unfinished message. Production outcomes belong to each message run in the <Link to="/queue" className="font-semibold underline">Queue</Link>.
+            Every message this rule was asked about. Open one to see its full run
+            timeline in the <Link to="/queue" className="font-semibold underline">Queue</Link>.
           </div>
         )}
 
@@ -697,7 +734,7 @@ export default function RuleEditor() {
           <ConditionBuilder
             conditions={conditions}
             onChange={setConditions}
-            labelOptions={labelOptions}
+            labelOptions={conditionLabelOptions}
             labelNameById={labelNameById}
             labelIdByName={labelIdByName}
             labelsError={labelsError}
@@ -706,6 +743,17 @@ export default function RuleEditor() {
         </div>
 
         {decisionMode === "classify" && <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800 space-y-2">
+          <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+            <span>Select</span>
+            <select
+              value={matchMode}
+              onChange={(event) => setMatchMode(event.target.value as "single" | "multiple")}
+              className="select-field"
+            >
+              <option value="single">One outcome</option>
+              <option value="multiple">Multiple outcomes</option>
+            </select>
+          </div>
           <label className="block text-sm text-gray-500 dark:text-gray-400">
             Outcome choices
           </label>
@@ -720,12 +768,14 @@ export default function RuleEditor() {
               onChange={(event) => setChooseFromAllLabels(event.target.checked)}
               className="rounded"
             />
-            Offer every Gmail user label instead
+            Offer every classifiable label instead
           </label>
           {chooseFromAllLabels ? (
             <p className="text-xs text-amber-700 dark:text-amber-300">
-              Every user label is sent with each email, which grows the prompt. Prefer a
-              fixed list when the rule classifies into a known set.
+              Every classifiable label is sent with each email (system labels like Inbox,
+              Sent, Category_* are excluded), which grows the prompt. Prefer a fixed list
+              when the rule classifies into a known set. Defaults come from Settings →
+              Labels.
             </p>
           ) : (
             <>
@@ -821,6 +871,11 @@ export default function RuleEditor() {
               while still stopping lower-priority rules from running.
             </p>
           )}
+          <RuleLabelOverridesPanel
+            ruleId={isEdit ? ruleId : null}
+            labels={offeredLabels}
+            matchMode={matchMode}
+          />
         </div>}
 
         <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800">
@@ -1265,13 +1320,7 @@ export default function RuleEditor() {
           </div>
         </div>}
 
-        {activeTab === "activity" && isEdit && (
-          <div className="rounded-2xl border border-gray-200 bg-white p-8 text-center dark:border-gray-700 dark:bg-gray-800">
-            <h3 className="text-lg font-semibold">Execution lives with each message</h3>
-            <p className="mx-auto mt-2 max-w-md text-sm text-gray-500 dark:text-gray-400">Inspect a queued message to see the ruleset snapshot, decisions, actions, and retries that produced its outcome.</p>
-            <Link to="/queue" className="mt-5 inline-flex rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Open Queue</Link>
-          </div>
-        )}
+        {activeTab === "activity" && isEdit && <RuleActivityPanel ruleId={ruleId} />}
 
         {activeTab === "learn" && (
           isEdit ? <div className="h-[38rem]"><RuleChatPanel ruleId={ruleId} ruleName={name || "Untitled rule"} onApplyProposal={applyChatProposalToDraft} /></div> : <div className="rounded-2xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400">Save the rule before tuning it with chat.</div>

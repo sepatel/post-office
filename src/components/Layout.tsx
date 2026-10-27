@@ -2,7 +2,7 @@ import { Component, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import AccountSwitcher from "./AccountSwitcher";
 import ThemeToggle from "./ThemeToggle";
-import { processingPause, processingResume, processingStatus, workflowQueueSummary, type WorkflowQueueSummary } from "../lib/tauri";
+import { processingPause, processingResume, processingStatus, onSyncProgress, onVerdictStatus, onWorkflowQueueChanged, workflowQueueSummary, type VerdictStatus, type WorkflowQueueSummary } from "../lib/tauri";
 import { useGate } from "../lib/gate";
 
 const navItems = [
@@ -47,6 +47,7 @@ export default function Layout() {
   const location = useLocation();
   const [summary, setSummary] = useState<WorkflowQueueSummary | null>(null);
   const [paused, setPaused] = useState(false);
+  const [verdict, setVerdict] = useState<VerdictStatus | null>(null);
   const [changingPause, setChangingPause] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
   const loading = useRef(false);
@@ -68,9 +69,35 @@ export default function Layout() {
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 10_000);
-    return () => window.clearInterval(timer);
+    // Event-driven refresh: the backend emits `workflow-queue-changed`
+    // after worker passes, sync arrivals, and retries. The 60s timer and
+    // visibility handler are only safety nets for missed events.
+    const unlistens = [
+      onWorkflowQueueChanged(() => void load()),
+      onSyncProgress((progress) => {
+        if (progress.phase === "idle" || progress.phase === "error") void load();
+      }),
+    ];
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load();
+    }, 60_000);
+    const onVisible = () => {
+      if (!document.hidden) void load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      for (const unlisten of unlistens) void unlisten.then((stop) => stop());
+    };
   }, [activeEmail]);
+
+  useEffect(() => {
+    const unlistenVerdict = onVerdictStatus(setVerdict);
+    return () => {
+      void unlistenVerdict.then((stop) => stop());
+    };
+  }, []);
 
   async function togglePause() {
     setChangingPause(true);
@@ -87,6 +114,8 @@ export default function Layout() {
 
   const attention = count(summary, "needs_attention");
   const active = count(summary, "processing") + count(summary, "retry_wait") + count(summary, "queued");
+  const verdictWorking = verdict?.state === "running" || verdict?.state === "qualifying";
+  const verdictPending = verdict?.pending ?? 0;
   const erroredAccounts = accounts.filter((account) => account.status === "error");
   const gmailNeedsAttention = Boolean(connection?.error) || erroredAccounts.length > 0;
   const gmailLabel = erroredAccounts.length > 1
@@ -98,12 +127,16 @@ export default function Layout() {
       ? "Attention needed"
       : gmailNeedsAttention
         ? "Gmail needs attention"
-        : "Automation healthy";
+        : verdictWorking
+          ? `Local decisions working${verdictPending > 0 ? ` · ${verdictPending.toLocaleString()} to shadow` : ""}`
+          : "Automation healthy";
   const healthTone = paused
     ? "bg-amber-500"
     : attention > 0 || gmailNeedsAttention
       ? "bg-red-500"
-      : "bg-emerald-500";
+      : verdictWorking
+        ? "bg-blue-500"
+        : "bg-emerald-500";
   return (
     <div className="flex min-h-screen bg-gray-50 text-gray-900 transition-colors dark:bg-gray-900 dark:text-gray-100">
       <aside className="sticky top-0 flex h-screen w-64 shrink-0 flex-col border-r border-gray-200 bg-gray-100 dark:border-gray-700 dark:bg-gray-800">

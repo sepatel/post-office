@@ -38,6 +38,14 @@ pub struct AppConfig {
     pub relay_ws_url: String,
     pub relay_auth_token: String,
     pub tray_theme: String,
+    /// Local decisions with rverdict, shadowing the LLM. Off by default.
+    pub verdict_enabled: bool,
+    pub verdict_precision: String,
+    pub verdict_backend: String,
+    pub verdict_max_state_tokens: u32,
+    pub verdict_startup: crate::decision::StartupMode,
+    pub verdict_shadow_paused: bool,
+    pub verdict_shadow_batch_size: usize,
 }
 
 impl Default for AppConfig {
@@ -76,6 +84,13 @@ impl Default for AppConfig {
             relay_ws_url: String::new(),
             relay_auth_token: String::new(),
             tray_theme: "auto".into(),
+            verdict_enabled: false,
+            verdict_precision: "f32".into(),
+            verdict_backend: "auto".into(),
+            verdict_max_state_tokens: 2_048,
+            verdict_startup: crate::decision::StartupMode::default(),
+            verdict_shadow_paused: false,
+            verdict_shadow_batch_size: 4,
         }
     }
 }
@@ -143,7 +158,41 @@ impl AppConfig {
             relay_ws_url: get("sync.relay.ws_url", ""),
             relay_auth_token: get("sync.relay.auth_token", ""),
             tray_theme: get("ui.tray_theme", "auto"),
+            verdict_enabled: get("verdict.enabled", "false").parse().unwrap_or(false),
+            verdict_precision: get("verdict.precision", "f32"),
+            verdict_backend: get("verdict.backend", "auto"),
+            verdict_max_state_tokens: get("verdict.max_state_tokens", "2048")
+                .parse()
+                .unwrap_or(2_048),
+            verdict_startup: serde_json::from_str(&get("verdict.startup_mode", "\"delayed\""))
+                .unwrap_or_default(),
+            verdict_shadow_paused: get("verdict.shadow_paused", "false")
+                .parse()
+                .unwrap_or(false),
+            verdict_shadow_batch_size: get("verdict.shadow_batch_size", "4").parse().unwrap_or(4),
         }
+    }
+
+    pub fn verdict_settings(&self) -> crate::decision::VerdictSettings {
+        crate::decision::VerdictSettings {
+            enabled: self.verdict_enabled,
+            precision: self.verdict_precision.clone(),
+            backend: self.verdict_backend.clone(),
+            max_state_tokens: self.verdict_max_state_tokens,
+            startup: self.verdict_startup,
+            shadow_paused: self.verdict_shadow_paused,
+            shadow_batch_size: self.verdict_shadow_batch_size,
+        }
+    }
+
+    pub fn set_verdict_settings(&mut self, settings: &crate::decision::VerdictSettings) {
+        self.verdict_enabled = settings.enabled;
+        self.verdict_precision.clone_from(&settings.precision);
+        self.verdict_backend.clone_from(&settings.backend);
+        self.verdict_max_state_tokens = settings.max_state_tokens;
+        self.verdict_startup = settings.startup;
+        self.verdict_shadow_paused = settings.shadow_paused;
+        self.verdict_shadow_batch_size = settings.shadow_batch_size;
     }
 
     pub fn save(&self, repo: &ConfigRepository) -> rusqlite::Result<()> {
@@ -216,6 +265,25 @@ impl AppConfig {
         set("sync.relay.ws_url", &self.relay_ws_url)?;
         set("sync.relay.auth_token", &self.relay_auth_token)?;
         set("ui.tray_theme", &self.tray_theme)?;
+        set("verdict.enabled", &self.verdict_enabled.to_string())?;
+        set("verdict.precision", &self.verdict_precision)?;
+        set("verdict.backend", &self.verdict_backend)?;
+        set(
+            "verdict.max_state_tokens",
+            &self.verdict_max_state_tokens.to_string(),
+        )?;
+        set(
+            "verdict.startup_mode",
+            &serde_json::to_string(&self.verdict_startup).unwrap_or_else(|_| "\"delayed\"".into()),
+        )?;
+        set(
+            "verdict.shadow_paused",
+            &self.verdict_shadow_paused.to_string(),
+        )?;
+        set(
+            "verdict.shadow_batch_size",
+            &self.verdict_shadow_batch_size.to_string(),
+        )?;
         Ok(())
     }
 }
@@ -278,7 +346,19 @@ mod tests {
         };
 
         db.with_config(|repo| config.save(&repo)).unwrap();
-        let loaded = db.with_config(|repo| AppConfig::load(&repo));
+        let mut loaded = db.with_config(|repo| AppConfig::load(&repo));
+        loaded.verdict_startup = crate::decision::StartupMode::Manual;
+        loaded.verdict_shadow_paused = true;
+        loaded.verdict_shadow_batch_size = 2;
+        db.with_config(|repo| loaded.save(&repo)).unwrap();
+        let reloaded = db.with_config(|repo| AppConfig::load(&repo));
+
+        assert_eq!(
+            reloaded.verdict_startup,
+            crate::decision::StartupMode::Manual
+        );
+        assert!(reloaded.verdict_shadow_paused);
+        assert_eq!(reloaded.verdict_shadow_batch_size, 2);
 
         assert_eq!(loaded.llm_default_policy, "travel");
         assert_eq!(loaded.llm_timeout_secs, 45);
@@ -308,6 +388,20 @@ mod tests {
         assert_eq!(
             db.with_config(|repo| AppConfig::load(&repo)).llm_max_tokens,
             1_024
+        );
+        assert_eq!(
+            db.with_config(|repo| AppConfig::load(&repo))
+                .verdict_startup,
+            crate::decision::StartupMode::Delayed
+        );
+        assert!(
+            !db.with_config(|repo| AppConfig::load(&repo))
+                .verdict_shadow_paused
+        );
+        assert_eq!(
+            db.with_config(|repo| AppConfig::load(&repo))
+                .verdict_shadow_batch_size,
+            4
         );
     }
 }

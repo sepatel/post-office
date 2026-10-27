@@ -118,35 +118,6 @@ impl<'a> InferenceRepository<'a> {
         rows.collect()
     }
 
-    pub fn list_for_rule(
-        &self,
-        account_email: &str,
-        rule_id: i64,
-        page: u32,
-        per_page: u32,
-    ) -> Result<Vec<InferenceJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, email_id, rule_id, source, status, attempt_count,
-                    next_attempt_at, lease_until, last_error, created_at, updated_at
-               FROM inference_jobs
-              WHERE account_email = ?1 AND rule_id = ?2 AND status <> 'succeeded'
-              ORDER BY updated_at DESC, id DESC
-              LIMIT ?3 OFFSET ?4",
-        )?;
-        let jobs = stmt
-            .query_map(
-                params![
-                    account_email,
-                    rule_id,
-                    per_page,
-                    page.saturating_mul(per_page)
-                ],
-                map_job,
-            )?
-            .collect();
-        jobs
-    }
-
     pub fn attempts(&self, account_email: &str, job_id: i64) -> Result<Vec<InferenceAttempt>> {
         let mut stmt = self.conn.prepare(
             "SELECT a.id, a.job_id, a.provider_id, a.model, a.status, a.error, a.duration_ms, a.created_at

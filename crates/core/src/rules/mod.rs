@@ -3,6 +3,7 @@ pub mod chat;
 pub mod email_view;
 pub mod engine;
 pub mod evaluation;
+pub mod label_context;
 pub mod matcher;
 pub mod models;
 pub mod prompts;

@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 mod commands;
 mod sync_runtime;
 mod tray;
+mod verdict;
 
 pub type ProcessingStates =
     Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<Mutex<ProcessingState>>>>>;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub inference_runtime: InferenceRuntime,
     pub sync_trigger: mpsc::UnboundedSender<sync_runtime::SyncTrigger>,
     pub tray: Arc<std::sync::Mutex<Option<TrayIcon>>>,
+    pub verdict: verdict::Verdict,
 }
 
 impl AppState {
@@ -46,6 +48,13 @@ impl AppState {
 }
 
 fn main() {
+    // The local decision model's CPU backend parallelizes through rayon,
+    // which defaults to one thread per core and leaves nothing for the app or
+    // the user's other work. Cap it before anything has touched rayon.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        let cores = std::thread::available_parallelism().map_or(4, |v| v.get());
+        std::env::set_var("RAYON_NUM_THREADS", (cores / 2).clamp(1, 6).to_string());
+    }
     tracing_subscriber::fmt::init();
 
     tauri::Builder::default()
@@ -99,6 +108,14 @@ fn main() {
                 inference_runtime.clone(),
             );
 
+            // Off by default: the service thread only waits until local
+            // decisions are enabled in settings.
+            let verdict = verdict::Verdict::start(
+                app.handle(),
+                db.clone(),
+                config_arc.clone(),
+                app_dir.clone(),
+            );
             let app_state = AppState {
                 db,
                 processing_states,
@@ -109,6 +126,7 @@ fn main() {
                 inference_runtime,
                 sync_trigger,
                 tray: Arc::new(std::sync::Mutex::new(None)),
+                verdict,
             };
 
             app.manage(app_state);
@@ -162,13 +180,8 @@ fn main() {
             commands::workflow_rule_set_status,
             commands::workflow_endpoint_status,
             commands::history_list,
-            commands::rules_metrics,
             commands::rule_activity,
             commands::history_search,
-            commands::inference_jobs_list,
-            commands::rule_inference_jobs,
-            commands::inference_job_attempts,
-            commands::inference_job_retry,
             commands::processing_status,
             commands::processing_pause,
             commands::processing_resume,
@@ -177,6 +190,15 @@ fn main() {
             commands::gmail_authenticate,
             commands::gmail_get_profile,
             commands::gmail_list_labels,
+            commands::label_qualifications_list,
+            commands::label_qualification_upsert,
+            commands::label_qualification_delete,
+            commands::label_qualifications_generate,
+            commands::label_library_list,
+            commands::rule_label_overrides_list,
+            commands::rule_label_override_upsert,
+            commands::rule_label_override_clear,
+            commands::rule_label_contexts,
             commands::gmail_connection_status,
             commands::history_by_email,
             commands::pipeline_dry_run,
@@ -191,6 +213,15 @@ fn main() {
             commands::llm_list_models,
             commands::llm_provider_set_api_key,
             commands::llm_provider_status_list,
+            verdict::verdict_overview,
+            verdict::verdict_settings_set,
+            verdict::verdict_start,
+            verdict::verdict_qualify_f16,
+            verdict::verdict_report,
+            verdict::verdict_message,
+            verdict::verdict_disagreements,
+            verdict::verdict_adjudicate,
+            verdict::verdict_export,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -1,0 +1,344 @@
+//! Exports shadowed decisions as rverdict training and calibration data:
+//! `decisions.jsonl` (labelled decisions, readable by `rverdict calibrate`
+//! and training) and `decisions.captures.jsonl` (the model's raw output, so
+//! calibration can be refit without running it again).
+//!
+//! Labels start from the LLM's answers (`source: "llm"`). Where the user has
+//! ruled on a disagreement, their ruling is the label instead (`source:
+//! "user"`), and a decision they called hard for both is left out entirely
+//! rather than labelled with whichever answer was nearer. The files contain
+//! email text: keep them local.
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use rverdict_core::RenderedKind;
+use serde::Serialize;
+use serde_json::{json, Value};
+
+use crate::db::verdicts::{Adjudication, Feedback, VerdictRow};
+use crate::db::Database;
+use crate::gmail::models::{Label, Message};
+use crate::rules::email_view::EmailView;
+
+use super::questions::{framing_group, state_text, Meaning};
+use super::report::{captures, is_negative, verdict_option};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportSummary {
+    pub decisions: usize,
+    pub from_user: usize,
+    pub captures: usize,
+    pub decisions_path: PathBuf,
+    pub captures_path: PathBuf,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExportError {
+    #[error(transparent)]
+    Database(#[from] rusqlite::Error),
+    #[error("writing {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// The label the user's feedback gives a decision, if it says one.
+fn user_option(
+    row: &VerdictRow,
+    meanings: &[Meaning],
+    feedback: &[&Feedback],
+    label_names: &HashMap<String, String>,
+) -> Option<usize> {
+    if feedback.iter().any(|f| f.kind == "llm_right") {
+        return row.llm_option.and_then(|o| usize::try_from(o).ok());
+    }
+    // A label the user added that is on the menu is the right answer.
+    for f in feedback.iter().filter(|f| f.kind == "label_added") {
+        let Some(name) = label_names.get(&f.label_id) else {
+            continue;
+        };
+        let wanted = format!("\"{name}\"");
+        if let Some(i) = meanings
+            .iter()
+            .position(|m| *m == Meaning::Choice(wanted.clone()))
+        {
+            return Some(i);
+        }
+    }
+    // Undoing a yes/no rule's action says it should not have applied.
+    if feedback.iter().any(|f| is_negative(&f.kind))
+        && row.llm_matched == Some(true)
+        && row.framing != "menu"
+    {
+        return meanings.iter().position(|m| *m == Meaning::DoesNotApply);
+    }
+    None
+}
+
+fn expected_label(kind: &RenderedKind, option: usize) -> Option<Value> {
+    match kind {
+        RenderedKind::Noul { .. } => Some(json!(if option == 0 { "yes" } else { "no" })),
+        RenderedKind::Choice { keys } => keys.get(option).map(|k| json!(k)),
+        RenderedKind::Score => Some(json!(option)),
+    }
+}
+
+pub fn export(
+    db: &Database,
+    dir: &Path,
+    model: Option<&str>,
+) -> Result<ExportSummary, ExportError> {
+    let io = |path: &Path| {
+        let path = path.to_owned();
+        move |source| ExportError::Io { path, source }
+    };
+    std::fs::create_dir_all(dir).map_err(io(dir))?;
+    let decisions_path = dir.join("decisions.jsonl");
+    let captures_path = dir.join("decisions.captures.jsonl");
+
+    let rows: Vec<VerdictRow> = db
+        .with_verdicts(|repo| repo.all(model))?
+        .into_iter()
+        .filter(|r| r.status == "ok")
+        .collect();
+    let feedback = db.with_verdicts(|repo| repo.feedback_for_steps())?;
+    let mut by_step: HashMap<i64, Vec<&Feedback>> = HashMap::new();
+    let mut by_verdict: HashMap<i64, Vec<&Feedback>> = HashMap::new();
+    for f in &feedback {
+        if let Some(verdict) = f.verdict_id {
+            by_verdict.entry(verdict).or_default().push(f);
+        } else if let Some(step) = f.step_id {
+            by_step.entry(step).or_default().push(f);
+        }
+    }
+    let mut label_names: HashMap<String, String> = HashMap::new();
+    for account in rows
+        .iter()
+        .map(|r| r.account_email.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let labels: Vec<Label> = db
+            .with_labels(|repo| repo.get(&account))?
+            .map(|c| c.labels)
+            .unwrap_or_default();
+        label_names.extend(labels.into_iter().map(|l| (l.id, l.name)));
+    }
+
+    let mut decisions = std::io::BufWriter::new(
+        std::fs::File::create(&decisions_path).map_err(io(&decisions_path))?,
+    );
+    let mut summary = ExportSummary {
+        decisions: 0,
+        from_user: 0,
+        captures: 0,
+        decisions_path: decisions_path.clone(),
+        captures_path: captures_path.clone(),
+    };
+    let mut relabelled: Vec<VerdictRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(kind) = row
+            .kind_json
+            .as_deref()
+            .and_then(|k| serde_json::from_str::<RenderedKind>(k).ok())
+        else {
+            continue;
+        };
+        let meanings: Vec<Meaning> = row
+            .options_json
+            .as_deref()
+            .and_then(|o| serde_json::from_str(o).ok())
+            .unwrap_or_default();
+        // Feedback about this row alone decides this row; step-level feedback
+        // still speaks for every row the step fanned out to.
+        let step = by_step.get(&row.step_id).cloned().unwrap_or_default();
+        let specific = by_verdict.get(&row.id).cloned().unwrap_or_default();
+        let mut feedback = step.clone();
+        feedback.extend(specific.iter().copied());
+
+        // A decision the user called hard for both carries no answer to learn
+        // from, so it is dropped rather than labelled with the nearer miss.
+        let user = match Adjudication::from_feedback(&step, &specific) {
+            Some(Adjudication::Neither) => continue,
+            Some(Adjudication::Rverdict) => match verdict_option(&row) {
+                Some(option) => Some(option),
+                // Falling back would write back the very label the user
+                // rejected.
+                None => continue,
+            },
+            Some(Adjudication::Llm) | None => user_option(&row, &meanings, &feedback, &label_names),
+        };
+        let (option, source) = match (user, row.llm_option) {
+            (Some(option), _) => (option, "user"),
+            (None, Some(option)) => (usize::try_from(option).unwrap_or(usize::MAX), "llm"),
+            (None, None) => continue,
+        };
+        let Some(expected) = expected_label(&kind, option) else {
+            continue;
+        };
+        let Some((Some(message), Some(question))) =
+            db.with_verdicts(|repo| repo.export_inputs(row.id))?
+        else {
+            continue;
+        };
+        let Ok(message) = serde_json::from_str::<Message>(&message) else {
+            continue;
+        };
+        let line = json!({
+            "id": format!("{}-{}", row.step_id, row.framing),
+            "subset": framing_group(&row.framing),
+            "family": format!("rule {}: {}", row.rule_legacy_id, row.rule_name),
+            "state": state_text(&EmailView::from_message(&message)),
+            "question": serde_json::from_str::<Value>(&question).unwrap_or(Value::Null),
+            "expected": expected,
+            "source": source,
+        });
+        writeln!(decisions, "{line}").map_err(io(&decisions_path))?;
+        summary.decisions += 1;
+        if source == "user" {
+            summary.from_user += 1;
+        }
+        relabelled.push(VerdictRow {
+            llm_option: i64::try_from(option).ok(),
+            ..row
+        });
+    }
+    decisions.flush().map_err(io(&decisions_path))?;
+
+    let mut out =
+        std::io::BufWriter::new(std::fs::File::create(&captures_path).map_err(io(&captures_path))?);
+    let refs: Vec<&VerdictRow> = relabelled.iter().collect();
+    for capture in captures(&refs) {
+        let line = serde_json::to_string(&capture).unwrap_or_default();
+        writeln!(out, "{line}").map_err(io(&captures_path))?;
+        summary.captures += 1;
+    }
+    out.flush().map_err(io(&captures_path))?;
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decision::worker::shadow_batch;
+    use crate::decision::worker::tests::{seeded, FirstOption};
+
+    /// Each test needs its own: they run in parallel in one process.
+    fn dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("po-export-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn exports_llm_labels_and_user_corrections() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        // The user moved the "Sort" email from Financial to Work.
+        db.with_verdicts(|r| {
+            r.record_feedback(
+                "a@x",
+                1,
+                Some(1),
+                Some(2),
+                Some(1),
+                "label_added",
+                "L2",
+                "9",
+            )
+        })
+        .unwrap();
+        let summary = export(&db, &dir("implicit"), None).unwrap();
+        assert_eq!(
+            (summary.decisions, summary.from_user, summary.captures),
+            (3, 1, 3)
+        );
+
+        let lines: Vec<Value> = std::fs::read_to_string(&summary.decisions_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let sort = lines.iter().find(|l| l["subset"] == "menu").unwrap();
+        assert_eq!(
+            (&sort["expected"], &sort["source"]),
+            (&json!("c1"), &json!("user"))
+        );
+        let noul = lines.iter().find(|l| l["subset"] == "noul").unwrap();
+        assert_eq!(noul["expected"], json!("yes"));
+        assert!(noul["state"]
+            .as_str()
+            .unwrap()
+            .starts_with("Subject: Invoice 4411"));
+    }
+
+    /// Reads back one exported line per question.
+    fn exported(summary: &ExportSummary) -> Vec<Value> {
+        std::fs::read_to_string(&summary.decisions_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn adjudicate(db: &Database, framing: &str, right: Adjudication) {
+        let row = db
+            .with_verdicts(|r| r.all(None))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.framing == framing)
+            .expect("a shadowed row");
+        db.with_verdicts(|r| r.set_adjudication(row.id, Some(right)))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_ruling_that_rverdict_was_right_labels_the_row_with_its_answer() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        adjudicate(&db, "menu", Adjudication::Rverdict);
+
+        let summary = export(&db, &dir("ruled"), None).unwrap();
+        let menu = exported(&summary)
+            .into_iter()
+            .find(|line| line["subset"] == "menu")
+            .unwrap();
+        assert_eq!(
+            (&menu["expected"], &menu["source"]),
+            (&json!("c0"), &json!("user"))
+        );
+        assert_eq!(summary.from_user, 1);
+    }
+
+    #[test]
+    fn a_ruling_that_the_llm_was_right_keeps_its_answer() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        adjudicate(&db, "menu", Adjudication::Llm);
+
+        let menu = exported(&export(&db, &dir("confirmed"), None).unwrap())
+            .into_iter()
+            .find(|line| line["subset"] == "menu")
+            .unwrap();
+        assert_eq!(
+            (&menu["expected"], &menu["source"]),
+            (&json!("c0"), &json!("user"))
+        );
+    }
+
+    /// Neither answer is worth learning from, so the decision is left out of
+    /// the export entirely rather than labelled with the nearer miss.
+    #[test]
+    fn a_ruling_that_neither_was_right_drops_the_decision() {
+        let db = seeded();
+        shadow_batch(&db, &FirstOption::default(), 10).unwrap();
+        adjudicate(&db, "menu", Adjudication::Neither);
+
+        let summary = export(&db, &dir("neither"), None).unwrap();
+        assert_eq!(summary.decisions, 2);
+        assert_eq!(summary.captures, 2);
+        assert!(!exported(&summary)
+            .iter()
+            .any(|line| line["subset"] == "menu"));
+    }
+}
