@@ -39,8 +39,7 @@ use crate::{AppState, PipelineDryRunStatus, ProcessingStates};
 
 const WORKFLOW_IDLE_FALLBACK_SECS: u64 = 60;
 
-static WORKFLOW_NOTIFY: std::sync::OnceLock<Arc<tokio::sync::Notify>> =
-    std::sync::OnceLock::new();
+static WORKFLOW_NOTIFY: std::sync::OnceLock<Arc<tokio::sync::Notify>> = std::sync::OnceLock::new();
 
 fn workflow_notify() -> Arc<tokio::sync::Notify> {
     WORKFLOW_NOTIFY
@@ -61,6 +60,7 @@ pub fn spawn_message_workflow_worker(
     processing_states: ProcessingStates,
     config: Arc<tokio::sync::Mutex<AppConfig>>,
     inference_runtime: post_office_core::llm::InferenceRuntime,
+    decider: Option<Arc<dyn post_office_core::decision::live::LiveDecider>>,
 ) {
     tauri::async_runtime::spawn(async move {
         let notify = workflow_notify();
@@ -118,7 +118,8 @@ pub fn spawn_message_workflow_worker(
                     let auth = match load_gmail_auth_for_account(&app, &cfg, &account_email) {
                         Ok(auth) => auth,
                         Err(error) => {
-                            let _ = db.with_accounts(|repo| repo.record_error(&account_email, &error));
+                            let _ =
+                                db.with_accounts(|repo| repo.record_error(&account_email, &error));
                             tracing::warn!(
                                 "Message workflow could not load Gmail credentials for {}: {}",
                                 account_email,
@@ -139,8 +140,9 @@ pub fn spawn_message_workflow_worker(
                     let mut gmail = GmailClient::new(auth);
 
                     let lease_token = post_office_core::workflow::new_lease_token();
-                    let next_run =
-                        db.with_workflow(|repo| repo.claim_next_unrouted(&account_email, &lease_token));
+                    let next_run = db.with_workflow(|repo| {
+                        repo.claim_next_unrouted(&account_email, &lease_token)
+                    });
                     match next_run {
                         Ok(Some(run)) => {
                             processed = true;
@@ -152,6 +154,7 @@ pub fn spawn_message_workflow_worker(
                                 &mut gmail,
                                 &cfg,
                                 inference_runtime.clone(),
+                                decider.clone(),
                                 run,
                             )
                             .await;
@@ -381,6 +384,10 @@ pub struct RuleCreateRequest {
     #[serde(default)]
     pub match_mode: MatchMode,
     #[serde(default)]
+    pub decision_mode: post_office_core::rules::models::DecisionMode,
+    #[serde(default)]
+    pub verdict_threshold: Option<f64>,
+    #[serde(default)]
     pub source_rule_id: Option<i64>,
 }
 
@@ -407,6 +414,10 @@ pub struct RuleUpdateRequest {
     pub continue_after_match: bool,
     #[serde(default)]
     pub match_mode: MatchMode,
+    #[serde(default)]
+    pub decision_mode: post_office_core::rules::models::DecisionMode,
+    #[serde(default)]
+    pub verdict_threshold: Option<f64>,
     #[serde(default)]
     pub source_rule_id: Option<i64>,
 }
@@ -476,6 +487,8 @@ fn build_rule_model(rule: &RuleCreateRequest) -> Rule {
         decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
         match_mode: rule.match_mode,
+        decision_mode: rule.decision_mode,
+        verdict_threshold: rule.verdict_threshold,
     }
 }
 
@@ -965,6 +978,8 @@ pub async fn rules_create(
         decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
         match_mode: rule.match_mode,
+        decision_mode: rule.decision_mode,
+        verdict_threshold: rule.verdict_threshold,
     };
     let created = state
         .db
@@ -1008,6 +1023,8 @@ pub async fn rules_update(
         decision_max_tokens: rule.decision_max_tokens,
         continue_after_match: rule.continue_after_match,
         match_mode: rule.match_mode,
+        decision_mode: rule.decision_mode,
+        verdict_threshold: rule.verdict_threshold,
     };
     let updated = state
         .db
@@ -2041,8 +2058,7 @@ pub async fn label_qualification_delete(
 pub struct LabelLibraryEntry {
     pub label: Label,
     pub classifiable: bool,
-    pub qualification:
-        Option<post_office_core::db::label_qualifications::LabelQualification>,
+    pub qualification: Option<post_office_core::db::label_qualifications::LabelQualification>,
 }
 
 /// The globally managed label library for the active account: every cached
@@ -2069,8 +2085,7 @@ pub async fn label_library_list(
     Ok(labels
         .into_iter()
         .map(|label| {
-            let classifiable =
-                post_office_core::gmail::models::is_classifiable_label(&label);
+            let classifiable = post_office_core::gmail::models::is_classifiable_label(&label);
             let qualification = by_id.get(label.id.as_str()).cloned().cloned();
             LabelLibraryEntry {
                 label,
@@ -2092,11 +2107,7 @@ pub struct RuleLabelOverrideInput {
     pub negative_examples: Vec<String>,
 }
 
-fn ensure_rule_owned(
-    state: &AppState,
-    account_email: &str,
-    rule_id: i64,
-) -> Result<(), String> {
+fn ensure_rule_owned(state: &AppState, account_email: &str, rule_id: i64) -> Result<(), String> {
     state
         .db
         .with_rules(|repo| repo.get_by_id(account_email, rule_id))
@@ -2131,15 +2142,17 @@ pub async fn rule_label_override_upsert(
     state
         .db
         .with_rule_label_overrides(|repo| {
-            repo.upsert(&post_office_core::db::rule_label_overrides::RuleLabelOverride {
-                account_email: account_email.clone(),
-                rule_id: input.rule_id,
-                label_id: input.label_id.clone(),
-                description: input.description,
-                examples: input.examples,
-                negative_examples: input.negative_examples,
-                updated_at: String::new(),
-            })
+            repo.upsert(
+                &post_office_core::db::rule_label_overrides::RuleLabelOverride {
+                    account_email: account_email.clone(),
+                    rule_id: input.rule_id,
+                    label_id: input.label_id.clone(),
+                    description: input.description,
+                    examples: input.examples,
+                    negative_examples: input.negative_examples,
+                    updated_at: String::new(),
+                },
+            )
         })
         .map_err(|e| e.to_string())?;
     publish_current_rule_set(&state, &account_email).await
@@ -2178,10 +2191,7 @@ pub async fn rule_label_contexts(
     let contexts = contexts_for_rule(&state.db, &account_email, rule_id);
     Ok(contexts
         .into_iter()
-        .map(|(label_id, resolved)| ResolvedLabelContext {
-            label_id,
-            resolved,
-        })
+        .map(|(label_id, resolved)| ResolvedLabelContext { label_id, resolved })
         .collect())
 }
 

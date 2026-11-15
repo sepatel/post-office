@@ -6,8 +6,10 @@
 //! calibration can be reported per rule. It runs only when enabled in
 //! settings; off, no model is downloaded or loaded and no GPU is touched.
 
+pub mod calibration;
 pub mod export;
 pub mod feedback;
+pub mod live;
 pub mod questions;
 pub mod repair;
 pub mod report;
@@ -110,6 +112,9 @@ pub struct Answered {
 pub struct Evaluation {
     pub answers: Vec<Answered>,
     pub truncated: bool,
+    /// The model that answered, for live `Resolved` attribution. Set by the
+    /// backend that owns the model; stubs leave it `None`.
+    pub model_id: Option<String>,
 }
 
 /// A decision model the shadow worker can ask: the embedded engine, or a

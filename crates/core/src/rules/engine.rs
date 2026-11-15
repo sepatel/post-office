@@ -1005,6 +1005,8 @@ mod tests {
             decision_max_tokens: None,
             continue_after_match: false,
             match_mode: crate::rules::models::MatchMode::Single,
+            decision_mode: crate::rules::models::DecisionMode::Llm,
+            verdict_threshold: None,
         }
     }
 

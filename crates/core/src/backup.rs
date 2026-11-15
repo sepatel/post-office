@@ -74,6 +74,10 @@ pub struct BackupRule {
     #[serde(default)]
     pub match_mode: MatchMode,
     #[serde(default)]
+    pub decision_mode: crate::rules::models::DecisionMode,
+    #[serde(default)]
+    pub verdict_threshold: Option<f64>,
+    #[serde(default)]
     pub memories: Vec<BackupMemory>,
     /// Per-rule label description overrides nested with the rule so they
     /// survive the new-id remapping on import.
@@ -325,6 +329,8 @@ pub fn build_export(
             decision_max_tokens: rule.decision_max_tokens,
             continue_after_match: rule.continue_after_match,
             match_mode: rule.match_mode,
+            decision_mode: rule.decision_mode,
+            verdict_threshold: rule.verdict_threshold,
             memories,
             label_overrides,
         });
@@ -572,6 +578,8 @@ pub fn apply_import(
                         decision_max_tokens: rule.decision_max_tokens,
                         continue_after_match: rule.continue_after_match,
                         match_mode: rule.match_mode,
+                        decision_mode: rule.decision_mode,
+                        verdict_threshold: rule.verdict_threshold,
                     },
                 )
             })
@@ -690,6 +698,8 @@ mod tests {
                 decision_max_tokens: Some(1024),
                 continue_after_match: true,
                 match_mode: MatchMode::Single,
+                decision_mode: crate::rules::models::DecisionMode::Llm,
+                verdict_threshold: None,
                 memories: vec![BackupMemory {
                     kind: "note".into(),
                     text: "remember this".into(),

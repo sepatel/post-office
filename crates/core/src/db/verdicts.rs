@@ -82,7 +82,7 @@ pub struct PendingStep {
     pub message_json: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NewVerdict<'a> {
     pub step_id: i64,
     pub run_id: i64,
@@ -115,6 +115,43 @@ pub struct NewVerdict<'a> {
     pub state_tokens: Option<i64>,
     pub truncated: Option<bool>,
     pub duration_ms: Option<i64>,
+    pub origin: &'a str,
+}
+
+impl Default for NewVerdict<'_> {
+    fn default() -> Self {
+        Self {
+            step_id: 0,
+            run_id: 0,
+            account_email: "",
+            rule_index: 0,
+            rule_legacy_id: 0,
+            rule_name: "",
+            framing: "",
+            model: "",
+            backend: None,
+            precision: None,
+            status: "",
+            detail: None,
+            question_json: None,
+            options_json: None,
+            kind_json: None,
+            logits_json: None,
+            probabilities_json: None,
+            verdict_matched: None,
+            verdict_choice: None,
+            target: None,
+            confidence: None,
+            llm_matched: None,
+            llm_choices_json: None,
+            llm_option: None,
+            agrees: None,
+            state_tokens: None,
+            truncated: None,
+            duration_ms: None,
+            origin: "shadow",
+        }
+    }
 }
 
 /// A recorded verdict, as reports and the UI read it.
@@ -150,6 +187,7 @@ pub struct VerdictRow {
     pub state_tokens: Option<i64>,
     pub truncated: Option<bool>,
     pub duration_ms: Option<i64>,
+    pub origin: String,
     pub created_at: String,
 }
 
@@ -231,7 +269,7 @@ const VERDICT_COLUMNS: &str =
     v.rule_name, v.framing, v.model, v.backend, v.precision, v.status, v.detail, v.options_json,
     v.kind_json, v.logits_json, v.probabilities_json, v.verdict_matched, v.verdict_choice,
     v.target, v.confidence, v.llm_matched, v.llm_choices_json, v.llm_option, v.agrees,
-    v.state_tokens, v.truncated, v.duration_ms, v.created_at";
+    v.state_tokens, v.truncated, v.duration_ms, v.origin, v.created_at";
 
 fn verdict_row(row: &rusqlite::Row<'_>) -> Result<VerdictRow> {
     Ok(VerdictRow {
@@ -263,7 +301,8 @@ fn verdict_row(row: &rusqlite::Row<'_>) -> Result<VerdictRow> {
         state_tokens: row.get(25)?,
         truncated: row.get(26)?,
         duration_ms: row.get(27)?,
-        created_at: row.get(28)?,
+        origin: row.get(28)?,
+        created_at: row.get(29)?,
     })
 }
 
@@ -330,9 +369,9 @@ impl<'a> VerdictRepository<'a> {
                  model, backend, precision, status, detail, question_json, options_json, kind_json,
                  logits_json, probabilities_json, verdict_matched, verdict_choice, target,
                  confidence, llm_matched, llm_choices_json, llm_option, agrees, state_tokens,
-                 truncated, duration_ms)
+                 truncated, duration_ms, origin)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 v.step_id,
                 v.run_id,
@@ -362,6 +401,7 @@ impl<'a> VerdictRepository<'a> {
                 v.state_tokens,
                 v.truncated,
                 v.duration_ms,
+                v.origin,
             ],
         )?;
         Ok(())
@@ -439,7 +479,7 @@ impl<'a> VerdictRepository<'a> {
                     ":limit": query.limit,
                     ":offset": query.offset,
                 },
-                |row| Ok((verdict_row(row)?, row.get::<_, i64>(29)?)),
+                |row| Ok((verdict_row(row)?, row.get::<_, i64>(30)?)),
             )?
             .collect::<Result<Vec<_>>>()?;
 
@@ -559,7 +599,8 @@ impl<'a> VerdictRepository<'a> {
     }
 
     /// The state and question of a verdict, for exports.
-    pub fn export_inputs(        &self,
+    pub fn export_inputs(
+        &self,
         verdict_id: i64,
     ) -> Result<Option<(Option<String>, Option<String>)>> {
         self.conn
@@ -672,6 +713,64 @@ impl<'a> VerdictRepository<'a> {
                 label_id: row.get(3)?,
                 created_at: row.get(4)?,
             })
+        })?;
+        rows.collect()
+    }
+
+    pub fn step_id(&self, run_id: i64, rule_index: i64) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM workflow_steps WHERE run_id = ?1 AND rule_index = ?2 ORDER BY id LIMIT 1",
+                params![run_id, rule_index],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn put_calibration(
+        &self,
+        account_email: &str,
+        rule_legacy_id: i64,
+        framing: &str,
+        model: &str,
+        params_json: &str,
+        n: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO verdict_calibration (account_email, rule_legacy_id, framing, model, params_json, n)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![account_email, rule_legacy_id, framing, model, params_json, n],
+        )?;
+        Ok(())
+    }
+
+    pub fn calibration(
+        &self,
+        account_email: &str,
+        rule_legacy_id: i64,
+        framing: &str,
+        model: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT params_json FROM verdict_calibration WHERE account_email=?1 AND rule_legacy_id=?2 AND framing=?3 AND model=?4",
+                params![account_email, rule_legacy_id, framing, model],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn calibration_for_rule(
+        &self,
+        account_email: &str,
+        rule_legacy_id: i64,
+        model: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT framing, params_json FROM verdict_calibration WHERE account_email=?1 AND rule_legacy_id=?2 AND model=?3",
+        )?;
+        let rows = statement.query_map(params![account_email, rule_legacy_id, model], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         rows.collect()
     }

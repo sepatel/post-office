@@ -137,6 +137,8 @@ pub async fn apply_proposal(
             decision_max_tokens: rule.decision_max_tokens,
             continue_after_match: rule.continue_after_match,
             match_mode: rule.match_mode,
+            decision_mode: rule.decision_mode,
+            verdict_threshold: rule.verdict_threshold,
         };
         db.with_rules(|repo| repo.update(account_email, rule.id, &update))?;
     }

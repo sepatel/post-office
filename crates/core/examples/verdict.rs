@@ -34,7 +34,7 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(command), Some(db_path)) = (args.first(), args.get(1)) else {
-        eprintln!("usage: verdict <shadow|report|export|repair> <app.db> [...]");
+        eprintln!("usage: verdict <shadow|report|export|repair|recalibrate> <app.db> [...]");
         std::process::exit(2);
     };
     let db_path = PathBuf::from(db_path);
@@ -67,6 +67,19 @@ fn main() -> Result<()> {
             println!(
                 "named {} rows, {} could not be resolved",
                 summary.named, summary.unresolved
+            );
+            Ok(())
+        }
+        // Rung 1 of the training ladder, applied: per-rule temperature refit
+        // against the LLM's answers, persisted for the live gate. LoRA
+        // (rung 2+) consumes `export`'s decisions.jsonl in the external
+        // rverdict CLI; see design/rverdict.md Phase 5.
+        "recalibrate" => {
+            let model = installed_model_id(&models);
+            let summary = post_office_core::decision::calibration::refit(&db, model.as_deref())?;
+            println!(
+                "fitted {} rule calibrations, skipped {}, judged {} rows",
+                summary.fitted, summary.skipped, summary.rows_judged
             );
             Ok(())
         }

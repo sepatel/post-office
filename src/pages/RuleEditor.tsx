@@ -120,6 +120,8 @@ export default function RuleEditor() {
   const [chooseFromAllLabels, setChooseFromAllLabels] = useState(false);
   const [continueAfterMatch, setContinueAfterMatch] = useState(false);
   const [matchMode, setMatchMode] = useState<"single" | "multiple">("single");
+  const [verdictMode, setVerdictMode] = useState<"llm" | "verdict_then_llm">("llm");
+  const [verdictThreshold, setVerdictThreshold] = useState("0.9");
   const [routingPolicies, setRoutingPolicies] = useState<RoutingPolicy[]>([]);
   const [conditions, setConditions] = useState<Condition[]>([]);
 
@@ -324,6 +326,8 @@ export default function RuleEditor() {
         choose_from_all_labels?: boolean;
         continue_after_match?: boolean;
         match_mode?: "single" | "multiple";
+        decision_mode?: "llm" | "verdict_then_llm";
+        verdict_threshold?: number | null;
       }[];
       const rule = rules.find((r) => r.id === ruleId);
       if (rule) {
@@ -360,6 +364,8 @@ export default function RuleEditor() {
         setChooseFromAllLabels(rule.choose_from_all_labels || false);
         setContinueAfterMatch(rule.continue_after_match || false);
         setMatchMode(rule.match_mode === "multiple" ? "multiple" : "single");
+        setVerdictMode(rule.decision_mode === "verdict_then_llm" ? "verdict_then_llm" : "llm");
+        setVerdictThreshold(rule.verdict_threshold?.toString() || "0.9");
         setConditions(normalizedConditions);
         setActions(normalizedActions);
         setChoices(normalizedChoices);
@@ -472,6 +478,8 @@ export default function RuleEditor() {
       decision_max_tokens: decisionMaxTokens === "server_default" ? null : Number(decisionMaxTokens),
       continue_after_match: continueAfterMatch,
       match_mode: matchMode,
+      decision_mode: verdictMode,
+      verdict_threshold: verdictMode === "verdict_then_llm" ? Number(verdictThreshold) || 0.9 : null,
       source_rule_id: isEdit ? ruleId : undefined,
     };
   }
@@ -885,6 +893,20 @@ export default function RuleEditor() {
             Continue to lower-priority rules after this one matches
           </label>
           <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">A match normally claims an email. Continue only when another rule should also get a chance to act.</p>
+          <label className="mt-4 block text-sm font-medium text-gray-700 dark:text-gray-200">
+            Decision engine
+            <select value={verdictMode} onChange={(event) => setVerdictMode(event.target.value as "llm" | "verdict_then_llm")} className="select-field mt-1">
+              <option value="llm">LLM (default)</option>
+              <option value="verdict_then_llm">Local model, then LLM below threshold</option>
+            </select>
+          </label>
+          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">The local model acts alone at or above the threshold; the LLM remains the fallback below it. Requires Local decisions enabled.</p>
+          {verdictMode === "verdict_then_llm" && (
+            <label className="mt-3 block text-sm text-gray-600 dark:text-gray-300">
+              Act-at confidence
+              <input type="number" min="0.5" max="0.99" step="0.01" value={verdictThreshold} onChange={(event) => setVerdictThreshold(event.target.value)} className="select-field mt-1" />
+            </label>
+          )}
         </section>
 
         {isEdit && (

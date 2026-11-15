@@ -58,10 +58,7 @@ pub fn repair_targets(db: &Database) -> rusqlite::Result<RepairSummary> {
 
     let unresolved = rows.len() - named.len();
     let named = db.with_verdicts(|repo| repo.set_targets(&named))?;
-    Ok(RepairSummary {
-        named,
-        unresolved,
-    })
+    Ok(RepairSummary { named, unresolved })
 }
 
 /// The menu a row's rule offered, as the entry names it stored.
@@ -152,6 +149,7 @@ mod tests {
             Ok(Evaluation {
                 answers,
                 truncated: false,
+                model_id: None,
             })
         }
     }
@@ -208,7 +206,9 @@ mod tests {
         let summary = repair_targets(&db).unwrap();
         assert_eq!((summary.named, summary.unresolved), (0, 0));
         assert_eq!(
-            targets(&db).into_iter().find(|(framing, _)| framing == "multi:0"),
+            targets(&db)
+                .into_iter()
+                .find(|(framing, _)| framing == "multi:0"),
             Some(("multi:0".into(), Some("\"Renamed\"".into())))
         );
     }

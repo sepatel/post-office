@@ -279,6 +279,11 @@ impl Database {
             ))?;
             transaction.execute("INSERT INTO schema_migrations (version) VALUES (32)", [])?;
         }
+        if !migration_applied(&transaction, 33)? {
+            transaction
+                .execute_batch(include_str!("../../../../migrations/033_decision_mode.sql"))?;
+            transaction.execute("INSERT INTO schema_migrations (version) VALUES (33)", [])?;
+        }
         transaction.commit()
     }
 

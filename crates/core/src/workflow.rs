@@ -24,7 +24,7 @@ use crate::rules::email_view::EmailView;
 use crate::rules::engine::{needs_llm_decision, resolve_rule, Outcome, Resolved};
 use crate::rules::label_context::contexts_for_rule;
 use crate::rules::matcher;
-use crate::rules::models::Rule;
+use crate::rules::models::{DecisionMode, Rule};
 
 const RETRY_DELAY_SECS: u64 = 60;
 const MAX_RUNS_PER_TICK: usize = 20;
@@ -788,7 +788,7 @@ pub async fn process_pending_runs(
         else {
             break;
         };
-        prepare_run(db, gmail, config, inference_runtime.clone(), run).await?;
+        prepare_run(db, gmail, config, inference_runtime.clone(), None, run).await?;
         processed += 1;
     }
     Ok(processed)
@@ -799,6 +799,7 @@ pub async fn prepare_run(
     gmail: &mut GmailClient,
     config: &AppConfig,
     inference_runtime: InferenceRuntime,
+    decider: Option<Arc<dyn crate::decision::live::LiveDecider>>,
     run: ClaimedRun,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot: RuleSetSnapshot = match serde_json::from_str(&run.rules_json) {
@@ -985,8 +986,7 @@ pub async fn prepare_run(
         }
 
         if !needs_llm_decision(rule, &labels) {
-            let label_contexts =
-                contexts_for_rule(db, &run.account_email, rule_snapshot.rule.id);
+            let label_contexts = contexts_for_rule(db, &run.account_email, rule_snapshot.rule.id);
             let resolved = resolve_rule(
                 &llm,
                 rule,
@@ -998,6 +998,33 @@ pub async fn prepare_run(
             .await?;
             persist_decision(db, &run, rule, rule_index, &labels, &resolved)?;
             return Ok(());
+        }
+
+        if rule.decision_mode == DecisionMode::VerdictThenLlm {
+            if let Some(attempt) = live_gate(
+                db.clone(),
+                decider.as_ref(),
+                &run,
+                rule,
+                &view,
+                &rule_snapshot.memories,
+                &labels,
+            )
+            .await?
+            {
+                persist_decision(db, &run, rule, rule_index, &labels, &attempt.resolved)?;
+                crate::decision::live::record_live(
+                    db,
+                    run.id,
+                    &run.account_email,
+                    rule_index,
+                    rule.id,
+                    &rule.name,
+                    &attempt,
+                    None,
+                )?;
+                return Ok(());
+            }
         }
 
         match llm.next_provider(&rule.inference_policy) {
@@ -1019,6 +1046,56 @@ pub async fn prepare_run(
         }
         return Ok(());
     }
+}
+
+/// The `verdict_then_llm` gate: asks the resident model via the service
+/// channel (blocking, in `spawn_blocking` so Tokio is never stalled) and
+/// returns the acted `LiveAttempt` — the caller persists its `Resolved` and
+/// records the live verdict rows — or `None` to fall through to the LLM.
+/// Every failure mode is a fall-through.
+#[allow(clippy::too_many_arguments)]
+async fn live_gate(
+    db: Arc<Database>,
+    decider: Option<&Arc<dyn crate::decision::live::LiveDecider>>,
+    run: &ClaimedRun,
+    rule: &Rule,
+    view: &EmailView,
+    memories: &[String],
+    labels: &[Label],
+) -> Result<Option<crate::decision::live::LiveAttempt>, rusqlite::Error> {
+    let decider = decider.cloned();
+    let threshold = rule
+        .verdict_threshold
+        .unwrap_or(crate::decision::live::LIVE_ACT_THRESHOLD);
+    let block_db = db.clone();
+    let block_rule = rule.clone();
+    let block_view = view.clone();
+    let block_memories = memories.to_vec();
+    let block_labels = labels.to_vec();
+    let account = run.account_email.clone();
+    let label_contexts = contexts_for_rule(&db, &account, rule.id);
+    let attempt = tokio::task::spawn_blocking(move || {
+        let decider = decider?;
+        crate::decision::live::attempt_live(
+            decider.as_ref(),
+            &block_db,
+            &account,
+            &block_rule,
+            &block_view,
+            &block_memories,
+            &block_labels,
+            &label_contexts,
+            threshold,
+            &rverdict_core::Calibration::default(),
+        )
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(attempt) = attempt else {
+        return Ok(None);
+    };
+    Ok(Some(attempt))
 }
 
 pub async fn process_routed_run(
@@ -1119,7 +1196,8 @@ pub async fn process_routed_run(
         &labels,
         &label_contexts,
     )
-    .await {
+    .await
+    {
         Ok(resolved) => resolved,
         Err(error) => {
             record_decision_error(
@@ -1569,12 +1647,17 @@ mod tests {
             decision_max_tokens: None,
             continue_after_match: false,
             match_mode: crate::rules::models::MatchMode::Single,
+            decision_mode: crate::rules::models::DecisionMode::Llm,
+            verdict_threshold: None,
         };
-        db.with_rules(|repo| repo.create(account, &request)).unwrap();
+        db.with_rules(|repo| repo.create(account, &request))
+            .unwrap();
 
         request.name = "Alerts".into();
         request.priority = 1;
-        let alerts = db.with_rules(|repo| repo.create(account, &request)).unwrap();
+        let alerts = db
+            .with_rules(|repo| repo.create(account, &request))
+            .unwrap();
 
         publish_rule_set(&db, account, &config).unwrap();
         let names = || -> Vec<String> {
@@ -1614,6 +1697,8 @@ mod tests {
                     decision_max_tokens: None,
                     continue_after_match: false,
                     match_mode: crate::rules::models::MatchMode::Single,
+                    decision_mode: crate::rules::models::DecisionMode::Llm,
+                    verdict_threshold: None,
                 },
             )
         })
@@ -1682,6 +1767,8 @@ mod tests {
                     decision_max_tokens: None,
                     continue_after_match: false,
                     match_mode: crate::rules::models::MatchMode::Single,
+                    decision_mode: crate::rules::models::DecisionMode::Llm,
+                    verdict_threshold: None,
                 },
                 memories: vec![],
             }],

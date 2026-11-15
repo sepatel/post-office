@@ -107,8 +107,8 @@ fn map_override(row: &rusqlite::Row<'_>) -> Result<RuleLabelOverride> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
     use crate::db::rules::CreateRuleRequest;
+    use crate::db::Database;
     use std::path::Path;
 
     fn rule_request() -> CreateRuleRequest {
@@ -127,6 +127,8 @@ mod tests {
             decision_max_tokens: None,
             continue_after_match: false,
             match_mode: crate::rules::models::MatchMode::Single,
+            decision_mode: crate::rules::models::DecisionMode::Llm,
+            verdict_threshold: None,
         }
     }
 

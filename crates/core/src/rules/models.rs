@@ -33,6 +33,44 @@ pub struct Rule {
     /// Whether a match may select exactly one outcome or several.
     #[serde(default)]
     pub match_mode: MatchMode,
+    /// Phase 5: `llm` keeps the live LLM path; `verdict_then_llm` lets the
+    /// local model act at/above `verdict_threshold` and falls back to the
+    /// LLM below it. `#[serde(default)]` keeps old snapshots on `llm`.
+    #[serde(default)]
+    pub decision_mode: DecisionMode,
+    /// Per-rule confidence threshold for `verdict_then_llm`; None uses the
+    /// global 0.9 default.
+    #[serde(default)]
+    pub verdict_threshold: Option<f64>,
+}
+
+/// Which engine decides live for a rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionMode {
+    #[default]
+    Llm,
+    VerdictThenLlm,
+}
+
+impl DecisionMode {
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::VerdictThenLlm => "verdict_then_llm",
+        }
+    }
+}
+
+impl std::str::FromStr for DecisionMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "verdict_then_llm" => Self::VerdictThenLlm,
+            _ => Self::Llm,
+        })
+    }
 }
 
 /// Whether a matching rule may pick a single outcome or multiple ones.

@@ -62,6 +62,10 @@ pub struct RuleReport {
     pub calibration: Option<CalibrationReport>,
     pub median_ms: Option<i64>,
     pub truncated: usize,
+    /// Acted live by `verdict_then_llm` (origin `live`): LLM calls avoided.
+    pub live_acted: usize,
+    /// Shadowed only (origin `shadow`): the audit tail.
+    pub shadowed: usize,
 }
 
 /// Held-out comparison of the model's calibration with one refit on half of
@@ -312,6 +316,8 @@ fn summarize(
         calibration: calibration_report(rows, feedback, per_row, calibration),
         median_ms: durations.get(durations.len() / 2).copied(),
         truncated: rows.iter().filter(|r| r.truncated == Some(true)).count(),
+        live_acted: rows.iter().filter(|r| r.origin == "live").count(),
+        shadowed: rows.iter().filter(|r| r.origin == "shadow").count(),
         ..RuleReport::default()
     }
 }

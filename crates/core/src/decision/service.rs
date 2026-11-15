@@ -4,6 +4,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,8 @@ use rverdict_engine::{BackendChoice, Checkpoint, Engine, ModelRef, Precision, Se
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use super::questions::QUESTIONS_VERSION;
+use super::live::{evaluate_chunked, LiveDecider};
+use super::questions::{Plan, QUESTIONS_VERSION};
 use super::worker::{shadow_batch, SHADOW_BATCH_RANGE};
 use super::{
     Answered, DecisionModel, Evaluation, ModelConfig, ModelInfo, StartupMode, VerdictSettings,
@@ -346,6 +348,7 @@ impl DecisionModel for LocalModel {
             .map_err(|e| e.to_string())?;
         Ok(Evaluation {
             truncated: evaluated.truncation.is_some(),
+            model_id: Some(self.info.id.clone()),
             answers: evaluated
                 .questions
                 .into_iter()
@@ -414,12 +417,57 @@ pub struct VerdictStatus {
 
 type Notify = Box<dyn Fn(&VerdictStatus) + Send>;
 
+/// One live `verdict_then_llm` ask, handled by the service thread between
+/// shadow batches so the model is loaded once and never twice.
+pub struct LiveRequest {
+    pub plan: Plan,
+    pub reply: mpsc::Sender<Result<Evaluation, String>>,
+}
+
 #[derive(Clone)]
 pub struct VerdictService {
     status: Arc<Mutex<VerdictStatus>>,
     wake: Arc<(Mutex<bool>, Condvar)>,
     requests: Arc<Mutex<Option<ServiceRequest>>>,
     models_dir: PathBuf,
+    live_tx: mpsc::SyncSender<LiveRequest>,
+    live_rx: Arc<Mutex<mpsc::Receiver<LiveRequest>>>,
+}
+
+/// The live request channel as a `LiveDecider`: blocks the caller (a
+/// `spawn_blocking` task in async contexts) until the service thread answers
+/// or the timeout elapses, at which point the caller falls through to the
+/// LLM.
+#[derive(Clone)]
+pub struct ChannelLiveDecider {
+    tx: mpsc::SyncSender<LiveRequest>,
+}
+
+impl ChannelLiveDecider {
+    /// How long a live ask may wait for the resident model before the caller
+    /// falls back to the LLM. One batched inference is seconds at most.
+    pub const TIMEOUT: Duration = Duration::from_secs(60);
+
+    pub fn evaluate(&self, plan: &Plan) -> Result<Evaluation, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        // `SyncSender::send` blocks only when the 64-deep queue is full;
+        // the receive timeout is the real deadline.
+        self.tx
+            .send(LiveRequest {
+                plan: plan.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| "local decision service is unavailable".to_owned())?;
+        reply_rx
+            .recv_timeout(Self::TIMEOUT)
+            .map_err(|_| "local decision timed out".to_owned())?
+    }
+}
+
+impl LiveDecider for ChannelLiveDecider {
+    fn eval_plan(&self, plan: &Plan) -> Result<Evaluation, String> {
+        self.evaluate(plan)
+    }
 }
 
 impl VerdictService {
@@ -436,6 +484,7 @@ impl VerdictService {
         notify: impl Fn(&VerdictStatus) + Send + 'static,
     ) -> Self {
         rverdict_core::set_cache_root(data_dir.join("rverdict"));
+        let (live_tx, live_rx) = mpsc::sync_channel::<LiveRequest>(64);
         let service = Self {
             status: Arc::new(Mutex::new(VerdictStatus {
                 state: "off".into(),
@@ -444,6 +493,8 @@ impl VerdictService {
             wake: Arc::new((Mutex::new(false), Condvar::new())),
             requests: Arc::new(Mutex::new(None)),
             models_dir: data_dir.join("models"),
+            live_tx,
+            live_rx: Arc::new(Mutex::new(live_rx)),
         };
         let runner = service.clone();
         let notify: Notify = Box::new(notify);
@@ -460,6 +511,13 @@ impl VerdictService {
 
     pub fn models_dir(&self) -> &Path {
         &self.models_dir
+    }
+
+    /// The live request channel as a `LiveDecider`, for the workflow gate.
+    pub fn live_decider(&self) -> ChannelLiveDecider {
+        ChannelLiveDecider {
+            tx: self.live_tx.clone(),
+        }
     }
 
     /// Re-reads the settings now instead of after the current wait.
@@ -499,13 +557,46 @@ impl VerdictService {
     }
 
     fn wait(&self, timeout: Duration) {
-        let (flag, condvar) = &*self.wake;
-        let Ok(woken) = flag.lock() else {
-            return;
-        };
-        if let Ok((mut woken, _)) = condvar.wait_timeout_while(woken, timeout, |w| !*w) {
-            *woken = false;
+        self.wait_live(timeout, &None);
+    }
+
+    /// Sleeps for up to `timeout`, still serving live asks: the service
+    /// thread is the only owner of the resident model, so a live request
+    /// waits for it here too. `loaded` is the model-aware wait used by the
+    /// running branches; elsewhere `None` answers fast with an error.
+    fn wait_live(&self, timeout: Duration, loaded: &Option<(LocalModel, ModelConfig)>) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let pending = self
+                .live_rx
+                .lock()
+                .ok()
+                .and_then(|rx| rx.try_recv().ok().or_else(|| rx.try_recv().ok()));
+            if let Some(request) = pending {
+                self.handle_live(request, loaded);
+                continue;
+            }
+            let remaining = deadline - Instant::now();
+            if remaining.is_zero() {
+                break;
+            }
+            let slice = remaining.min(Duration::from_millis(50));
+            let (flag, condvar) = &*self.wake;
+            if let Ok(woken) = flag.lock() {
+                if let Ok((mut woken, _)) = condvar.wait_timeout_while(woken, slice, |w| !*w) {
+                    *woken = false;
+                    break;
+                }
+            }
         }
+    }
+
+    fn handle_live(&self, request: LiveRequest, loaded: &Option<(LocalModel, ModelConfig)>) {
+        let result = loaded.as_ref().map_or_else(
+            || Err("local model is not loaded".to_owned()),
+            |(model, _)| evaluate_chunked(model as &dyn DecisionModel, &request.plan, 8),
+        );
+        let _ = request.reply.send(result);
     }
 
     fn update(&self, notify: &Notify, change: impl FnOnce(&mut VerdictStatus)) {
@@ -694,7 +785,13 @@ impl VerdictService {
                             loaded = Some((model, current.model_config()));
                         }
                         Err(detail) => {
-                            self.fail_load(&mut backend, &mut attempts, &mut cpu_since, notify, detail);
+                            self.fail_load(
+                                &mut backend,
+                                &mut attempts,
+                                &mut cpu_since,
+                                notify,
+                                detail,
+                            );
                             continue;
                         }
                     }
@@ -709,7 +806,13 @@ impl VerdictService {
                             loaded = Some((model, current.model_config()));
                         }
                         Err(detail) => {
-                            self.fail_load(&mut backend, &mut attempts, &mut cpu_since, notify, detail);
+                            self.fail_load(
+                                &mut backend,
+                                &mut attempts,
+                                &mut cpu_since,
+                                notify,
+                                detail,
+                            );
                             continue;
                         }
                     }
@@ -743,12 +846,13 @@ impl VerdictService {
                         s.processed_this_session += handled as u64;
                     });
                     if handled == 0 {
-                        self.wait(IDLE_WAIT);
+                        self.wait_live(IDLE_WAIT, &loaded);
                     } else {
-                        self.wait(
+                        self.wait_live(
                             (batch_started.elapsed() * BATCH_REST_FACTOR)
                                 .max(BATCH_PACE_MIN)
                                 .min(BATCH_PACE_MAX),
+                            &loaded,
                         );
                     }
                 }

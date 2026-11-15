@@ -5,6 +5,7 @@ import {
   verdictOverview,
   verdictQualifyF16,
   verdictReport,
+  verdictRecalibrate,
   verdictSettingsSet,
   verdictStart,
   type VerdictOverview,
@@ -307,6 +308,7 @@ const COLUMNS: { label: string; title: string }[] = [
   { label: "rverdict wins", title: "Of the disagreements you ruled on, the share where the local model was right and the LLM was wrong. The closer to half, the less reason there is to switch" },
   { label: "Calibration", title: "Held-out log loss with the model's calibration, and with one refit on this rule's history; lower is better. Measured against the LLM's answers, and only over decisions you have not ruled on — it is a what-if, not a number in use" },
   { label: "Median", title: "Time the local model took per question" },
+  { label: "Live", title: "Decisions the local model acted on live (LLM calls avoided)" },
 ];
 
 function AgreementTable({ reports }: { reports: VerdictRuleReport[] }) {
@@ -376,6 +378,9 @@ function AgreementTable({ reports }: { reports: VerdictRuleReport[] }) {
               </td>
               <td className="py-2 pr-3 text-right">
                 {report.median_ms != null ? `${(report.median_ms / 1000).toFixed(1)}s` : "–"}
+              </td>
+              <td className="py-2 pr-3 text-right">
+                {report.live_acted > 0 ? report.live_acted.toLocaleString() : "–"}
               </td>
             </tr>
           ))}
@@ -456,6 +461,16 @@ export default function LocalDecisions() {
     }
   }
 
+  async function recalibrate() {
+    try {
+      const summary = await verdictRecalibrate();
+      toast.success(`Refit complete: ${summary.fitted} rule calibrations (${summary.skipped} skipped)`);
+      await load();
+    } catch (error) {
+      toast.error(`Recalibration failed: ${String(error)}`);
+    }
+  }
+
   async function qualifyF16() {
     try {
       await verdictQualifyF16();
@@ -488,6 +503,13 @@ export default function LocalDecisions() {
               className="rounded-lg px-3 py-1.5 text-sm font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/40"
             >
               Refresh
+            </button>
+            <button
+              type="button"
+              onClick={() => void recalibrate()}
+              className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
+            >
+              Refit calibration
             </button>
             <button
               type="button"

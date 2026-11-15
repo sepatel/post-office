@@ -4,7 +4,7 @@ use crate::rules::models::Rule;
 
 const RULE_COLUMNS: &str = "r.id, r.name, r.description, r.conditions, r.prompt, r.choices, r.choose_from_all_labels,
      r.actions, r.priority, r.enabled, r.parent_id, COALESCE(p.policy_id, 'default'), r.decision_reasoning_effort,
-     r.decision_max_tokens, r.continue_after_match, r.match_mode";
+     r.decision_max_tokens, r.continue_after_match, r.match_mode, r.decision_mode, r.verdict_threshold";
 
 const RULE_FROM: &str = "FROM rules r LEFT JOIN rule_inference_policy p ON p.rule_id = r.id";
 
@@ -33,6 +33,11 @@ fn map_rule_row(row: &Row<'_>) -> Result<Rule> {
             .get::<_, String>(15)?
             .parse()
             .unwrap_or(crate::rules::models::MatchMode::Single),
+        decision_mode: row
+            .get::<_, String>(16)?
+            .parse()
+            .unwrap_or(crate::rules::models::DecisionMode::Llm),
+        verdict_threshold: row.get(17)?,
     })
 }
 
@@ -107,8 +112,8 @@ impl<'a> RuleRepository<'a> {
         self.conn.execute(
             "INSERT INTO rules (account_email, name, description, conditions, prompt, choices,
                                 choose_from_all_labels, actions, priority, enabled, decision_reasoning_effort,
-                                decision_max_tokens, continue_after_match, match_mode)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                decision_max_tokens, continue_after_match, match_mode, decision_mode, verdict_threshold)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 account_email,
                 rule.name,
@@ -124,6 +129,8 @@ impl<'a> RuleRepository<'a> {
                 rule.decision_max_tokens,
                 rule.continue_after_match as i32,
                 rule.match_mode.config_value(),
+                rule.decision_mode.config_value(),
+                rule.verdict_threshold,
             ],
         )?;
 
@@ -151,6 +158,8 @@ impl<'a> RuleRepository<'a> {
             decision_max_tokens: rule.decision_max_tokens,
             continue_after_match: rule.continue_after_match,
             match_mode: rule.match_mode,
+            decision_mode: rule.decision_mode,
+            verdict_threshold: rule.verdict_threshold,
         })
     }
 
@@ -159,7 +168,7 @@ impl<'a> RuleRepository<'a> {
             "UPDATE rules SET name = ?1, description = ?2, conditions = ?3, prompt = ?4,
              choices = ?5, choose_from_all_labels = ?6, actions = ?7, priority = ?8, enabled = ?9,
              decision_reasoning_effort = ?10, decision_max_tokens = ?11, continue_after_match = ?12,
-             match_mode = ?13, updated_at = datetime('now') WHERE id = ?14 AND account_email = ?15",
+             match_mode = ?13, decision_mode = ?14, verdict_threshold = ?15, updated_at = datetime('now') WHERE id = ?16 AND account_email = ?17",
             params![
                 rule.name,
                 rule.description,
@@ -174,6 +183,8 @@ impl<'a> RuleRepository<'a> {
                 rule.decision_max_tokens,
                 rule.continue_after_match as i32,
                 rule.match_mode.config_value(),
+                rule.decision_mode.config_value(),
+                rule.verdict_threshold,
                 id,
                 account_email,
             ],
@@ -231,6 +242,8 @@ pub struct CreateRuleRequest {
     pub decision_max_tokens: Option<u32>,
     pub continue_after_match: bool,
     pub match_mode: crate::rules::models::MatchMode,
+    pub decision_mode: crate::rules::models::DecisionMode,
+    pub verdict_threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +262,8 @@ pub struct UpdateRuleRequest {
     pub decision_max_tokens: Option<u32>,
     pub continue_after_match: bool,
     pub match_mode: crate::rules::models::MatchMode,
+    pub decision_mode: crate::rules::models::DecisionMode,
+    pub verdict_threshold: Option<f64>,
 }
 
 #[cfg(test)]
@@ -302,6 +317,8 @@ mod tests {
             decision_max_tokens: None,
             continue_after_match: false,
             match_mode: crate::rules::models::MatchMode::Single,
+            decision_mode: crate::rules::models::DecisionMode::VerdictThenLlm,
+            verdict_threshold: Some(0.85),
         };
         let updated = db
             .with_rules(|repo| repo.update("test@example.com", created.id, &update))
@@ -309,6 +326,11 @@ mod tests {
         assert!(!updated.continue_after_match);
         assert!(updated.choose_from_all_labels);
         assert!(updated.choices.is_empty());
+        assert_eq!(
+            updated.decision_mode,
+            crate::rules::models::DecisionMode::VerdictThenLlm
+        );
+        assert_eq!(updated.verdict_threshold, Some(0.85));
         assert_eq!(
             updated.decision_reasoning_effort,
             crate::llm::ReasoningEffort::Medium
@@ -343,6 +365,8 @@ mod tests {
             decision_max_tokens: None,
             continue_after_match: false,
             match_mode: crate::rules::models::MatchMode::Single,
+            decision_mode: crate::rules::models::DecisionMode::Llm,
+            verdict_threshold: None,
         }
     }
 

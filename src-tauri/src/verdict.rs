@@ -229,6 +229,24 @@ pub async fn verdict_adjudicate(
         .map_err(|e| e.to_string())
 }
 
+/// Refits per-rule calibration against the LLM's answers (the gold) and
+/// persists it, so the live gate uses it. The exported `decisions.jsonl`
+/// feeds the external rverdict training ladder (LoRA); this command is
+/// rung 1 only.
+#[tauri::command]
+pub async fn verdict_recalibrate(
+    state: State<'_, AppState>,
+) -> Result<post_office_core::decision::calibration::RefitSummary, String> {
+    let model = state.verdict.model();
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        post_office_core::decision::calibration::refit(&db, model.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
 /// Writes the decision export under the app data directory and returns
 /// where. The files contain email text and stay on this machine.
 #[tauri::command]

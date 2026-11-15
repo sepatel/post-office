@@ -109,6 +109,10 @@ export interface RulePayload {
   continue_after_match: boolean;
   /// 'single' asks the model for exactly one outcome; 'multiple' allows several.
   match_mode?: "single" | "multiple";
+  /// Phase 5: 'llm' (default) keeps the live LLM path; 'verdict_then_llm' lets
+  /// the local model act at/above verdict_threshold, LLM otherwise.
+  decision_mode?: "llm" | "verdict_then_llm";
+  verdict_threshold?: number | null;
   source_rule_id?: number;
 }
 
@@ -1059,6 +1063,8 @@ export interface VerdictRuleReport {
   calibration: VerdictCalibration | null;
   median_ms: number | null;
   truncated: number;
+  live_acted: number;
+  shadowed: number;
 }
 
 export interface VerdictRow {
@@ -1084,6 +1090,7 @@ export interface VerdictRow {
   state_tokens: number | null;
   truncated: boolean | null;
   duration_ms: number | null;
+  origin: string;
   created_at: string;
 }
 
@@ -1121,6 +1128,10 @@ export async function verdictQualifyF16(): Promise<void> {
 
 export async function verdictReport(): Promise<VerdictRuleReport[]> {
   return invoke("verdict_report");
+}
+
+export async function verdictRecalibrate(): Promise<{ fitted: number; skipped: number; rows_judged: number }> {
+  return invoke("verdict_recalibrate");
 }
 
 export async function verdictMessage(messageId: number): Promise<{ verdicts: VerdictRow[]; feedback: VerdictFeedback[] }> {

@@ -138,6 +138,8 @@ fn main() {
                 state_handle.processing_states.clone(),
                 state_handle.config.clone(),
                 state_handle.inference_runtime.clone(),
+                Some(Arc::new(state_handle.verdict.service.live_decider())
+                    as Arc<dyn post_office_core::decision::live::LiveDecider>),
             );
 
             let tray = tray::setup_tray(app, &config.tray_theme)?;
@@ -218,6 +220,7 @@ fn main() {
             verdict::verdict_start,
             verdict::verdict_qualify_f16,
             verdict::verdict_report,
+            verdict::verdict_recalibrate,
             verdict::verdict_message,
             verdict::verdict_disagreements,
             verdict::verdict_adjudicate,

@@ -600,6 +600,22 @@ so it never blocks Post Office.
   the bar.
 - **Done when**: most rules run through rverdict, with LLM fallback below
   the threshold.
+- **Status** 2026-11-07 (built): the gate is live. Per-rule `decision_mode`
+  (`llm` | `verdict_then_llm`) + `verdict_threshold` (migration 033, persisted
+  in `rules` and in `RuleSetSnapshot`); `decision/live.rs` maps confident
+  verdicts onto the same `Resolved` the LLM path produces, so priority,
+  `continue_after_match` and action planning are untouched. The resident
+  model answers through a request channel on the `VerdictService` thread
+  (one load, shared with shadow), acting only at/above threshold and
+  falling through to the LLM on every other outcome — threshold, error,
+  timeout, truncation. Acted attempts record as `origin = "live"` verdict
+  rows; fallback decisions flow to the LLM and are shadowed normally, which
+  is the live audit. Rung 1 (`decision/calibration.rs`, `verdict
+  recalibrate`) fits per-rule temperature against the LLM's answers and
+  persists it for the gate; LoRA (rung 2) consumes `verdict export`'s
+  `decisions.jsonl` in the external rverdict CLI. User adjudication is no
+  longer a promotion gate (LLM is ~99.9%): calibration and reports measure
+  against the LLM, with user rulings as diagnostics only.
 
 ### Phase 6: own base checkpoint
 - Train from ModernBERT-large on the full rverdict corpus, pre-registered,

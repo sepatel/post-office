@@ -12,11 +12,14 @@ use crate::rules::engine::choice_catalog;
 use crate::rules::label_context::{resolve_label_contexts, ResolvedLabel};
 use crate::workflow::snapshot_rule;
 
-use rverdict_core::Request;
-use serde_json::Map;
-
+use super::live::evaluate_chunked;
 use super::questions::{llm_answer, plan, verdict, Plan};
 use super::{DecisionModel, Evaluation};
+
+/// Alias kept so tests calling the old helper keep compiling.
+fn evaluate_plan(model: &dyn DecisionModel, plan: &Plan, max: usize) -> Result<Evaluation, String> {
+    evaluate_chunked(model, plan, max)
+}
 
 /// Valid shadowed steps per worker pass. The command layer and the worker must
 /// agree on the same range.
@@ -61,33 +64,6 @@ pub fn shadow_batch(
         shadow_step(db, model, step, labels, qualifications)?;
     }
     Ok(pending.len())
-}
-
-/// Evaluates a plan in whole-question chunks, so one 100-label request does not
-/// become one very large dispatch. Splitting here never changes an answer.
-fn evaluate_plan(
-    model: &dyn DecisionModel,
-    plan: &Plan,
-    max_questions: usize,
-) -> Result<Evaluation, String> {
-    let mut answers = Vec::with_capacity(plan.asked.len());
-    let mut truncated = false;
-    for chunk in plan.asked.chunks(max_questions.max(1)) {
-        let mut questions = Map::new();
-        for asked in chunk {
-            if let Some(question) = plan.request.questions.get(&asked.id) {
-                questions.insert(asked.id.clone(), question.clone());
-            }
-        }
-        let evaluation = model.evaluate(&Request {
-            state: plan.request.state.clone(),
-            model: plan.request.model.clone(),
-            questions,
-        })?;
-        truncated = truncated || evaluation.truncated;
-        answers.extend(evaluation.answers);
-    }
-    Ok(Evaluation { answers, truncated })
 }
 
 fn shadow_step(
@@ -259,6 +235,7 @@ pub(crate) mod tests {
             Ok(Evaluation {
                 answers,
                 truncated: false,
+                model_id: None,
             })
         }
     }
@@ -455,6 +432,7 @@ pub(crate) mod tests {
             Ok(Evaluation {
                 answers,
                 truncated: self.calls.get() == 1,
+                model_id: None,
             })
         }
     }
@@ -557,6 +535,7 @@ pub(crate) mod tests {
                 Ok(Evaluation {
                     answers,
                     truncated: false,
+                    model_id: None,
                 })
             }
         }
